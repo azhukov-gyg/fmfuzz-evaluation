@@ -138,6 +138,11 @@ jobs:
           cd cvc5
           ./configure.sh production --auto-download
       
+      - name: Install system dependencies for coverage
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ binutils
+      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -145,7 +150,7 @@ jobs:
       
       - name: Install Python dependencies
         run: |
-          pip install psutil
+          pip install psutil fastcov
       
       - name: Run coverage analysis
         working-directory: cvc5/build
