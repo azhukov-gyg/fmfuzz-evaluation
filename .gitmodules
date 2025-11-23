@@ -1,0 +1,3 @@
+[submodule "fmfuzz-dev"]
+	path = fmfuzz-dev
+	url = git@github.com:NixoN2/fmfuzz-dev.git
