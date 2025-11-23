@@ -243,9 +243,9 @@ def analyze_commit_functions(commit_hash: str, repo_path: str, solver: str) -> D
     changed_files_lines = parse_diff(diff_result.stdout)
     cpp_language, parser = init_tree_sitter()
     
-    # Use language.query() - this returns a query object with captures() method
-    # (deprecated but works, unlike Query constructor which needs QueryCursor)
-    query = cpp_language.query(FUNCTION_QUERY)
+    # Create Query using Query constructor (current API, 0.20.0+)
+    from tree_sitter import Query
+    query = Query(cpp_language, FUNCTION_QUERY)
     
     function_details = []
     files_with_no_functions = []
