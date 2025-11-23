@@ -280,8 +280,12 @@ def analyze_commit_functions(commit_hash: str, repo_path: str, solver: str) -> D
         # Use QueryCursor to execute the query
         from tree_sitter import QueryCursor
         cursor = QueryCursor(query)
-        # captures() returns list of (node, capture_name) tuples
-        captures = cursor.captures(tree.root_node)
+        # captures() returns dict {capture_name: [nodes]} - convert to list of (node, capture_name) tuples
+        captures_dict = cursor.captures(tree.root_node)
+        captures = []
+        for capture_name, nodes in captures_dict.items():
+            for node in nodes:
+                captures.append((node, capture_name))
         func_map = {}
         
         for node, tag in captures:
