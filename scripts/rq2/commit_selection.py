@@ -282,10 +282,18 @@ def analyze_commit_functions(commit_hash: str, repo_path: str, solver: str) -> D
         cursor = QueryCursor(query)
         # captures() returns dict {capture_name: [nodes]} - convert to list of (node, capture_name) tuples
         captures_dict = cursor.captures(tree.root_node)
+        
+        # Debug: print what we got from captures
+        if not captures_dict:
+            print(f"  ⚠️  No captures found in {file_path}")
+        else:
+            print(f"  📋 Found {sum(len(nodes) for nodes in captures_dict.values())} captures in {file_path}: {list(captures_dict.keys())}")
+        
         captures = []
         for capture_name, nodes in captures_dict.items():
             for node in nodes:
                 captures.append((node, capture_name))
+        
         func_map = {}
         
         for node, tag in captures:
@@ -300,14 +308,17 @@ def analyze_commit_functions(commit_hash: str, repo_path: str, solver: str) -> D
         for func_node, func_name in func_map.items():
             start_line = func_node.start_point[0] + 1
             end_line = func_node.end_point[0] + 1
-            if changed_lines & set(range(start_line, end_line + 1)):
+            func_lines = set(range(start_line, end_line + 1))
+            if changed_lines & func_lines:
                 func_key = (file_path, func_name, start_line)
                 if func_key not in found_functions:
                     found_functions.add(func_key)
                     function_details.append({'file': file_path, 'function': func_name, 'line': start_line})
+                    print(f"    ✅ Found changed function: {func_name} at line {start_line}")
         
         if not found_functions:
             files_with_no_functions.append(file_path)
+            print(f"    ⚠️  No changed functions found in {file_path} (changed lines: {sorted(changed_lines)[:10]}{'...' if len(changed_lines) > 10 else ''})")
     
     return {
         'changed_functions_count': len(function_details),
