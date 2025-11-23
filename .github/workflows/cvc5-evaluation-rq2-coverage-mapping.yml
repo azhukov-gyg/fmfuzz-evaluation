@@ -67,7 +67,7 @@ jobs:
             RESULT=$(python3 scripts/rq2/generate_coverage_matrix.py cvc5)
           fi
           
-          MATRIX=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(json.dumps(data['include'], separators=(',', ':')))")
+          MATRIX=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(json.dumps({'include': data['include']}, separators=(',', ':')))")
           TOTAL_COMMITS=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['total_commits'])")
           CHUNKS_PER_COMMIT=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['chunks_per_commit'])")
           COMMIT_MATRIX=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); commits = sorted(set(item['commit'] for item in data['include'])); print(json.dumps({'include': [{'commit': c} for c in commits]}, separators=(',', ':')))")
