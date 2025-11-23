@@ -1,5 +1,10 @@
 # Repositories cloned for analysis
-cvc5/
-z3/
-z3test/
+./cvc5/
+./z3/
+./z3test/
+
+# Build artifacts directories
+.artifacts-production/
+.artifacts-coverage/
+artifacts/
 
