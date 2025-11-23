@@ -139,6 +139,11 @@ jobs:
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
           S3_KEY="evaluation/rq2/z3/builds/production/${COMMIT_HASH}.tar.gz"
           
+          if [ ! -f "z3/build/artifacts-production.tar.gz" ]; then
+            echo "❌ Error: artifacts-production.tar.gz not found"
+            exit 1
+          fi
+          
           aws s3api put-object \
             --bucket ${{ secrets.AWS_S3_BUCKET }} \
             --key "$S3_KEY" \
@@ -150,6 +155,11 @@ jobs:
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
           S3_KEY="evaluation/rq2/z3/builds/coverage/${COMMIT_HASH}.tar.gz"
+          
+          if [ ! -f "z3/build/artifacts-coverage.tar.gz" ]; then
+            echo "❌ Error: artifacts-coverage.tar.gz not found"
+            exit 1
+          fi
           
           aws s3api put-object \
             --bucket ${{ secrets.AWS_S3_BUCKET }} \
