@@ -248,13 +248,9 @@ def analyze_commit_functions(commit_hash: str, repo_path: str, solver: str) -> D
     changed_files_lines = parse_diff(diff_result.stdout)
     cpp_language, parser = init_tree_sitter()
     
-    # Create Query - try Query constructor first, fallback to language.query()
-    try:
-        from tree_sitter import Query
-        query = Query(cpp_language, FUNCTION_QUERY)
-    except (ImportError, TypeError, AttributeError):
-        # Fallback to deprecated API
-        query = cpp_language.query(FUNCTION_QUERY)
+    # Use language.query() - this returns a query object with captures() method
+    # (deprecated but works, unlike Query constructor which needs QueryCursor)
+    query = cpp_language.query(FUNCTION_QUERY)
     
     function_details = []
     files_with_no_functions = []
@@ -277,50 +273,21 @@ def analyze_commit_functions(commit_hash: str, repo_path: str, solver: str) -> D
             files_with_no_functions.append(file_path)
             continue
         
-        # Use QueryCursor to execute the query
-        from tree_sitter import QueryCursor
-        cursor = QueryCursor(query)
-        cursor.exec(tree.root_node)
-        
-        # captures() might return an iterator or list of (node, capture_name) tuples
-        # Try different approaches to get captures
-        captures = []
-        try:
-            # Try as iterator/list of tuples
-            captures_list = cursor.captures()
-            if isinstance(captures_list, dict):
-                # If it's a dict, convert it
-                for capture_name, nodes in captures_list.items():
-                    for node in nodes:
-                        captures.append((node, capture_name))
-            else:
-                # If it's a list/iterator of tuples
-                captures = list(captures_list)
-        except (TypeError, AttributeError):
-            # Try calling captures with node argument
-            try:
-                captures_dict = cursor.captures(tree.root_node)
-                if isinstance(captures_dict, dict):
-                    for capture_name, nodes in captures_dict.items():
-                        for node in nodes:
-                            captures.append((node, capture_name))
-                else:
-                    captures = list(captures_dict)
-            except (TypeError, AttributeError):
-                # Fallback: iterate over cursor directly
-                try:
-                    for match in cursor:
-                        for capture_name, node in match.items():
-                            captures.append((node, capture_name))
-                except:
-                    pass
+        # Use query.captures() directly - this works with language.query() result
+        # (deprecated API but functional)
+        captures = query.captures(tree.root_node)
         
         # Debug: print what we got from captures
         if not captures:
-            print(f"  ⚠️  No captures found in {file_path} (query: {FUNCTION_QUERY[:50]}...)")
+            print(f"  ⚠️  No captures found in {file_path}")
             print(f"      Tree root type: {tree.root_node.type}, children: {len(tree.root_node.children)}")
+            # Try to see if parsing worked
+            if tree.root_node.children:
+                print(f"      First child type: {tree.root_node.children[0].type}")
         else:
             print(f"  📋 Found {len(captures)} captures in {file_path}")
+            if captures:
+                print(f"      First capture: tag={captures[0][1]}, node_type={captures[0][0].type}")
         
         func_map = {}
         
