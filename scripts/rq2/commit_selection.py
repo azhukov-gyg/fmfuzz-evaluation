@@ -61,19 +61,20 @@ class EvaluationS3Manager:
             raise
 
 
-def get_commits_from_s3_bugs(bucket: str, solver: str, region: Optional[str] = None) -> Set[str]:
+def get_commits_from_s3_bugs(bucket: str, solver: str, region: Optional[str] = None) -> List[Dict]:
     """Extract commit hashes from bug file names in S3.
     
-    Bug files are stored at: solvers/{solver}/bugs/bugs-{commit_short}-{timestamp}.tar.gz
-    Pattern: bugs-{7-char-commit}-{timestamp}.tar.gz
+    Bug files are stored at: solvers/{solver}/bugs/bugs-{commit}-{timestamp}.tar.gz
+    Pattern: bugs-{7-40-char-commit}-{timestamp}.tar.gz
     
-    Returns set of commit hashes (short 7-char hashes) found in bug filenames.
-    Note: These are short hashes, may need to resolve to full hashes if needed.
+    Returns list of commit dicts with hash. Handles deduplication:
+    - If both short and full hash exist for same commit, prefer full hash
+    - Deduplicates by checking if short hash matches prefix of full hash
     """
     s3_client = boto3.client('s3', region_name=region or os.getenv('AWS_REGION', 'eu-north-1'))
     bugs_prefix = f"solvers/{solver}/bugs/"
     
-    commits = set()
+    commits_dict = {}  # Map short_hash -> full_hash (or short_hash if no full hash found)
     commit_pattern = re.compile(r'bugs-([0-9a-f]{7,40})-', re.IGNORECASE)
     
     try:
@@ -92,14 +93,28 @@ def get_commits_from_s3_bugs(bucket: str, solver: str, region: Optional[str] = N
                 match = commit_pattern.match(filename)
                 if match:
                     commit_hash = match.group(1)
-                    commits.add(commit_hash)
+                    short_hash = commit_hash[:7] if len(commit_hash) >= 7 else commit_hash
+                    
+                    # If we have a full hash (40 chars), prefer it
+                    # If we have a short hash, keep it unless we later find a full hash
+                    if len(commit_hash) == 40:
+                        # Full hash - always use it
+                        commits_dict[short_hash] = commit_hash
+                    elif short_hash not in commits_dict:
+                        # Short hash - only add if we don't have it yet
+                        commits_dict[short_hash] = commit_hash
+                    elif len(commits_dict[short_hash]) < 40 and len(commit_hash) > len(commits_dict[short_hash]):
+                        # We have a short hash, but this one is longer (but not full), prefer longer
+                        commits_dict[short_hash] = commit_hash
         
+        # Convert to list of dicts
+        commits = [{'hash': h} for h in commits_dict.values()]
         print(f"📋 Found {len(commits)} unique commits in S3 bugs folder: {bugs_prefix}")
         return commits
         
     except ClientError as e:
         print(f"⚠️  Error listing S3 bugs: {e}", file=sys.stderr)
-        return set()
+        return []
 
 
 def get_commits_from_last_n_years(repo_url: str, years: int = 2, token: Optional[str] = None) -> List[Dict]:
@@ -153,16 +168,18 @@ def filter_cpp_commits(commits: List[Dict], repo_url: str, token: Optional[str] 
 
 def init_tree_sitter():
     try:
-        from tree_sitter_languages import get_language, get_parser
-        return get_language('cpp'), get_parser('cpp')
+        import tree_sitter_cpp as cpp
+        parser = Parser()
+        parser.set_language(cpp.language())
+        return cpp.language(), parser
     except ImportError:
         try:
-            import tree_sitter_cpp as cpp
-            parser = Parser()
-            parser.set_language(cpp.language())
-            return cpp.language(), parser
-        except ImportError:
-            raise RuntimeError("Install: pip install tree-sitter-languages")
+            from tree_sitter_languages import get_language, get_parser
+            language = get_language('cpp')
+            parser = get_parser('cpp')
+            return language, parser
+        except (ImportError, TypeError):
+            raise RuntimeError("Install: pip install tree-sitter-languages or tree-sitter-cpp")
 
 
 def parse_diff(diff_text: str) -> Dict[str, set]:
@@ -317,7 +334,6 @@ def main():
     parser.add_argument('--max-commits', type=int, help='Maximum total commits to select (for testing, limits selection)')
     parser.add_argument('--skip-analysis', action='store_true')
     parser.add_argument('--skip-selection', action='store_true')
-    parser.add_argument('--use-s3-bugs', action='store_true', help='Extract commits from S3 bugs folder instead of GitHub API (default: use GitHub API)')
     args = parser.parse_args()
     
     bucket = os.getenv('AWS_S3_BUCKET')
@@ -326,21 +342,43 @@ def main():
     
     s3 = EvaluationS3Manager(bucket, args.solver)
     
-    # Option 1: Read commits from S3 bugs folder
-    if args.use_s3_bugs:
-        print(f"🔍 Reading commits from S3 bugs folder: solvers/{args.solver}/bugs/")
-        bug_commits = get_commits_from_s3_bugs(bucket, args.solver, os.getenv('AWS_REGION', 'eu-north-1'))
-        if not bug_commits:
-            print("❌ No commits found in S3 bugs folder")
-            sys.exit(1)
-        
-        # Convert to list of dicts with hash
-        # Note: These are short hashes (7 chars), may need to resolve to full hashes
-        all_commits = [{'hash': h} for h in bug_commits]
+    # Read commits from S3 bugs folder (default)
+    print(f"🔍 Reading commits from S3 bugs folder: solvers/{args.solver}/bugs/")
+    all_commits = get_commits_from_s3_bugs(bucket, args.solver, os.getenv('AWS_REGION', 'eu-north-1'))
+    
+    if all_commits:
         print(f"✅ Found {len(all_commits)} commits from S3 bugs folder")
-        print(f"⚠️  Note: These are short commit hashes. Full hash resolution may be needed.")
+        # Deduplicate: remove commits where short hash matches prefix of another commit's hash
+        seen_short = {}
+        deduplicated = []
+        for commit in all_commits:
+            commit_hash = commit['hash']
+            short_hash = commit_hash[:7] if len(commit_hash) >= 7 else commit_hash
+            
+            if short_hash in seen_short:
+                # We've seen this short hash before
+                existing = seen_short[short_hash]
+                existing_hash = existing['hash']
+                
+                # Prefer full hash (40 chars) over short hash
+                if len(commit_hash) == 40 and len(existing_hash) < 40:
+                    # Replace short hash with full hash
+                    deduplicated.remove(existing)
+                    deduplicated.append(commit)
+                    seen_short[short_hash] = commit
+                elif len(existing_hash) == 40 and len(commit_hash) < 40:
+                    # Existing is full hash, skip this short one
+                    continue
+                # Both are same length or both short - keep first one
+            else:
+                deduplicated.append(commit)
+                seen_short[short_hash] = commit
+        
+        all_commits = deduplicated
+        print(f"✅ After deduplication: {len(all_commits)} unique commits")
     else:
-        # Option 2: Discover commits from GitHub API
+        # Fallback: Discover commits from GitHub API if no bugs found
+        print(f"⚠️  No commits found in S3 bugs folder, falling back to GitHub API...")
         print(f"🔍 Discovering commits from last {args.years} years...")
         all_commits = get_commits_from_last_n_years(args.repo_url, args.years, args.token)
         print(f"✅ Found {len(all_commits)} commits")

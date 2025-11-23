@@ -19,11 +19,6 @@ on:
         description: 'Number of large commits to select (default: 0)'
         required: false
         type: string
-      use_s3_bugs:
-        description: 'Extract commits from S3 bugs folder instead of GitHub API'
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   commit-selection:
@@ -50,7 +45,7 @@ jobs:
       
       - name: Install dependencies
         run: |
-          pip install boto3 GitPython requests tree-sitter-languages
+          pip install boto3 GitPython requests tree-sitter-cpp
       
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5.1.0
@@ -86,10 +81,6 @@ jobs:
           
           if [ -n "${{ inputs.max_commits }}" ] && [ "${{ inputs.max_commits }}" != "" ]; then
             CMD="$CMD --max-commits ${{ inputs.max_commits }}"
-          fi
-          
-          if [ "${{ inputs.use_s3_bugs }}" == "true" ]; then
-            CMD="$CMD --use-s3-bugs"
           fi
           
           eval $CMD
