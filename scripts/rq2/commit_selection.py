@@ -280,19 +280,47 @@ def analyze_commit_functions(commit_hash: str, repo_path: str, solver: str) -> D
         # Use QueryCursor to execute the query
         from tree_sitter import QueryCursor
         cursor = QueryCursor(query)
-        # captures() returns dict {capture_name: [nodes]} - convert to list of (node, capture_name) tuples
-        captures_dict = cursor.captures(tree.root_node)
+        cursor.exec(tree.root_node)
+        
+        # captures() might return an iterator or list of (node, capture_name) tuples
+        # Try different approaches to get captures
+        captures = []
+        try:
+            # Try as iterator/list of tuples
+            captures_list = cursor.captures()
+            if isinstance(captures_list, dict):
+                # If it's a dict, convert it
+                for capture_name, nodes in captures_list.items():
+                    for node in nodes:
+                        captures.append((node, capture_name))
+            else:
+                # If it's a list/iterator of tuples
+                captures = list(captures_list)
+        except (TypeError, AttributeError):
+            # Try calling captures with node argument
+            try:
+                captures_dict = cursor.captures(tree.root_node)
+                if isinstance(captures_dict, dict):
+                    for capture_name, nodes in captures_dict.items():
+                        for node in nodes:
+                            captures.append((node, capture_name))
+                else:
+                    captures = list(captures_dict)
+            except (TypeError, AttributeError):
+                # Fallback: iterate over cursor directly
+                try:
+                    for match in cursor:
+                        for capture_name, node in match.items():
+                            captures.append((node, capture_name))
+                except:
+                    pass
         
         # Debug: print what we got from captures
-        if not captures_dict:
-            print(f"  ⚠️  No captures found in {file_path}")
+        if not captures:
+            print(f"  ⚠️  No captures found in {file_path} (query: {FUNCTION_QUERY[:50]}...)")
+            print(f"      Tree root type: {tree.root_node.type}, children: {len(tree.root_node.children)}")
         else:
-            print(f"  📋 Found {sum(len(nodes) for nodes in captures_dict.values())} captures in {file_path}: {list(captures_dict.keys())}")
-        
-        captures = []
-        for capture_name, nodes in captures_dict.items():
-            for node in nodes:
-                captures.append((node, capture_name))
+            print(f"  📋 Found {len(captures)} captures in {file_path}")
         
         func_map = {}
         
