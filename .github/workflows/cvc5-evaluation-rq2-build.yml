@@ -94,9 +94,8 @@ jobs:
       - name: Compress production artifacts
         run: |
           cd .artifacts-production
-          tar -czf ../artifacts-production.tar.gz .
+          tar -czf /tmp/artifacts-production.tar.gz .
           cd ..
-          mv artifacts-production.tar.gz cvc5/build/
       
       - name: Install LLVM/Clang 17 for coverage build
         uses: KyleMayes/install-llvm-action@v2
@@ -125,9 +124,8 @@ jobs:
       - name: Compress coverage artifacts
         run: |
           cd .artifacts-coverage
-          tar -czf ../artifacts-coverage.tar.gz .
+          tar -czf /tmp/artifacts-coverage.tar.gz .
           cd ..
-          mv artifacts-coverage.tar.gz cvc5/build/
       
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5.1.0
@@ -141,7 +139,7 @@ jobs:
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
           S3_KEY="evaluation/rq2/cvc5/builds/production/${COMMIT_HASH}.tar.gz"
           
-          if [ ! -f "cvc5/build/artifacts-production.tar.gz" ]; then
+          if [ ! -f "/tmp/artifacts-production.tar.gz" ]; then
             echo "❌ Error: artifacts-production.tar.gz not found"
             exit 1
           fi
@@ -149,7 +147,7 @@ jobs:
           aws s3api put-object \
             --bucket ${{ secrets.AWS_S3_BUCKET }} \
             --key "$S3_KEY" \
-            --body cvc5/build/artifacts-production.tar.gz
+            --body /tmp/artifacts-production.tar.gz
           
           echo "✅ Uploaded production binary to S3: $S3_KEY"
       
@@ -158,7 +156,7 @@ jobs:
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
           S3_KEY="evaluation/rq2/cvc5/builds/coverage/${COMMIT_HASH}.tar.gz"
           
-          if [ ! -f "cvc5/build/artifacts-coverage.tar.gz" ]; then
+          if [ ! -f "/tmp/artifacts-coverage.tar.gz" ]; then
             echo "❌ Error: artifacts-coverage.tar.gz not found"
             exit 1
           fi
@@ -166,7 +164,7 @@ jobs:
           aws s3api put-object \
             --bucket ${{ secrets.AWS_S3_BUCKET }} \
             --key "$S3_KEY" \
-            --body cvc5/build/artifacts-coverage.tar.gz
+            --body /tmp/artifacts-coverage.tar.gz
           
           echo "✅ Uploaded coverage binary to S3: $S3_KEY"
 
