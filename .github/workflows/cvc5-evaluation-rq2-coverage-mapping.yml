@@ -125,10 +125,11 @@ jobs:
       
       - name: Copy source files to cvc5 directory (preserving build artifacts)
         run: |
-          # Copy source files but preserve the build directory
+          # Copy source files but preserve the existing build directory
           if [ -d "cvc5-source" ]; then
-            cp -r cvc5-source/* cvc5/ 2>/dev/null || true
-            cp -r cvc5-source/.* cvc5/ 2>/dev/null || true
+            # Copy everything except .git and build directory
+            rsync -av --exclude='.git' --exclude='build' cvc5-source/ cvc5/ || \
+            (cp -r cvc5-source/* cvc5/ 2>/dev/null; cp -r cvc5-source/.git cvc5/ 2>/dev/null; true)
             rm -rf cvc5-source
           fi
       
