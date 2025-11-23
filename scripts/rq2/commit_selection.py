@@ -60,34 +60,45 @@ class EvaluationS3Manager:
             raise
 
 
-def get_commits_from_bugs_folder(bugs_folder: str, solver: str) -> Set[str]:
-    """Extract commit hashes from bug file names in bugs folder.
+def get_commits_from_s3_bugs(bucket: str, solver: str, region: Optional[str] = None) -> Set[str]:
+    """Extract commit hashes from bug file names in S3.
     
-    Bug files might be named with commit hash patterns. This function attempts
-    to extract commit hashes from filenames. The exact pattern depends on how
-    bugs are stored/named in the system.
+    Bug files are stored at: solvers/{solver}/bugs/bugs-{commit_short}-{timestamp}.tar.gz
+    Pattern: bugs-{7-char-commit}-{timestamp}.tar.gz
     
-    Returns set of commit hashes found in bug filenames.
+    Returns set of commit hashes (short 7-char hashes) found in bug filenames.
+    Note: These are short hashes, may need to resolve to full hashes if needed.
     """
-    bugs_path = Path(bugs_folder)
-    if not bugs_path.exists():
-        print(f"⚠️  Bugs folder not found: {bugs_folder}")
-        return set()
+    s3_client = boto3.client('s3', region_name=region or os.getenv('AWS_REGION', 'eu-north-1'))
+    bugs_prefix = f"solvers/{solver}/bugs/"
     
     commits = set()
-    # Look for commit hash patterns in filenames (typically 7-40 char hex strings)
-    commit_pattern = re.compile(r'[0-9a-f]{7,40}', re.IGNORECASE)
+    commit_pattern = re.compile(r'bugs-([0-9a-f]{7,40})-', re.IGNORECASE)
     
-    for bug_file in bugs_path.rglob("*.smt2"):
-        # Try to extract commit hash from filename
-        matches = commit_pattern.findall(bug_file.name)
-        for match in matches:
-            # Validate it looks like a commit hash (at least 7 chars)
-            if len(match) >= 7:
-                commits.add(match)
-    
-    print(f"📋 Found {len(commits)} unique commits in bugs folder")
-    return commits
+    try:
+        paginator = s3_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=bucket, Prefix=bugs_prefix)
+        
+        for page in pages:
+            if 'Contents' not in page:
+                continue
+            
+            for obj in page['Contents']:
+                key = obj['Key']
+                filename = key.split('/')[-1]
+                
+                # Extract commit hash from filename pattern: bugs-{commit}-{timestamp}.tar.gz
+                match = commit_pattern.match(filename)
+                if match:
+                    commit_hash = match.group(1)
+                    commits.add(commit_hash)
+        
+        print(f"📋 Found {len(commits)} unique commits in S3 bugs folder: {bugs_prefix}")
+        return commits
+        
+    except ClientError as e:
+        print(f"⚠️  Error listing S3 bugs: {e}", file=sys.stderr)
+        return set()
 
 
 def get_commits_from_last_n_years(repo_url: str, years: int = 2, token: Optional[str] = None) -> List[Dict]:
@@ -305,7 +316,7 @@ def main():
     parser.add_argument('--max-commits', type=int, help='Maximum total commits to select (for testing, limits selection)')
     parser.add_argument('--skip-analysis', action='store_true')
     parser.add_argument('--skip-selection', action='store_true')
-    parser.add_argument('--bugs-folder', help='Path to bugs folder to extract commits from (alternative to GitHub API)')
+    parser.add_argument('--use-s3-bugs', action='store_true', help='Extract commits from S3 bugs folder instead of GitHub API')
     args = parser.parse_args()
     
     bucket = os.getenv('AWS_S3_BUCKET')
@@ -314,17 +325,19 @@ def main():
     
     s3 = EvaluationS3Manager(bucket, args.solver)
     
-    # Option 1: Read commits from bugs folder
-    if args.bugs_folder:
-        print(f"🔍 Reading commits from bugs folder: {args.bugs_folder}")
-        bug_commits = get_commits_from_bugs_folder(args.bugs_folder, args.solver)
+    # Option 1: Read commits from S3 bugs folder
+    if args.use_s3_bugs:
+        print(f"🔍 Reading commits from S3 bugs folder: solvers/{args.solver}/bugs/")
+        bug_commits = get_commits_from_s3_bugs(bucket, args.solver, os.getenv('AWS_REGION', 'eu-north-1'))
         if not bug_commits:
-            print("❌ No commits found in bugs folder")
+            print("❌ No commits found in S3 bugs folder")
             sys.exit(1)
         
         # Convert to list of dicts with hash
+        # Note: These are short hashes (7 chars), may need to resolve to full hashes
         all_commits = [{'hash': h} for h in bug_commits]
-        print(f"✅ Found {len(all_commits)} commits from bugs folder")
+        print(f"✅ Found {len(all_commits)} commits from S3 bugs folder")
+        print(f"⚠️  Note: These are short commit hashes. Full hash resolution may be needed.")
     else:
         # Option 2: Discover commits from GitHub API
         print(f"🔍 Discovering commits from last {args.years} years...")

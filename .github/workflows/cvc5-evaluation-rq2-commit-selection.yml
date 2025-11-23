@@ -19,10 +19,11 @@ on:
         description: 'Number of large commits to select (default: 0)'
         required: false
         type: string
-      bugs_folder:
-        description: 'Path to bugs folder to extract commits from (optional)'
+      use_s3_bugs:
+        description: 'Extract commits from S3 bugs folder instead of GitHub API'
         required: false
-        type: string
+        type: boolean
+        default: false
 
 jobs:
   commit-selection:
@@ -87,8 +88,8 @@ jobs:
             CMD="$CMD --max-commits ${{ inputs.max_commits }}"
           fi
           
-          if [ -n "${{ inputs.bugs_folder }}" ] && [ "${{ inputs.bugs_folder }}" != "" ]; then
-            CMD="$CMD --bugs-folder ${{ inputs.bugs_folder }}"
+          if [ "${{ inputs.use_s3_bugs }}" == "true" ]; then
+            CMD="$CMD --use-s3-bugs"
           fi
           
           eval $CMD
