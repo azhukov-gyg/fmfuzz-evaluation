@@ -277,18 +277,14 @@ def analyze_commit_functions(commit_hash: str, repo_path: str, solver: str) -> D
             files_with_no_functions.append(file_path)
             continue
         
-        # Use matches() method instead of captures()
-        try:
-            matches = query.matches(tree.root_node)
-            # Convert matches to captures format: [(node, capture_name), ...]
-            # matches() returns Match objects, each with a captures property
-            captures = []
-            for match in matches:
-                # match.captures returns list of (node, capture_name) tuples
-                captures.extend(match.captures)
-        except AttributeError:
-            # Fallback to captures() if matches() not available (older API)
-            captures = query.captures(tree.root_node)
+        # Use matches() method - this is the correct API
+        matches = query.matches(tree.root_node)
+        # Convert matches to captures format: [(node, capture_name), ...]
+        # matches() returns Match objects, each with a captures property
+        captures = []
+        for match in matches:
+            # match.captures returns list of (node, capture_name) tuples
+            captures.extend(match.captures)
         func_map = {}
         
         for node, tag in captures:
