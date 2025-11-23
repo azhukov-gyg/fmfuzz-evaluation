@@ -154,6 +154,21 @@ jobs:
         run: |
           pip install psutil fastcov
       
+      - name: Debug: Run a single test to see error
+        working-directory: cvc5/build
+        env:
+          TEST_TIMEOUT: 120
+        run: |
+          echo "🔍 Debugging test execution..."
+          ctest -I 1,1 -V 2>&1 | head -100 || true
+          echo ""
+          echo "🔍 Checking if binary exists and is executable..."
+          ls -la bin/cvc5 || echo "Binary not found"
+          ./bin/cvc5 --version || echo "Binary failed to run"
+          echo ""
+          echo "🔍 Checking if test files exist..."
+          find ../test -name "ackermann.real.smt2" -type f | head -5 || echo "Test files not found"
+      
       - name: Run coverage analysis
         working-directory: cvc5/build
         env:
