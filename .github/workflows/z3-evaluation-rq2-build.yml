@@ -75,28 +75,6 @@ jobs:
           echo "Checked out commit: $(git rev-parse HEAD)"
           cd ..
       
-      - name: Build Z3 production binary
-        run: |
-          ./fmfuzz-dev/scripts/z3/build.sh --static
-      
-      - name: Get commit hash
-        id: get-commit
-        working-directory: z3
-        run: |
-          COMMIT_HASH=$(git rev-parse HEAD)
-          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
-          echo "Z3 commit hash: $COMMIT_HASH"
-      
-      - name: Collect production artifacts
-        run: |
-          ./fmfuzz-dev/scripts/z3/collect_build_artifacts.sh z3/build .artifacts-production
-      
-      - name: Compress production artifacts
-        run: |
-          cd .artifacts-production
-          tar -czf /tmp/artifacts-production.tar.gz .
-          cd ..
-      
       - name: Install LLVM/Clang 17 for coverage build
         uses: KyleMayes/install-llvm-action@v2
         with:
@@ -134,22 +112,13 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
       
-      - name: Upload production binary to S3
+      - name: Get commit hash
+        id: get-commit
+        working-directory: z3
         run: |
-          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/z3/builds/production/${COMMIT_HASH}.tar.gz"
-          
-          if [ ! -f "/tmp/artifacts-production.tar.gz" ]; then
-            echo "❌ Error: artifacts-production.tar.gz not found"
-            exit 1
-          fi
-          
-          aws s3api put-object \
-            --bucket ${{ secrets.AWS_S3_BUCKET }} \
-            --key "$S3_KEY" \
-            --body /tmp/artifacts-production.tar.gz
-          
-          echo "✅ Uploaded production binary to S3: $S3_KEY"
+          COMMIT_HASH=$(git rev-parse HEAD)
+          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+          echo "Z3 commit hash: $COMMIT_HASH"
       
       - name: Upload coverage binary to S3
         run: |
