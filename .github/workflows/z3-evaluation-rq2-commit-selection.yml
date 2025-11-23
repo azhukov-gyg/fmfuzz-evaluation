@@ -1,0 +1,95 @@
+name: Z3 RQ2 Commit Selection
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_commits:
+        description: 'Maximum total commits to select (for testing, leave empty for default: 2)'
+        required: false
+        type: string
+      small_count:
+        description: 'Number of small commits to select (default: 1)'
+        required: false
+        type: string
+      medium_count:
+        description: 'Number of medium commits to select (default: 1)'
+        required: false
+        type: string
+      large_count:
+        description: 'Number of large commits to select (default: 0)'
+        required: false
+        type: string
+      bugs_folder:
+        description: 'Path to bugs folder to extract commits from (optional)'
+        required: false
+        type: string
+
+jobs:
+  commit-selection:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      
+      - name: Clone Z3 repository
+        run: |
+          if [ -d "z3" ]; then
+            cd z3
+            git fetch origin
+          else
+            git clone https://github.com/Z3Prover/z3.git z3
+          fi
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: |
+          pip install boto3 GitPython requests tree-sitter-languages
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Run commit selection
+        env:
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CMD="python3 scripts/rq2/commit_selection.py \
+            z3 \
+            https://github.com/Z3Prover/z3.git \
+            --years 2 \
+            --token $GITHUB_TOKEN \
+            --repo-path z3"
+          
+          if [ -n "${{ inputs.small_count }}" ] && [ "${{ inputs.small_count }}" != "" ]; then
+            CMD="$CMD --small-count ${{ inputs.small_count }}"
+          fi
+          
+          if [ -n "${{ inputs.medium_count }}" ] && [ "${{ inputs.medium_count }}" != "" ]; then
+            CMD="$CMD --medium-count ${{ inputs.medium_count }}"
+          fi
+          
+          if [ -n "${{ inputs.large_count }}" ] && [ "${{ inputs.large_count }}" != "" ]; then
+            CMD="$CMD --large-count ${{ inputs.large_count }}"
+          fi
+          
+          if [ -n "${{ inputs.max_commits }}" ] && [ "${{ inputs.max_commits }}" != "" ]; then
+            CMD="$CMD --max-commits ${{ inputs.max_commits }}"
+          fi
+          
+          if [ -n "${{ inputs.bugs_folder }}" ] && [ "${{ inputs.bugs_folder }}" != "" ]; then
+            CMD="$CMD --bugs-folder ${{ inputs.bugs_folder }}"
+          fi
+          
+          eval $CMD
+

@@ -1,0 +1,175 @@
+name: CVC5 RQ2 Coverage Mapping (Variant 1)
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_commits:
+        description: 'Maximum number of commits to process (for testing, leave empty for all)'
+        required: false
+        type: string
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+      commit_matrix: ${{ steps.generate-matrix.outputs.commit_matrix }}
+      total_commits: ${{ steps.generate-matrix.outputs.total_commits }}
+      chunks_per_commit: ${{ steps.generate-matrix.outputs.chunks_per_commit }}
+    
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: |
+          pip install boto3 psutil
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Generate combined matrix
+        id: generate-matrix
+        env:
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          MAX_COMMITS="${{ inputs.max_commits }}"
+          if [ -n "$MAX_COMMITS" ] && [ "$MAX_COMMITS" != "" ]; then
+            RESULT=$(python3 scripts/rq2/generate_coverage_matrix.py cvc5 "$MAX_COMMITS")
+          else
+            RESULT=$(python3 scripts/rq2/generate_coverage_matrix.py cvc5)
+          fi
+          
+          MATRIX=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(json.dumps(data['include'], separators=(',', ':')))")
+          TOTAL_COMMITS=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['total_commits'])")
+          CHUNKS_PER_COMMIT=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['chunks_per_commit'])")
+          COMMIT_MATRIX=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); commits = sorted(set(item['commit'] for item in data['include'])); print(json.dumps({'include': [{'commit': c} for c in commits]}, separators=(',', ':')))")
+          
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "commit_matrix=$COMMIT_MATRIX" >> $GITHUB_OUTPUT
+          echo "total_commits=$TOTAL_COMMITS" >> $GITHUB_OUTPUT
+          echo "chunks_per_commit=$CHUNKS_PER_COMMIT" >> $GITHUB_OUTPUT
+          
+          echo "✅ Generated matrix: $TOTAL_COMMITS commits × $CHUNKS_PER_COMMIT chunks"
+
+  coverage-analysis:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    timeout-minutes: 360
+    
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Download coverage binary
+        run: |
+          COMMIT_HASH="${{ matrix.commit }}"
+          S3_KEY="evaluation/rq2/cvc5/builds/coverage/${COMMIT_HASH}.tar.gz"
+          
+          mkdir -p artifacts
+          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY artifacts/artifacts.tar.gz
+          echo "✅ Downloaded coverage binary for $COMMIT_HASH"
+      
+      - name: Extract coverage binary
+        run: |
+          mkdir -p cvc5/build
+          ./fmfuzz-dev/scripts/cvc5/extract_build_artifacts.sh artifacts/artifacts.tar.gz cvc5/build true
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install Python dependencies
+        run: |
+          pip install psutil
+      
+      - name: Run coverage analysis
+        working-directory: cvc5/build
+        run: |
+          python3 ../../fmfuzz-dev/scripts/cvc5/coverage/coverage_mapper.py \
+            --build-dir . \
+            --start-index ${{ matrix.chunk.start_index }} \
+            --end-index ${{ matrix.chunk.end_index }}
+      
+      - name: Upload coverage mapping chunk
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-mapping-${{ matrix.commit }}-${{ matrix.chunk.job_name }}
+          path: cvc5/build/coverage_mapping_${{ matrix.chunk.start_index }}_${{ matrix.chunk.end_index }}.json
+          retention-days: 1
+
+  join-mappings:
+    needs: [generate-matrix, coverage-analysis]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.commit_matrix) }}
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      
+      - name: Download all coverage mapping chunks for commit
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-mapping-${{ matrix.commit }}-*
+          path: coverage-mappings
+      
+      - name: Join coverage mappings
+        run: |
+          python3 fmfuzz-dev/scripts/cvc5/coverage/join_coverage_mappings.py
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Upload coverage mapping to S3
+        run: |
+          COMMIT_HASH="${{ matrix.commit }}"
+          S3_KEY="evaluation/rq2/cvc5/coverage-mappings/variant1/coverage_mapping-${COMMIT_HASH}.json.gz"
+          
+          if [ ! -f "coverage_mapping.json.gz" ]; then
+            echo "❌ Error: coverage_mapping.json.gz not found"
+            exit 1
+          fi
+          
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body coverage_mapping.json.gz
+          
+          echo "✅ Uploaded coverage mapping to S3: $S3_KEY"
+

@@ -1,0 +1,160 @@
+name: Z3 RQ2 Binary Building
+
+on:
+  workflow_dispatch:
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+      total_commits: ${{ steps.generate-matrix.outputs.total_commits }}
+    
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: |
+          pip install boto3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Generate build matrix
+        id: generate-matrix
+        env:
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          MATRIX=$(python3 scripts/rq2/generate_build_matrix.py z3)
+          COMMIT_COUNT=$(echo "$MATRIX" | python3 -c "import sys, json; data=json.load(sys.stdin); print(len(data['include']))")
+          
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "total_commits=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+          
+          echo "✅ Generated matrix with $COMMIT_COUNT commits"
+          echo "$MATRIX" | python3 -m json.tool
+
+  build-binaries:
+    needs: generate-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    timeout-minutes: 360  # 6 hours
+    
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      
+      - name: Prepare Z3 for commit
+        run: |
+          COMMIT_HASH="${{ matrix.commit }}"
+          echo "🔨 Building commit: $COMMIT_HASH"
+          if [ -d "z3" ]; then
+            rm -rf z3
+          fi
+          git clone https://github.com/Z3Prover/z3.git z3
+          cd z3
+          git checkout $COMMIT_HASH
+          echo "Checked out commit: $(git rev-parse HEAD)"
+          cd ..
+      
+      - name: Build Z3 production binary
+        run: |
+          ./fmfuzz-dev/scripts/z3/build.sh --static
+      
+      - name: Get commit hash
+        id: get-commit
+        working-directory: z3
+        run: |
+          COMMIT_HASH=$(git rev-parse HEAD)
+          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+          echo "Z3 commit hash: $COMMIT_HASH"
+      
+      - name: Collect production artifacts
+        run: |
+          ./fmfuzz-dev/scripts/z3/collect_build_artifacts.sh z3/build .artifacts-production
+      
+      - name: Compress production artifacts
+        run: |
+          cd .artifacts-production
+          tar -czf ../z3/build/artifacts-production.tar.gz .
+          cd ..
+      
+      - name: Install LLVM/Clang 17 for coverage build
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '17'
+      
+      - name: Add LLVM to PATH
+        run: echo "${{ env.LLVM_PATH }}/bin" >> $GITHUB_PATH
+      
+      - name: Clean build for coverage
+        run: |
+          if [ -d "z3/build" ]; then
+            rm -rf z3/build
+          fi
+      
+      - name: Build Z3 coverage binary
+        run: |
+          export CXX="clang++ --gcc-toolchain=/usr"
+          export CC="clang --gcc-toolchain=/usr"
+          ./fmfuzz-dev/scripts/z3/build.sh --static --coverage
+      
+      - name: Collect coverage artifacts
+        run: |
+          ./fmfuzz-dev/scripts/z3/collect_build_artifacts.sh z3/build .artifacts-coverage
+      
+      - name: Compress coverage artifacts
+        run: |
+          cd .artifacts-coverage
+          tar -czf ../z3/build/artifacts-coverage.tar.gz .
+          cd ..
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Upload production binary to S3
+        run: |
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/z3/builds/production/${COMMIT_HASH}.tar.gz"
+          
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body z3/build/artifacts-production.tar.gz
+          
+          echo "✅ Uploaded production binary to S3: $S3_KEY"
+      
+      - name: Upload coverage binary to S3
+        run: |
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/z3/builds/coverage/${COMMIT_HASH}.tar.gz"
+          
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body z3/build/artifacts-coverage.tar.gz
+          
+          echo "✅ Uploaded coverage binary to S3: $S3_KEY"
+
