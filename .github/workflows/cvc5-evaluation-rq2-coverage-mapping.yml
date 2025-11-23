@@ -110,28 +110,18 @@ jobs:
           aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY artifacts/artifacts.tar.gz
           echo "✅ Downloaded coverage binary for $COMMIT_HASH"
       
-      - name: Extract coverage binary
-        run: |
-          mkdir -p cvc5/build
-          ./scripts/cvc5/extract_build_artifacts.sh artifacts/artifacts.tar.gz cvc5/build true
-      
-      - name: Checkout exact CVC5 commit (deep clone for CTest discovery)
+      - name: Checkout exact CVC5 commit (deep clone - must match build structure)
         uses: actions/checkout@v5
         with:
           repository: cvc5/cvc5
           ref: ${{ matrix.commit }}
-          path: cvc5-source
+          path: cvc5
           fetch-depth: 0
       
-      - name: Copy source files to cvc5 directory (preserving build artifacts)
+      - name: Extract coverage binary (preserving source files)
         run: |
-          # Copy source files but preserve the existing build directory
-          if [ -d "cvc5-source" ]; then
-            # Copy everything except .git and build directory
-            rsync -av --exclude='.git' --exclude='build' cvc5-source/ cvc5/ || \
-            (cp -r cvc5-source/* cvc5/ 2>/dev/null; cp -r cvc5-source/.git cvc5/ 2>/dev/null; true)
-            rm -rf cvc5-source
-          fi
+          mkdir -p cvc5/build
+          ./scripts/cvc5/extract_build_artifacts.sh artifacts/artifacts.tar.gz cvc5/build true
       
       - name: Install CMake (if not already installed)
         run: |
@@ -159,74 +149,6 @@ jobs:
         run: |
           pip install psutil fastcov
       
-      - name: Debug - Test coverage extraction
-        working-directory: cvc5/build
-        env:
-          TEST_TIMEOUT: 120
-        run: |
-          echo "Checking for .gcno files (coverage notes)..."
-          GCNO_COUNT=$(find . -name "*.gcno" -type f 2>/dev/null | wc -l || echo "0")
-          echo "Found $GCNO_COUNT .gcno files"
-          if [ "$GCNO_COUNT" -gt 0 ]; then
-            echo "Sample .gcno files:"
-            find . -name "*.gcno" -type f | head -5
-          else
-            echo "⚠️  WARNING: No .gcno files found! fastcov will fail without them."
-          fi
-          echo ""
-          echo "Running a test and checking coverage..."
-          ctest -I 1,1 -j4 --output-on-failure 2>&1
-          echo "Exit code: $?"
-          echo ""
-          echo "Checking for .gcda files..."
-          GCDA_COUNT=$(find . -name "*.gcda" -type f 2>/dev/null | wc -l || echo "0")
-          echo "Found $GCDA_COUNT .gcda files"
-          find . -name "*.gcda" -type f | head -5 || echo "No .gcda files found"
-          echo ""
-          echo "Checking if .gcno and .gcda files are in same directories..."
-          for gcda_file in $(find . -name "*.gcda" -type f | head -3); do
-            gcno_file="${gcda_file%.gcda}.gcno"
-            if [ -f "$gcno_file" ]; then
-              echo "✓ Match: $gcda_file has corresponding $gcno_file"
-            else
-              echo "✗ Missing: $gcda_file has NO corresponding $gcno_file"
-            fi
-          done
-          echo ""
-          echo "Checking source file locations..."
-          echo "Looking for source files that gcov needs..."
-          # Try running gcov manually on one file to see what it expects
-          SAMPLE_GCDA=$(find . -name "*.gcda" -type f | head -1)
-          if [ -n "$SAMPLE_GCDA" ]; then
-            echo "Testing gcov on: $SAMPLE_GCDA"
-            gcov "$SAMPLE_GCDA" 2>&1 | head -20 || echo "gcov failed"
-            echo ""
-            echo "Checking if source files exist..."
-            # Check if src/ directory exists relative to build
-            if [ -d "../src" ]; then
-              echo "✓ Found ../src directory"
-              find ../src -name "*.cpp" -o -name "*.c" | head -5
-            else
-              echo "✗ ../src directory not found"
-            fi
-            # Check if source files exist in build/src (from headers extraction)
-            if [ -d "./src" ]; then
-              echo "✓ Found ./src directory (from headers)"
-              find ./src -name "*.cpp" -o -name "*.c" | head -5
-            else
-              echo "✗ ./src directory not found"
-            fi
-          fi
-          echo ""
-          echo "Testing fastcov..."
-          fastcov --gcov gcov --search-directory . --output test_fastcov.json --exclude "/usr/include/*" --exclude "*/deps/*" --jobs 4 2>&1 | head -50 || echo "fastcov failed with exit code: $?"
-          echo ""
-          if [ -f "test_fastcov.json" ]; then
-            echo "fastcov output file exists, size: $(wc -l < test_fastcov.json) lines"
-            head -20 test_fastcov.json || true
-          else
-            echo "fastcov output file NOT found"
-          fi
       
       - name: Run coverage analysis
         working-directory: cvc5/build
