@@ -1,9 +1,9 @@
 #!/bin/bash
 # Collect CVC5 build artifacts preserving build directory structure
 # This script collects everything needed for coverage analysis:
-# - Headers, binary, CMake files, .gcno files
+# - Headers, source .cpp files, binary, CMake files, .gcno files
 # - All files preserve their relative paths from build/
-# Note: Source .cpp files are NOT collected - they're available from CVC5 checkout
+# Source .cpp files are collected to src/... so fastcov can find them at build/src/...
 #
 # Usage: ./collect_build_artifacts.sh <build_dir> <output_dir>
 # Example: ./collect_build_artifacts.sh cvc5/build artifacts
@@ -90,10 +90,56 @@ if [ "$GCNO_COUNT" -gt 0 ]; then
     echo "   ✓ Collected $GCNO_COUNT .gcno files"
 fi
 
-# Note: We do NOT collect source .cpp files because:
-# 1. .gcno files contain absolute paths pointing to cvc5/src/... (source directory)
-# 2. Source files are already available from the CVC5 checkout in coverage workflow
-# 3. fastcov will find source files at their absolute paths from .gcno files
+# Collect source .cpp files from source directory (../src relative to build)
+# fastcov rewrites paths from .gcno files relative to --search-directory (build/)
+# So it looks for source files at build/src/... even though .gcno contains cvc5/src/...
+# We need to place source files at src/... in artifacts so they extract to build/src/...
+echo "🔍 Collecting source .cpp files..."
+CPP_COUNT=0
+SRC_DIR="$BUILD_DIR/../src"
+echo "   Source directory: $SRC_DIR"
+echo "   Build directory: $BUILD_DIR"
+echo "   Output directory: $OUTPUT_DIR"
+
+if [ -d "$SRC_DIR" ]; then
+    echo "   ✓ Source directory exists"
+    TOTAL_SRC_FILES=$(find "$SRC_DIR" -type f -name "*.cpp" 2>/dev/null | wc -l || echo "0")
+    echo "   Found $TOTAL_SRC_FILES .cpp files in source directory"
+    
+    if [ "$TOTAL_SRC_FILES" -gt 0 ]; then
+        echo "   Copying source files to $OUTPUT_DIR/src/..."
+        COPIED=0
+        find "$SRC_DIR" -type f -name "*.cpp" 2>/dev/null | while read -r cpp_file; do
+            # Get relative path from src/ directory
+            rel_path="${cpp_file#$SRC_DIR/}"
+            # Place in output as src/... (matching build structure for fastcov)
+            target_path="$OUTPUT_DIR/src/$rel_path"
+            mkdir -p "$(dirname "$target_path")"
+            cp "$cpp_file" "$target_path"
+            COPIED=$((COPIED + 1))
+            if [ $((COPIED % 100)) -eq 0 ]; then
+                echo "   ... copied $COPIED files"
+            fi
+        done 2>/dev/null || true
+        
+        CPP_COUNT=$(find "$OUTPUT_DIR/src" -name "*.cpp" -type f 2>/dev/null | wc -l || echo "0")
+        if [ "$CPP_COUNT" -gt 0 ]; then
+            echo "   ✓ Collected $CPP_COUNT .cpp source files"
+            echo "   Sample files collected:"
+            find "$OUTPUT_DIR/src" -name "*.cpp" -type f 2>/dev/null | head -5 | sed 's/^/      /'
+        else
+            echo "   ✗ ERROR: No .cpp files found in output directory after copying"
+            echo "   Checking output directory structure:"
+            ls -la "$OUTPUT_DIR/src" 2>/dev/null | head -10 || echo "      Output src/ directory does not exist"
+        fi
+    else
+        echo "   ⚠ Warning: No .cpp files found in source directory"
+    fi
+else
+    echo "   ✗ ERROR: Source directory not found at $SRC_DIR"
+    echo "   Build directory contents:"
+    ls -la "$BUILD_DIR/.." 2>/dev/null | head -10 || echo "      Cannot list parent directory"
+fi
 
 # Summary
 echo ""
@@ -102,6 +148,7 @@ echo "   All files preserve build directory structure"
 echo ""
 echo "📊 Summary:"
 echo "   Headers: $HEADER_COUNT"
+echo "   Source files (.cpp): $CPP_COUNT"
 echo "   .gcno files: $GCNO_COUNT"
 echo "   CTestTestfile.cmake: $CTEST_COUNT"
 if [ -f "$OUTPUT_DIR/bin/cvc5" ]; then

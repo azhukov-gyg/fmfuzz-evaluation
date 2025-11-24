@@ -133,61 +133,106 @@ jobs:
           # CMakeCache.txt and CTestTestfile.cmake are now included in artifacts
           # No need to reconfigure CMake - ctest will work with extracted files
       
-      - name: Verify directory structure and fix fastcov path resolution
+      - name: Verify source files are extracted correctly
         run: |
-          echo "=== Verifying directory structure ==="
+          echo "=== Comprehensive source files verification ==="
           echo "Workspace root: $GITHUB_WORKSPACE"
           echo "Current directory: $(pwd)"
           echo ""
-          echo "=== Checking source files location ==="
-          echo "Source files at cvc5/src/:"
-          find cvc5/src -name "*.cpp" -type f 2>/dev/null | wc -l || echo "0"
+          
+          echo "=== Step 1: Check source files from checkout ==="
+          CHECKOUT_COUNT=$(find cvc5/src -name "*.cpp" -type f 2>/dev/null | wc -l || echo "0")
+          echo "Source files in cvc5/src/ (from checkout): $CHECKOUT_COUNT"
+          if [ "$CHECKOUT_COUNT" -gt 0 ]; then
+            echo "Sample checkout files:"
+            find cvc5/src -name "*.cpp" -type f 2>/dev/null | head -3
+          fi
           echo ""
-          echo "=== Checking .gcno files and path resolution ==="
+          
+          echo "=== Step 2: Check extracted source files ==="
+          EXTRACTED_COUNT=$(find cvc5/build/src -name "*.cpp" -type f 2>/dev/null | wc -l || echo "0")
+          echo "Source files in cvc5/build/src/ (from artifacts): $EXTRACTED_COUNT"
+          if [ "$EXTRACTED_COUNT" -gt 0 ]; then
+            echo "✓ Source files extracted correctly"
+            echo "Sample extracted files:"
+            find cvc5/build/src -name "*.cpp" -type f 2>/dev/null | head -5
+          else
+            echo "✗ ERROR: No source files found in cvc5/build/src/"
+            echo "This means artifacts need to be rebuilt with source files included"
+            echo ""
+            echo "Checking what IS in cvc5/build/src/:"
+            if [ -d cvc5/build/src ]; then
+              ls -la cvc5/build/src/ | head -20
+              echo ""
+              echo "Directory structure:"
+              find cvc5/build/src -type d 2>/dev/null | head -10
+              echo ""
+              echo "All files in cvc5/build/src/:"
+              find cvc5/build/src -type f 2>/dev/null | head -20
+            else
+              echo "cvc5/build/src/ directory does not exist"
+            fi
+          fi
+          echo ""
+          
+          echo "=== Step 3: Check .gcno files and path resolution ==="
           SAMPLE_GCNO=$(find cvc5/build -name "*.gcno" -type f | head -1)
           if [ -n "$SAMPLE_GCNO" ]; then
             echo "Sample .gcno: $SAMPLE_GCNO"
             ABSOLUTE_PATH=$(strings "$SAMPLE_GCNO" | grep -E "^/.*\.cpp$" | head -1)
             echo "Path in .gcno: $ABSOLUTE_PATH"
             if [ -f "$ABSOLUTE_PATH" ]; then
-              echo "✓ Source file exists at absolute path"
+              echo "✓ Source file exists at absolute path from .gcno"
             else
-              echo "✗ Source file does NOT exist at absolute path"
+              echo "✗ Source file does NOT exist at absolute path from .gcno"
             fi
-            # fastcov rewrites paths relative to --search-directory (cvc5/build)
-            # Extract the relative path from cvc5/ onwards
+            
+            # Check what fastcov will look for
             if [[ "$ABSOLUTE_PATH" == *"/cvc5/"* ]]; then
               REL_PATH="${ABSOLUTE_PATH#*cvc5/}"
-              BUILD_PATH="$GITHUB_WORKSPACE/cvc5/build/$REL_PATH"
-              echo "fastcov will look for: $BUILD_PATH"
-              if [ -f "$BUILD_PATH" ]; then
-                echo "✓ File exists at fastcov's expected path"
+              FASTCOV_PATH="$GITHUB_WORKSPACE/cvc5/build/$REL_PATH"
+              echo ""
+              echo "fastcov path resolution:"
+              echo "  .gcno absolute path: $ABSOLUTE_PATH"
+              echo "  Relative path from cvc5/: $REL_PATH"
+              echo "  fastcov will look for: $FASTCOV_PATH"
+              if [ -f "$FASTCOV_PATH" ]; then
+                echo "  ✓ File exists at fastcov's expected path"
               else
-                echo "✗ File does NOT exist at fastcov's expected path"
-                echo "  Creating symlink: cvc5/build/src -> ../src"
-                if [ ! -e cvc5/build/src ]; then
-                  cd cvc5/build
-                  ln -s ../src src
-                  echo "✓ Created symlink"
-                  cd ../..
+                echo "  ✗ ERROR: File does NOT exist at fastcov's expected path"
+                echo "  Checking parent directory:"
+                PARENT_DIR=$(dirname "$FASTCOV_PATH")
+                if [ -d "$PARENT_DIR" ]; then
+                  echo "    Parent directory exists: $PARENT_DIR"
+                  echo "    Contents:"
+                  ls -la "$PARENT_DIR" | head -10
                 else
-                  echo "⚠ src already exists in build directory"
-                  echo "  Checking what's in cvc5/build/src:"
-                  ls -la cvc5/build/src/ | head -20
+                  echo "    Parent directory does NOT exist: $PARENT_DIR"
                 fi
               fi
             fi
+          else
+            echo "✗ ERROR: No .gcno files found"
           fi
           echo ""
-          echo "=== Final structure check ==="
+          
+          echo "=== Step 4: Directory structure summary ==="
           echo "cvc5/build structure:"
-          ls -la cvc5/build/ || echo "cvc5/build does not exist"
+          ls -la cvc5/build/ 2>/dev/null || echo "cvc5/build does not exist"
           echo ""
           echo "cvc5/build/src structure (if exists):"
-          if [ -e cvc5/build/src ]; then
+          if [ -d cvc5/build/src ]; then
+            echo "Directory type: $(file cvc5/build/src)"
+            if [ -L cvc5/build/src ]; then
+              echo "It's a symlink pointing to: $(readlink cvc5/build/src)"
+            fi
+            echo "Top-level contents:"
             ls -la cvc5/build/src/ | head -20
+            echo ""
+            echo "Subdirectories:"
+            find cvc5/build/src -type d -maxdepth 2 2>/dev/null | head -20
           else
-            echo "src does not exist in build directory"
+            echo "cvc5/build/src does not exist"
           fi
       
       - name: Set up Python

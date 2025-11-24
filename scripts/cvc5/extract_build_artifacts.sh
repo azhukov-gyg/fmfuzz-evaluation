@@ -1,7 +1,7 @@
 #!/bin/bash
 # Extract CVC5 build artifacts preserving build directory structure
 # This script extracts everything directly to build/ preserving paths
-# Note: Source .cpp files are NOT extracted - they're available from CVC5 checkout
+# Source .cpp files are extracted to build/src/... for fastcov path resolution
 #
 # Usage: ./extract_build_artifacts.sh <artifact_file> <build_dir> [extract_headers]
 # Example: ./extract_build_artifacts.sh artifacts/artifacts.tar.gz cvc5/build true
@@ -90,10 +90,69 @@ if [ "$GCNO_COUNT" -gt 0 ]; then
     echo "✓ Extracted $GCNO_COUNT .gcno files"
 fi
 
-# Note: We do NOT extract source .cpp files because:
-# 1. .gcno files contain absolute paths pointing to cvc5/src/... (source directory)
-# 2. Source files are already available from the CVC5 checkout in coverage workflow
-# 3. fastcov will find source files at their absolute paths from .gcno files
+# Extract source .cpp files (preserving structure)
+# fastcov rewrites paths relative to --search-directory, so it looks for build/src/...
+echo "🔍 Extracting source .cpp files..."
+CPP_COUNT=0
+if [ -d "$TMP_DIR/src" ]; then
+    echo "   Found src/ directory in artifacts"
+    TOTAL_IN_ARCHIVE=$(find "$TMP_DIR/src" -type f -name "*.cpp" 2>/dev/null | wc -l || echo "0")
+    echo "   Found $TOTAL_IN_ARCHIVE .cpp files in archive"
+    
+    if [ "$TOTAL_IN_ARCHIVE" -gt 0 ]; then
+        echo "   Extracting to $BUILD_DIR/src/..."
+        EXTRACTED=0
+        find "$TMP_DIR/src" -type f -name "*.cpp" 2>/dev/null | while read -r cpp_file; do
+            rel_path="${cpp_file#$TMP_DIR/}"
+            target_path="$BUILD_DIR/$rel_path"
+            mkdir -p "$(dirname "$target_path")"
+            cp "$cpp_file" "$target_path"
+            EXTRACTED=$((EXTRACTED + 1))
+            if [ $((EXTRACTED % 100)) -eq 0 ]; then
+                echo "   ... extracted $EXTRACTED files"
+            fi
+        done 2>/dev/null || true
+        
+        CPP_COUNT=$(find "$BUILD_DIR/src" -name "*.cpp" -type f 2>/dev/null | wc -l || echo "0")
+        if [ "$CPP_COUNT" -gt 0 ]; then
+            echo "✓ Extracted $CPP_COUNT .cpp source files"
+            echo "   Sample extracted files:"
+            find "$BUILD_DIR/src" -name "*.cpp" -type f 2>/dev/null | head -5 | sed 's/^/      /'
+            
+            # Verify a specific file that fastcov will look for
+            SAMPLE_GCNO=$(find "$BUILD_DIR" -name "*.gcno" -type f | head -1)
+            if [ -n "$SAMPLE_GCNO" ]; then
+                ABSOLUTE_PATH=$(strings "$SAMPLE_GCNO" | grep -E "^/.*\.cpp$" | head -1)
+                if [[ "$ABSOLUTE_PATH" == *"/cvc5/"* ]]; then
+                    REL_PATH="${ABSOLUTE_PATH#*cvc5/}"
+                    EXPECTED_PATH="$BUILD_DIR/$REL_PATH"
+                    echo "   Verifying fastcov path resolution:"
+                    echo "     .gcno contains: $ABSOLUTE_PATH"
+                    echo "     fastcov will look for: $EXPECTED_PATH"
+                    if [ -f "$EXPECTED_PATH" ]; then
+                        echo "     ✓ File exists at expected path"
+                    else
+                        echo "     ✗ ERROR: File does NOT exist at expected path"
+                        echo "     Checking if parent directory exists:"
+                        ls -la "$(dirname "$EXPECTED_PATH")" 2>/dev/null | head -5 || echo "       Parent directory does not exist"
+                    fi
+                fi
+            fi
+        else
+            echo "✗ ERROR: No .cpp files found in build directory after extraction"
+            echo "   Checking build directory structure:"
+            ls -la "$BUILD_DIR/src" 2>/dev/null | head -10 || echo "      Build src/ directory does not exist"
+        fi
+    else
+        echo "   ⚠ Warning: No .cpp files found in archive src/ directory"
+        echo "   Archive src/ directory contents:"
+        ls -la "$TMP_DIR/src" 2>/dev/null | head -10 || echo "      Archive src/ directory does not exist"
+    fi
+else
+    echo "⚠ Warning: src/ directory not found in artifacts"
+    echo "   Archive contents:"
+    ls -la "$TMP_DIR" 2>/dev/null | head -20 || echo "      Cannot list archive contents"
+fi
 
 # Extract headers if requested
 if [ "$EXTRACT_HEADERS" = "true" ]; then
