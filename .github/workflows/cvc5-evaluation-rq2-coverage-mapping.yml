@@ -142,53 +142,86 @@ jobs:
         run: |
           pip install psutil fastcov
       
-      - name: Check paths in .gcno files and verify if they exist
+      - name: Run test and diagnose coverage collection
         working-directory: cvc5/build
+        env:
+          TEST_TIMEOUT: 120
         run: |
-          echo "Current workspace: $(pwd)"
+          echo "=== Step 1: Check workspace structure ==="
+          echo "Current directory: $(pwd)"
           echo "Workspace root: $GITHUB_WORKSPACE"
           echo ""
-          echo "Checking what paths are stored in .gcno files..."
+          
+          echo "=== Step 2: Check .gcno files ==="
           SAMPLE_GCNO=$(find . -name "*.gcno" -type f | head -1)
           if [ -n "$SAMPLE_GCNO" ]; then
-            echo "Sample .gcno file: $SAMPLE_GCNO"
-            echo ""
-            echo "Extracting source file paths from .gcno:"
+            echo "Sample .gcno: $SAMPLE_GCNO"
             ABSOLUTE_PATH=$(strings "$SAMPLE_GCNO" | grep -E "^/.*\.cpp$" | head -1)
-            echo "Absolute path from .gcno: $ABSOLUTE_PATH"
-            echo ""
-            echo "Checking if this path exists:"
-            if [ -n "$ABSOLUTE_PATH" ]; then
-              if [ -f "$ABSOLUTE_PATH" ]; then
-                echo "✓ Path EXISTS: $ABSOLUTE_PATH"
-              else
-                echo "✗ Path DOES NOT EXIST: $ABSOLUTE_PATH"
-                echo ""
-                echo "Checking what the actual workspace structure is:"
-                echo "Workspace root contents:"
-                ls -la "$GITHUB_WORKSPACE" | head -10
-                echo ""
-                echo "Checking if cvc5/src exists:"
-                if [ -d "$GITHUB_WORKSPACE/cvc5/src" ]; then
-                  echo "✓ $GITHUB_WORKSPACE/cvc5/src exists"
-                  echo "Sample source file:"
-                  find "$GITHUB_WORKSPACE/cvc5/src" -name "*.cpp" | head -1
-                else
-                  echo "✗ $GITHUB_WORKSPACE/cvc5/src does NOT exist"
-                fi
-              fi
-            fi
-            echo ""
-            echo "Relative path from build directory:"
-            RELATIVE_PATH=$(echo "$ABSOLUTE_PATH" | sed "s|$GITHUB_WORKSPACE/||")
-            echo "Relative: $RELATIVE_PATH"
-            if [ -f "../$RELATIVE_PATH" ]; then
-              echo "✓ Relative path EXISTS: ../$RELATIVE_PATH"
+            echo "Path in .gcno: $ABSOLUTE_PATH"
+            if [ -f "$ABSOLUTE_PATH" ]; then
+              echo "✓ Source file exists at absolute path"
             else
-              echo "✗ Relative path DOES NOT EXIST: ../$RELATIVE_PATH"
+              echo "✗ Source file does NOT exist at absolute path"
             fi
+          fi
+          echo ""
+          
+          echo "=== Step 3: Clear existing .gcda files ==="
+          find . -name "*.gcda" -type f -delete
+          echo "Cleared all .gcda files"
+          echo ""
+          
+          echo "=== Step 4: Run a test to generate coverage ==="
+          ctest -I 1,1 -j1 --output-on-failure 2>&1
+          TEST_EXIT=$?
+          echo "Test exit code: $TEST_EXIT"
+          echo ""
+          
+          echo "=== Step 5: Check what .gcda files were created ==="
+          GCDA_COUNT=$(find . -name "*.gcda" -type f 2>/dev/null | wc -l)
+          echo "Found $GCDA_COUNT .gcda files"
+          if [ "$GCDA_COUNT" -gt 0 ]; then
+            echo "Sample .gcda files:"
+            find . -name "*.gcda" -type f | head -5
+          fi
+          echo ""
+          
+          echo "=== Step 6: Run gcov manually on a sample file ==="
+          if [ -n "$SAMPLE_GCNO" ]; then
+            SAMPLE_GCDA="${SAMPLE_GCNO%.gcno}.gcda"
+            if [ -f "$SAMPLE_GCDA" ]; then
+              echo "Running gcov on: $SAMPLE_GCDA"
+              echo "Working directory: $(pwd)"
+              gcov "$SAMPLE_GCDA" 2>&1
+              echo ""
+              
+              echo "=== Step 7: Check what files gcov created ==="
+              GCOV_FILE="${SAMPLE_GCDA%.gcda}.gcov"
+              if [ -f "$GCOV_FILE" ]; then
+                echo "✓ .gcov file created: $GCOV_FILE"
+                echo "File size: $(wc -l < "$GCOV_FILE") lines"
+                echo "First 20 lines:"
+                head -20 "$GCOV_FILE"
+              else
+                echo "✗ No .gcov file created"
+                echo "Files in current directory:"
+                ls -la "$(dirname "$SAMPLE_GCDA")" | grep -E "\.gcov|\.gcda|\.gcno"
+              fi
+            else
+              echo "No corresponding .gcda file found for $SAMPLE_GCNO"
+            fi
+          fi
+          echo ""
+          
+          echo "=== Step 8: Test fastcov ==="
+          fastcov --gcov gcov --search-directory . --output test_fastcov.json --exclude "/usr/include/*" --exclude "*/deps/*" --jobs 1 2>&1
+          if [ -f "test_fastcov.json" ]; then
+            echo "fastcov output file created"
+            echo "File size: $(wc -l < test_fastcov.json) lines"
+            echo "Content:"
+            cat test_fastcov.json
           else
-            echo "No .gcno files found!"
+            echo "✗ fastcov output file NOT created"
           fi
       
       - name: Run coverage analysis
