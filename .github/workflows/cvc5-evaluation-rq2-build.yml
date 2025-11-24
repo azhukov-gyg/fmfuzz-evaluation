@@ -103,11 +103,11 @@ jobs:
       
       - name: Build CVC5 coverage binary
         run: |
-          # Use Clang with GCC 14 toolchain (explicitly configured above)
-          # build.sh will install system gcc for coverage tools (lcov, fastcov)
-          # But Clang uses GCC 14 via --gcc-toolchain=/usr (now set as default)
-          export CXX="clang++ --gcc-toolchain=/usr"
-          export CC="clang --gcc-toolchain=/usr"
+          # Use GCC 14 directly for compilation to ensure coverage format matches
+          # Clang defaults to '408*' format (GCC 4.8) regardless of toolchain
+          # Using GCC 14 directly ensures 'B42*' format that gcov-14 can read
+          export CXX="g++-14"
+          export CC="gcc-14"
           ./fmfuzz-dev/scripts/cvc5/build.sh --static --coverage
       
       - name: Collect coverage artifacts
