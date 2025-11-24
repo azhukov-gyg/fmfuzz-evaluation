@@ -151,7 +151,23 @@ jobs:
       - name: Install system dependencies for coverage
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc g++ binutils cmake
+          # Install system gcc/gcov (GCC 13) to match what build.sh installs
+          # This matches fmfuzz-dev approach - system gcov can read Clang's '408*' format
+          sudo apt-get install -y \
+            gcc \
+            g++ \
+            binutils \
+            cmake \
+            lcov
+          
+          # Verify we're using the same GCC/gcov versions as build workflow
+          echo "GCC version:"
+          gcc --version
+          echo ""
+          echo "gcov version:"
+          gcov --version
+          echo ""
+          echo "✓ Using system GCC/gcov (matches build workflow)"
       
       - name: Run test and diagnose coverage collection
         working-directory: cvc5/build

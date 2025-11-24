@@ -83,6 +83,21 @@ jobs:
       - name: Add LLVM to PATH
         run: echo "${{ env.LLVM_PATH }}/bin" >> $GITHUB_PATH
       
+      - name: Verify GCC/gcov versions before build
+        run: |
+          # Ensure we're using system GCC (GCC 13) - build.sh will install it
+          # Verify no GCC 14 is installed that could interfere
+          echo "Checking GCC versions:"
+          gcc --version || echo "GCC not yet installed (will be installed by build.sh)"
+          gcov --version || echo "gcov not yet installed (will be installed by build.sh)"
+          echo ""
+          echo "Checking for GCC 14 (should not be installed):"
+          if command -v gcc-14 >/dev/null 2>&1; then
+            echo "⚠️  WARNING: gcc-14 is installed, this may cause toolchain mismatch"
+          else
+            echo "✓ No gcc-14 found (using system GCC 13)"
+          fi
+      
       - name: Clean build for coverage
         run: |
           if [ -d "cvc5/build" ]; then
@@ -91,9 +106,22 @@ jobs:
       
       - name: Build CVC5 coverage binary
         run: |
+          # Use Clang with system GCC toolchain (GCC 13)
+          # build.sh will install system gcc (GCC 13) for coverage tools
+          # This ensures gcov version matches between build and coverage workflows
           export CXX="clang++ --gcc-toolchain=/usr"
           export CC="clang --gcc-toolchain=/usr"
           ./fmfuzz-dev/scripts/cvc5/build.sh --static --coverage
+      
+      - name: Verify GCC/gcov versions after build
+        run: |
+          echo "GCC version used:"
+          gcc --version
+          echo ""
+          echo "gcov version used:"
+          gcov --version
+          echo ""
+          echo "These versions will be used in coverage workflow"
       
       - name: Collect coverage artifacts
         run: |
