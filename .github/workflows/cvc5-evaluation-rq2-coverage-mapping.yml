@@ -363,6 +363,89 @@ jobs:
           fi
           echo ""
           
+          echo "=== Step 7.5: Debug - Check cvc5/build structure and specific files ==="
+          echo "Current directory: $(pwd)"
+          echo "Workspace root: $GITHUB_WORKSPACE"
+          echo ""
+          echo "Directory structure of cvc5/build/src (top 3 levels):"
+          find cvc5/build/src -type d -maxdepth 3 2>/dev/null | head -30 | sort
+          echo ""
+          echo "Checking for specific .cpp files that fastcov is looking for:"
+          MISSING_FILES=0
+          TEST_FILES=(
+            "cvc5/build/src/api/cpp/cvc5_proof_rule.cpp"
+            "cvc5/build/src/expr/node_manager.cpp"
+            "cvc5/build/src/expr/kind.cpp"
+            "cvc5/build/src/expr/metakind.cpp"
+            "cvc5/build/src/expr/type_checker.cpp"
+            "cvc5/build/src/expr/type_properties.cpp"
+            "cvc5/build/src/options/strings_options.cpp"
+            "cvc5/build/src/options/bv_options.cpp"
+            "cvc5/build/src/options/printer_options.cpp"
+            "cvc5/build/src/options/quantifiers_options.cpp"
+            "cvc5/build/src/options/base_options.cpp"
+            "cvc5/build/src/options/parallel_options.cpp"
+            "cvc5/build/src/options/io_utils.cpp"
+            "cvc5/build/src/options/parser_options.cpp"
+            "cvc5/build/src/options/decision_options.cpp"
+            "cvc5/build/src/options/datatypes_options.cpp"
+            "cvc5/build/src/options/options_public.cpp"
+            "cvc5/build/src/options/proof_options.cpp"
+            "cvc5/build/src/options/smt_options.cpp"
+            "cvc5/build/src/options/options.cpp"
+            "cvc5/build/src/options/arith_options.cpp"
+            "cvc5/build/src/options/uf_options.cpp"
+            "cvc5/build/src/options/ff_options.cpp"
+            "cvc5/build/src/options/prop_options.cpp"
+            "cvc5/build/src/options/theory_options.cpp"
+            "cvc5/build/src/rewriter/rewrites-booleans-rewrites.cpp"
+            "cvc5/build/src/rewriter/rewrites-arrays-rewrites.cpp"
+            "cvc5/build/src/rewriter/rewrites-bv-rewrites-elimination.cpp"
+            "cvc5/build/src/rewriter/rewrites-sets-rewrites.cpp"
+            "cvc5/build/src/rewriter/rewrites-bv-rewrites-simplification.cpp"
+            "cvc5/build/src/rewriter/rewrites-strings-rewrites.cpp"
+            "cvc5/build/src/rewriter/rewrites-arith-rewrites.cpp"
+            "cvc5/build/src/rewriter/rewrites-uf-rewrites.cpp"
+            "cvc5/build/src/rewriter/rewrites-strings-rewrites-regexp-membership.cpp"
+            "cvc5/build/src/rewriter/rewrites-arith-rewrites-transcendentals.cpp"
+            "cvc5/build/src/rewriter/rewrites-sets-rewrites-card.cpp"
+            "cvc5/build/src/rewriter/rewrites-bv-rewrites.cpp"
+            "cvc5/build/src/rewriter/rewrites.cpp"
+            "cvc5/build/src/rewriter/rewrites-builtin-rewrites.cpp"
+            "cvc5/build/src/theory/type_enumerator.cpp"
+            "cvc5/build/src/main/options.cpp"
+          )
+          for test_file in "${TEST_FILES[@]}"; do
+            if [ -f "$test_file" ]; then
+              echo "  ✓ $(basename "$test_file")"
+            else
+              echo "  ✗ $(basename "$test_file") - MISSING"
+              MISSING_FILES=$((MISSING_FILES + 1))
+              # Check if parent directory exists
+              PARENT_DIR=$(dirname "$test_file")
+              if [ -d "$PARENT_DIR" ]; then
+                echo "    Parent dir exists, contents:"
+                ls -la "$PARENT_DIR" | head -5 | sed 's/^/      /'
+              else
+                echo "    Parent dir MISSING: $PARENT_DIR"
+              fi
+              # Check if it exists in checkout
+              CHECKOUT_PATH="${test_file#cvc5/build/}"
+              if [ -f "cvc5/src/$CHECKOUT_PATH" ]; then
+                echo "    (exists in checkout at cvc5/src/$CHECKOUT_PATH)"
+              fi
+            fi
+          done
+          echo ""
+          echo "Summary: $MISSING_FILES missing files out of ${#TEST_FILES[@]} checked"
+          echo ""
+          echo "Total .cpp files in cvc5/build/src:"
+          find cvc5/build/src -name "*.cpp" -type f 2>/dev/null | wc -l
+          echo ""
+          echo "Sample .cpp files in cvc5/build/src:"
+          find cvc5/build/src -name "*.cpp" -type f 2>/dev/null | head -10
+          echo ""
+          
           echo "=== Step 8: Test fastcov ==="
           fastcov --gcov gcov --search-directory . --output test_fastcov.json --exclude "/usr/include/*" --exclude "*/deps/*" --jobs 1 2>&1
           if [ -f "test_fastcov.json" ]; then

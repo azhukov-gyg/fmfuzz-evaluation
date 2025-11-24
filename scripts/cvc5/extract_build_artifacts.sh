@@ -229,6 +229,29 @@ if [ -d "$SRC_BASE" ]; then
         if [ "$BUILD_COUNT_AFTER" -lt "$CHECKOUT_COUNT" ]; then
             echo "   ⚠ Warning: Fewer files in build/src/ than in checkout (expected $CHECKOUT_COUNT, got $BUILD_COUNT_AFTER)"
         fi
+        
+        # Verify some specific files that fastcov commonly looks for
+        echo "   Verifying specific files that fastcov needs:"
+        TEST_FILES=(
+            "api/cpp/cvc5_proof_rule.cpp"
+            "expr/node_manager.cpp"
+            "expr/kind.cpp"
+            "options/options.cpp"
+            "rewriter/rewrites.cpp"
+        )
+        for test_file in "${TEST_FILES[@]}"; do
+            if [ -f "$BUILD_DIR/src/$test_file" ]; then
+                echo "     ✓ $test_file exists"
+            else
+                echo "     ✗ $test_file MISSING"
+                # Check if it exists in checkout
+                if [ -f "$SRC_BASE/$test_file" ]; then
+                    echo "       (exists in checkout at $SRC_BASE/$test_file)"
+                else
+                    echo "       (also missing in checkout)"
+                fi
+            fi
+        done
     else
         echo "⚠ Warning: No .cpp files found in checked-out source at $SRC_BASE"
     fi
