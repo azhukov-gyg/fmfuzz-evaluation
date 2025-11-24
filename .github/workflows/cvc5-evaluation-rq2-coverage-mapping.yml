@@ -186,26 +186,56 @@ jobs:
           fi
           echo ""
           
-          echo "=== Step 6: Run gcov manually on a sample file ==="
+          echo "=== Step 6: Check compiler/gcov versions ==="
+          echo "GCC version used for gcov:"
+          gcc --version
+          echo ""
+          echo "Gcov version:"
+          gcov --version
+          echo ""
+          echo "Checking what compiler was used to build (from .gcno file):"
+          if [ -n "$SAMPLE_GCNO" ]; then
+            echo "GCC version string in .gcno:"
+            strings "$SAMPLE_GCNO" | grep -i "gcc\|clang" | head -5
+            echo ""
+            echo "Version info in .gcno:"
+            strings "$SAMPLE_GCNO" | grep -E "version|Version|VERSION" | head -10
+          fi
+          echo ""
+          
+          echo "=== Step 7: Check LLVM/Clang version (if used for build) ==="
+          if command -v clang >/dev/null 2>&1; then
+            echo "Clang version:"
+            clang --version
+          fi
+          echo ""
+          
+          echo "=== Step 8: Run gcov manually on a sample file ==="
           if [ -n "$SAMPLE_GCNO" ]; then
             SAMPLE_GCDA="${SAMPLE_GCNO%.gcno}.gcda"
             if [ -f "$SAMPLE_GCDA" ]; then
               echo "Running gcov on: $SAMPLE_GCDA"
               echo "Working directory: $(pwd)"
+              echo "Full gcov output:"
               gcov "$SAMPLE_GCDA" 2>&1
+              GCOV_EXIT=$?
+              echo "gcov exit code: $GCOV_EXIT"
               echo ""
               
-              echo "=== Step 7: Check what files gcov created ==="
+              echo "=== Step 9: Check what files gcov created ==="
               GCOV_FILE="${SAMPLE_GCDA%.gcda}.gcov"
               if [ -f "$GCOV_FILE" ]; then
                 echo "✓ .gcov file created: $GCOV_FILE"
                 echo "File size: $(wc -l < "$GCOV_FILE") lines"
-                echo "First 20 lines:"
-                head -20 "$GCOV_FILE"
+                echo "First 30 lines:"
+                head -30 "$GCOV_FILE"
               else
                 echo "✗ No .gcov file created"
-                echo "Files in current directory:"
+                echo "Files in directory $(dirname "$SAMPLE_GCDA"):"
                 ls -la "$(dirname "$SAMPLE_GCDA")" | grep -E "\.gcov|\.gcda|\.gcno"
+                echo ""
+                echo "Checking if .gcov file was created elsewhere:"
+                find . -name "*.gcov" -type f 2>/dev/null | head -5
               fi
             else
               echo "No corresponding .gcda file found for $SAMPLE_GCNO"
