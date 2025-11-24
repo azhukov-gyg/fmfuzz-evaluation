@@ -138,6 +138,14 @@ jobs:
         with:
           python-version: '3.12'
       
+      - name: Recreate Python venv (needed for CTest)
+        run: |
+          cd cvc5/build
+          # CVC5's CMake creates a venv during build, but we don't collect it as artifact
+          # Recreate it here so CTest can find the Python executable
+          python3 -m venv venv-3.12.3 --system-site-packages || python3 -m venv venv-3.12.3
+          echo "✓ Created Python venv for CTest"
+      
       - name: Install Python dependencies
         run: |
           pip install psutil fastcov
