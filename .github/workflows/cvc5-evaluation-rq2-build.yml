@@ -83,6 +83,14 @@ jobs:
       - name: Add LLVM to PATH
         run: echo "${{ env.LLVM_PATH }}/bin" >> $GITHUB_PATH
       
+      - name: Install GCC 14 for coverage build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-14 \
+            g++-14 \
+            libstdc++-14-dev
+      
       - name: Clean build for coverage
         run: |
           if [ -d "cvc5/build" ]; then
@@ -91,8 +99,11 @@ jobs:
       
       - name: Build CVC5 coverage binary
         run: |
-          export CXX="clang++ --gcc-toolchain=/usr"
-          export CC="clang --gcc-toolchain=/usr"
+          # Configure Clang to use GCC 14.2 coverage format (B42*)
+          # Without -Xclang -coverage-version='B42*', Clang defaults to GCC 4.8 format (408*)
+          # which is incompatible with GCC 14.2's gcov
+          export CXX="clang++ --gcc-toolchain=/usr -Xclang -coverage-version='B42*'"
+          export CC="clang --gcc-toolchain=/usr -Xclang -coverage-version='B42*'"
           ./fmfuzz-dev/scripts/cvc5/build.sh --static --coverage
       
       - name: Collect coverage artifacts
