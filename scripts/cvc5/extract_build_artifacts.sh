@@ -170,6 +170,54 @@ if [ "$EXTRACT_HEADERS" = "true" ]; then
     fi
 fi
 
+# Copy source files from checked-out cvc5 to build/src/ for fastcov path resolution
+# This ensures files exist at both original paths (cvc5/src/...) and rewritten paths (cvc5/build/src/...)
+# .gcno files contain absolute paths like /path/to/cvc5/src/... but fastcov looks for build/src/...
+SRC_BASE="$BUILD_DIR/../src"
+if [ -d "$SRC_BASE" ]; then
+    echo "🔍 Copying source files from checked-out cvc5 to build directory..."
+    
+    # Count files before copying
+    CHECKOUT_COUNT=$(find "$SRC_BASE" -name "*.cpp" -type f 2>/dev/null | wc -l || echo "0")
+    BUILD_COUNT_BEFORE=$(find "$BUILD_DIR/src" -name "*.cpp" -type f 2>/dev/null | wc -l || echo "0")
+    
+    if [ "$CHECKOUT_COUNT" -gt 0 ]; then
+        # Create temp file list to avoid subshell issues
+        TEMP_FILE_LIST=$(mktemp)
+        find "$SRC_BASE" -type f -name "*.cpp" 2>/dev/null > "$TEMP_FILE_LIST" || true
+        
+        COPIED=0
+        while IFS= read -r cpp_file; do
+            [ -z "$cpp_file" ] && continue
+            rel_path="${cpp_file#$SRC_BASE/}"
+            build_target="$BUILD_DIR/src/$rel_path"
+            
+            # Only copy if file doesn't already exist in build (from artifacts)
+            if [ ! -f "$build_target" ]; then
+                mkdir -p "$(dirname "$build_target")"
+                cp "$cpp_file" "$build_target"
+                COPIED=$((COPIED + 1))
+                if [ $((COPIED % 100)) -eq 0 ]; then
+                    echo "   ... copied $COPIED files from checkout"
+                fi
+            fi
+        done < "$TEMP_FILE_LIST"
+        rm -f "$TEMP_FILE_LIST"
+        
+        BUILD_COUNT_AFTER=$(find "$BUILD_DIR/src" -name "*.cpp" -type f 2>/dev/null | wc -l || echo "0")
+        
+        if [ "$COPIED" -gt 0 ]; then
+            echo "✓ Copied $COPIED .cpp files from checkout to build/src/"
+        fi
+        echo "   Total .cpp files in build/src/: $BUILD_COUNT_AFTER (was $BUILD_COUNT_BEFORE, checkout has $CHECKOUT_COUNT)"
+    else
+        echo "⚠ Warning: No .cpp files found in checked-out source at $SRC_BASE"
+    fi
+else
+    echo "⚠ Warning: Checked-out source directory not found at $SRC_BASE"
+    echo "   Source files may not be available at original paths for fastcov"
+fi
+
 # Verify binary
 if [ -f "$BUILD_DIR/bin/cvc5" ]; then
     "$BUILD_DIR/bin/cvc5" --version > /dev/null 2>&1 && echo "✓ Binary verified" || echo "⚠ Binary verification failed"
