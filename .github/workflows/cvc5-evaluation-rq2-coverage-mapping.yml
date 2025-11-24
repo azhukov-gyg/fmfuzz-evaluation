@@ -142,22 +142,51 @@ jobs:
         run: |
           pip install psutil fastcov
       
-      - name: Check paths in .gcno files
+      - name: Check paths in .gcno files and verify if they exist
         working-directory: cvc5/build
         run: |
+          echo "Current workspace: $(pwd)"
+          echo "Workspace root: $GITHUB_WORKSPACE"
+          echo ""
           echo "Checking what paths are stored in .gcno files..."
           SAMPLE_GCNO=$(find . -name "*.gcno" -type f | head -1)
           if [ -n "$SAMPLE_GCNO" ]; then
             echo "Sample .gcno file: $SAMPLE_GCNO"
             echo ""
             echo "Extracting source file paths from .gcno:"
-            strings "$SAMPLE_GCNO" | grep -E "\.cpp$|\.c$" | head -10
+            ABSOLUTE_PATH=$(strings "$SAMPLE_GCNO" | grep -E "^/.*\.cpp$" | head -1)
+            echo "Absolute path from .gcno: $ABSOLUTE_PATH"
             echo ""
-            echo "Checking for absolute paths:"
-            strings "$SAMPLE_GCNO" | grep -E "^/" | grep -E "\.cpp$|\.c$" | head -10
+            echo "Checking if this path exists:"
+            if [ -n "$ABSOLUTE_PATH" ]; then
+              if [ -f "$ABSOLUTE_PATH" ]; then
+                echo "✓ Path EXISTS: $ABSOLUTE_PATH"
+              else
+                echo "✗ Path DOES NOT EXIST: $ABSOLUTE_PATH"
+                echo ""
+                echo "Checking what the actual workspace structure is:"
+                echo "Workspace root contents:"
+                ls -la "$GITHUB_WORKSPACE" | head -10
+                echo ""
+                echo "Checking if cvc5/src exists:"
+                if [ -d "$GITHUB_WORKSPACE/cvc5/src" ]; then
+                  echo "✓ $GITHUB_WORKSPACE/cvc5/src exists"
+                  echo "Sample source file:"
+                  find "$GITHUB_WORKSPACE/cvc5/src" -name "*.cpp" | head -1
+                else
+                  echo "✗ $GITHUB_WORKSPACE/cvc5/src does NOT exist"
+                fi
+              fi
+            fi
             echo ""
-            echo "Full path context:"
-            strings "$SAMPLE_GCNO" | grep -C3 "\.cpp" | head -20
+            echo "Relative path from build directory:"
+            RELATIVE_PATH=$(echo "$ABSOLUTE_PATH" | sed "s|$GITHUB_WORKSPACE/||")
+            echo "Relative: $RELATIVE_PATH"
+            if [ -f "../$RELATIVE_PATH" ]; then
+              echo "✓ Relative path EXISTS: ../$RELATIVE_PATH"
+            else
+              echo "✗ Relative path DOES NOT EXIST: ../$RELATIVE_PATH"
+            fi
           else
             echo "No .gcno files found!"
           fi
