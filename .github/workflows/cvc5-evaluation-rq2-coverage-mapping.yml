@@ -134,16 +134,21 @@ jobs:
           # Install GCC 14 to match the toolchain used during build
           # This ensures gcov version matches the .gcno file format
           sudo apt-get install -y \
-            gcc \
-            g++ \
+            gcc-14 \
+            g++-14 \
             binutils \
             cmake \
             libstdc++-14-dev
+          # Use GCC 14's gcov instead of system gcov
+          sudo update-alternatives --install /usr/bin/gcov gcov /usr/bin/gcov-14 100
           # Verify GCC version
           echo "GCC version:"
-          gcc --version
+          gcc-14 --version || gcc --version
           echo "Gcov version:"
           gcov --version
+          echo "Gcov path:"
+          which gcov
+          readlink -f $(which gcov) || which gcov
       
       - name: Set up Python
         uses: actions/setup-python@v5
