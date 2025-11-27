@@ -133,37 +133,9 @@ jobs:
       
       - name: Aggregate comparisons
         run: |
-          # Collect all comparison files
-          echo "[]" > /tmp/all_comparisons.json
-          for comp_file in comparisons/comparison-*/comparison_*.json; do
-            if [ -f "$comp_file" ]; then
-              jq -s '.[0] + [.[1]]' /tmp/all_comparisons.json "$comp_file" > /tmp/all_comparisons_new.json
-              mv /tmp/all_comparisons_new.json /tmp/all_comparisons.json
-            fi
-          done
-          
-          # Calculate aggregate statistics using jq
-          jq '{
-            "aggregate": {
-              "total_commits": length,
-              "baseline_better_commits": [.[] | select(.summary.baseline_better > .summary.variant1_better)] | length,
-              "variant1_better_commits": [.[] | select(.summary.variant1_better > .summary.baseline_better)] | length,
-              "total_baseline_better_functions": [.[] | .summary.baseline_better] | add,
-              "total_variant1_better_functions": [.[] | .summary.variant1_better] | add,
-              "total_both_triggered_functions": [.[] | .summary.both_triggered] | add,
-              "total_baseline_executions": [.[] | .summary.total_baseline_executions] | add,
-              "total_variant1_executions": [.[] | .summary.total_variant1_executions] | add
-            },
-            "commits": .
-          }' /tmp/all_comparisons.json > aggregated_comparison.json
-          
-          TOTAL_COMMITS=$(jq -r '.aggregate.total_commits' aggregated_comparison.json)
-          BASELINE_BETTER=$(jq -r '.aggregate.total_baseline_better_functions' aggregated_comparison.json)
-          VARIANT1_BETTER=$(jq -r '.aggregate.total_variant1_better_functions' aggregated_comparison.json)
-          
-          echo "✅ Aggregated comparison for $TOTAL_COMMITS commits"
-          echo "📊 Baseline better: $BASELINE_BETTER functions"
-          echo "📊 Variant1 better: $VARIANT1_BETTER functions"
+          python3 scripts/rq2/aggregate_comparison.py \
+            --comparisons-dir comparisons \
+            --output aggregated_comparison.json
       
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5.1.0
