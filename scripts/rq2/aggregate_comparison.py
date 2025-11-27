@@ -137,20 +137,6 @@ def print_statistics(aggregated: Dict):
                 variant1 = func.get('variant1', {})
                 better = func.get('better', 'neither')
                 
-                # Extract function name (last part after last colon, or use full ID if no colon)
-                if ':' in func_id:
-                    func_name = func_id.split(':')[-1]
-                    # If it's a line number, get the part before it
-                    if func_name.isdigit() and ':' in func_id:
-                        parts = func_id.rsplit(':', 2)
-                        func_name = parts[-2] if len(parts) >= 2 else func_id
-                else:
-                    func_name = func_id
-                
-                # Truncate long function names for readability
-                if len(func_name) > 80:
-                    func_name = func_name[:77] + "..."
-                
                 baseline_triggered = baseline.get('triggered', False)
                 variant1_triggered = variant1.get('triggered', False)
                 baseline_exec = baseline.get('total_executions', 0)
@@ -163,7 +149,8 @@ def print_statistics(aggregated: Dict):
                 elif better == "variant1":
                     better_icon = " [VARIANT1 BETTER]"
                 
-                print(f"    {status_icon} {func_name}{better_icon}", file=sys.stderr)
+                # Print full function ID
+                print(f"    {status_icon} {func_id}{better_icon}", file=sys.stderr)
                 print(f"      Baseline: triggered={baseline_triggered}, executions={baseline_exec:,}", file=sys.stderr)
                 print(f"      Variant1: triggered={variant1_triggered}, executions={variant1_exec:,}", file=sys.stderr)
                 if baseline_triggered and variant1_triggered:
