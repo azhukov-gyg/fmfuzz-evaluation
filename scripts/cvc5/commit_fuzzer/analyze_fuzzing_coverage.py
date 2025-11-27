@@ -54,13 +54,32 @@ def parse_changed_function(function_id: str) -> tuple[str, str, int]:
     """Parse changed function ID into (file_path, signature, line_number)
     
     Format: path/to/file.cpp:function_signature:line_number
+    The signature may contain '::' so we need to be careful about splitting.
     """
-    parts = function_id.rsplit(':', 2)
-    if len(parts) == 3:
-        file_path, signature, line_str = parts
+    # Find the last ':' that's followed by a number (the line number)
+    # Work backwards to find where the line number starts
+    last_colon_idx = -1
+    for i in range(len(function_id) - 1, -1, -1):
+        if function_id[i] == ':':
+            # Check if what follows is a number
+            remaining = function_id[i+1:]
+            if remaining and remaining.isdigit():
+                last_colon_idx = i
+                break
+    
+    if last_colon_idx >= 0:
+        # Split at the last colon before the line number
+        before_line = function_id[:last_colon_idx]
+        line_str = function_id[last_colon_idx+1:]
         try:
             line_num = int(line_str)
-            return (file_path, signature, line_num)
+            # Now split before_line into file_path and signature
+            # Find the first ':' to separate them
+            first_colon_idx = before_line.find(':')
+            if first_colon_idx >= 0:
+                file_path = before_line[:first_colon_idx]
+                signature = before_line[first_colon_idx+1:]
+                return (file_path, signature, line_num)
         except ValueError:
             pass
     
