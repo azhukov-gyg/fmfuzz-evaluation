@@ -112,6 +112,7 @@ def print_statistics(aggregated: Dict):
     for comp in commits:
         commit_hash = comp.get('commit_hash', 'unknown')
         summary = comp.get('summary', {})
+        functions = comp.get('functions', [])
         
         print(f"Commit: {commit_hash}", file=sys.stderr)
         print(f"  Total functions: {summary.get('total_functions', 0)}", file=sys.stderr)
@@ -126,6 +127,54 @@ def print_statistics(aggregated: Dict):
         print(f"  Total baseline executions: {summary.get('total_baseline_executions', 0):,}", file=sys.stderr)
         print(f"  Total variant1 executions: {summary.get('total_variant1_executions', 0):,}", file=sys.stderr)
         print("", file=sys.stderr)
+        
+        # Print per-function details
+        if functions:
+            print(f"  📝 Per-Function Details:", file=sys.stderr)
+            for func in functions:
+                func_id = func.get('function_id', 'unknown')
+                baseline = func.get('baseline', {})
+                variant1 = func.get('variant1', {})
+                better = func.get('better', 'neither')
+                
+                # Extract function name (last part after last colon, or use full ID if no colon)
+                if ':' in func_id:
+                    func_name = func_id.split(':')[-1]
+                    # If it's a line number, get the part before it
+                    if func_name.isdigit() and ':' in func_id:
+                        parts = func_id.rsplit(':', 2)
+                        func_name = parts[-2] if len(parts) >= 2 else func_id
+                else:
+                    func_name = func_id
+                
+                # Truncate long function names for readability
+                if len(func_name) > 80:
+                    func_name = func_name[:77] + "..."
+                
+                baseline_triggered = baseline.get('triggered', False)
+                variant1_triggered = variant1.get('triggered', False)
+                baseline_exec = baseline.get('total_executions', 0)
+                variant1_exec = variant1.get('total_executions', 0)
+                
+                status_icon = "✓" if (baseline_triggered or variant1_triggered) else "✗"
+                better_icon = ""
+                if better == "baseline":
+                    better_icon = " [BASELINE BETTER]"
+                elif better == "variant1":
+                    better_icon = " [VARIANT1 BETTER]"
+                
+                print(f"    {status_icon} {func_name}{better_icon}", file=sys.stderr)
+                print(f"      Baseline: triggered={baseline_triggered}, executions={baseline_exec:,}", file=sys.stderr)
+                print(f"      Variant1: triggered={variant1_triggered}, executions={variant1_exec:,}", file=sys.stderr)
+                if baseline_triggered and variant1_triggered:
+                    diff = baseline_exec - variant1_exec
+                    if diff > 0:
+                        print(f"      Difference: baseline has {diff:,} more executions", file=sys.stderr)
+                    elif diff < 0:
+                        print(f"      Difference: variant1 has {abs(diff):,} more executions", file=sys.stderr)
+                    else:
+                        print(f"      Difference: equal executions", file=sys.stderr)
+            print("", file=sys.stderr)
     
     print("✅ Aggregated comparison complete", file=sys.stderr)
 
