@@ -46,6 +46,7 @@ def compare_statistics(baseline: Dict, variant1: Dict) -> Dict:
         'total_functions': len(all_function_ids),
         'functions': [],
         'summary': {
+            'total_functions': len(all_function_ids),
             'baseline_triggered': 0,
             'variant1_triggered': 0,
             'both_triggered': 0,
