@@ -161,23 +161,28 @@ def find_function_in_fastcov(fastcov_data: Dict, file_path: str,
     
     # Try to match by signature
     # Fastcov stores functions with mangled names, so we need to demangle
-    sig_base = signature.split(':')[0] if ':' in signature else signature
-    sig_normalized = ' '.join(sig_base.split())
+    # The signature from prepare_commit_fuzzer is the full demangled function signature
+    # (format matches coverage_mapper: file_path:signature:line_number where signature has no line)
+    # So we use the signature as-is (it's already the full signature without line number)
+    sig_full = signature
+    sig_normalized = ' '.join(sig_full.split())
     
     if debug:
-        print(f"  [DEBUG] Looking for signature: {sig_base}")
+        print(f"  [DEBUG] Looking for signature: {sig_full}")
         print(f"  [DEBUG] Normalized signature: {sig_normalized}")
     
     for mangled_name, func_data in functions.items():
         demangled = demangle_function_name(mangled_name)
-        demangled_base = demangled.split(':')[0] if ':' in demangled else demangled
-        demangled_normalized = ' '.join(demangled_base.split())
+        # The demangled name from fastcov is the full function signature
+        # (c++filt returns the complete signature, matching what coverage_mapper stores)
+        demangled_full = demangled
+        demangled_normalized = ' '.join(demangled_full.split())
         
         if debug and len(functions) <= 10:  # Only print all if few functions
-            print(f"  [DEBUG]   Comparing with: {demangled_base[:80]}...")
+            print(f"  [DEBUG]   Comparing with: {demangled_full}")
         
         # Try exact match first
-        if sig_base == demangled_base:
+        if sig_full == demangled_full:
             exec_count = func_data.get('execution_count', 0)
             if debug:
                 print(f"  [DEBUG] ✓ EXACT MATCH! Execution count: {exec_count}")

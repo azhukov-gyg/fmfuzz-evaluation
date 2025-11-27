@@ -410,10 +410,29 @@ jobs:
             --commit-hash ${{ matrix.commit }} \
             --coverage-map-commit ${{ matrix.commit }}
       
-      - name: Upload merged statistics
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
         with:
-          name: merged-statistics-${{ matrix.commit }}
-          path: merged_statistics_${{ matrix.commit }}.json
-          if-no-files-found: ignore
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload merged statistics to S3
+        if: always()
+        run: |
+          COMMIT_HASH="${{ matrix.commit }}"
+          S3_KEY="evaluation/rq2/cvc5/fuzzing-statistics/variant1/fuzzing_statistics-${COMMIT_HASH}.json.gz"
+          
+          if [ ! -f "merged_statistics_${COMMIT_HASH}.json" ]; then
+            echo "⚠️ Merged statistics file not found"
+            exit 0
+          fi
+          
+          gzip -c merged_statistics_${COMMIT_HASH}.json > merged_statistics_${COMMIT_HASH}.json.gz
+          
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body merged_statistics_${COMMIT_HASH}.json.gz
+          
+          echo "✅ Uploaded fuzzing statistics to S3: $S3_KEY"
