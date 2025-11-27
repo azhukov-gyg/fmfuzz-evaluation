@@ -158,18 +158,41 @@ def find_function_in_fastcov(fastcov_data: Dict, file_path: str,
     if debug:
         print(f"  [DEBUG] Found {len(functions)} functions in file")
         print(f"  [DEBUG] Function names (first 5): {list(functions.keys())[:5]}")
+        print(f"  [DEBUG] Raw file_data structure keys: {list(file_data.keys())}")
+        if '' in file_data:
+            print(f"  [DEBUG] Raw file_data[''] keys: {list(file_data[''].keys())}")
+        
+        # Show execution counts for all functions in this file (sorted by count)
+        all_funcs_with_counts = []
+        for mangled, data in functions.items():
+            count = data.get('execution_count', 0)
+            if count > 0:
+                all_funcs_with_counts.append((mangled, count, data.get('start_line', 0)))
+        all_funcs_with_counts.sort(key=lambda x: x[1], reverse=True)  # Sort by execution count
+        
+        print(f"  [DEBUG] Functions with execution_count > 0 in this file ({len(all_funcs_with_counts)} total):")
+        for i, (mangled, count, line) in enumerate(all_funcs_with_counts[:10]):  # Show top 10
+            demangled = demangle_function_name(mangled)
+            print(f"    [{i+1}] exec={count:>8} line={line:>4} | {demangled[:100]}...")
+        if len(all_funcs_with_counts) > 10:
+            print(f"    ... and {len(all_funcs_with_counts) - 10} more functions with executions")
     
-    # Try to match by signature
+    # Try to match by signature only (no line numbers)
     # Fastcov stores functions with mangled names, so we need to demangle
     # The signature from prepare_commit_fuzzer is the full demangled function signature
-    # (format matches coverage_mapper: file_path:signature:line_number where signature has no line)
-    # So we use the signature as-is (it's already the full signature without line number)
+    # We match on signature only - line numbers are unreliable (libclang vs fastcov can differ)
+    # This matches how coverage_mapper creates function IDs: src/file.cpp:FullDemangledSignature:line
+    # but we only use the signature part for matching
     sig_full = signature
     sig_normalized = ' '.join(sig_full.split())
     
     if debug:
         print(f"  [DEBUG] Looking for signature: {sig_full}")
         print(f"  [DEBUG] Normalized signature: {sig_normalized}")
+        print(f"  [DEBUG] Expected line: {line_num} (not used for matching, only for reference)")
+    
+    # Collect all candidate functions for debug output if no match found
+    candidates = []
     
     for mangled_name, func_data in functions.items():
         demangled = demangle_function_name(mangled_name)
@@ -178,25 +201,53 @@ def find_function_in_fastcov(fastcov_data: Dict, file_path: str,
         demangled_full = demangled
         demangled_normalized = ' '.join(demangled_full.split())
         
-        if debug and len(functions) <= 10:  # Only print all if few functions
-            print(f"  [DEBUG]   Comparing with: {demangled_full}")
+        # Get line number from fastcov for reference/debugging only
+        fastcov_line = func_data.get('start_line', 0)
+        exec_count = func_data.get('execution_count', 0)
         
-        # Try exact match first
+        # Store candidate for debug output
+        candidates.append({
+            'demangled': demangled_full,
+            'line': fastcov_line,
+            'exec_count': exec_count
+        })
+        
+        if debug and len(functions) <= 10:  # Only print all if few functions
+            print(f"  [DEBUG]   Comparing with: {demangled_full} (line {fastcov_line}, exec={exec_count})")
+        
+        # Try exact match first (signature only, no line number check)
         if sig_full == demangled_full:
-            exec_count = func_data.get('execution_count', 0)
             if debug:
-                print(f"  [DEBUG] ✓ EXACT MATCH! Execution count: {exec_count}")
+                print(f"  [DEBUG] ✓ EXACT MATCH!")
+                print(f"  [DEBUG]   Raw fastcov data:")
+                print(f"  [DEBUG]     - Mangled name: {mangled_name}")
+                print(f"  [DEBUG]     - Demangled: {demangled_full}")
+                print(f"  [DEBUG]     - Execution count: {exec_count}")
+                print(f"  [DEBUG]     - Start line (fastcov): {fastcov_line}")
+                print(f"  [DEBUG]     - Expected line (libclang): {line_num}")
+                print(f"  [DEBUG]     - Full func_data: {json.dumps(func_data, indent=8)}")
             return exec_count
         
         # Try normalized match (remove whitespace differences)
         if sig_normalized == demangled_normalized:
-            exec_count = func_data.get('execution_count', 0)
             if debug:
-                print(f"  [DEBUG] ✓ NORMALIZED MATCH! Execution count: {exec_count}")
+                print(f"  [DEBUG] ✓ NORMALIZED MATCH!")
+                print(f"  [DEBUG]   Raw fastcov data:")
+                print(f"  [DEBUG]     - Mangled name: {mangled_name}")
+                print(f"  [DEBUG]     - Demangled: {demangled_full}")
+                print(f"  [DEBUG]     - Execution count: {exec_count}")
+                print(f"  [DEBUG]     - Start line (fastcov): {fastcov_line}")
+                print(f"  [DEBUG]     - Expected line (libclang): {line_num}")
+                print(f"  [DEBUG]     - Full func_data: {json.dumps(func_data, indent=8)}")
             return exec_count
     
     if debug:
         print(f"  [DEBUG] ✗ No match found")
+        print(f"  [DEBUG] All candidates in this file ({len(candidates)} functions):")
+        for i, cand in enumerate(candidates[:20]):  # Show first 20 candidates
+            print(f"    [{i+1}] {cand['demangled'][:120]}... (line {cand['line']}, exec={cand['exec_count']})")
+        if len(candidates) > 20:
+            print(f"    ... and {len(candidates) - 20} more functions")
     
     return None
 
@@ -246,6 +297,18 @@ def analyze_coverage(changed_functions_file: Path, fastcov_json_file: Path, debu
         
         if execution_count is None:
             execution_count = 0
+        
+        if debug:
+            print(f"  [DEBUG] Final result for this function:")
+            print(f"  [DEBUG]   - Function ID: {func_id}")
+            print(f"  [DEBUG]   - File: {file_path}")
+            print(f"  [DEBUG]   - Signature: {signature}")
+            print(f"  [DEBUG]   - Line number: {line_num}")
+            print(f"  [DEBUG]   - Execution count: {execution_count}")
+            print(f"  [DEBUG]   - Triggered: {execution_count > 0}")
+            if execution_count > 0:
+                print(f"  [DEBUG]   - Note: Execution count is cumulative across all fuzzing inputs and jobs")
+                print(f"  [DEBUG]   - This represents total times the function was called during the entire fuzzing run")
         
         function_stats.append({
             "function_id": func_id,
