@@ -71,15 +71,6 @@ jobs:
         with:
           submodules: recursive
       
-      - name: Clone Z3 repository (for commit hash expansion)
-        run: |
-          if [ -d "z3" ]; then
-            cd z3
-            git fetch origin
-          else
-            git clone https://github.com/Z3Prover/z3.git z3
-          fi
-      
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5.1.0
         with:
@@ -87,21 +78,21 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
       
+      - name: Checkout exact Z3 commit (for source files and commit hash expansion)
+        uses: actions/checkout@v5
+        with:
+          repository: Z3Prover/z3
+          ref: ${{ matrix.commit }}
+          path: z3
+          fetch-depth: 0
+      
       - name: Get full commit hash
         id: get-commit
         run: |
-          # Expand short hash to full hash if needed
-          if [ -d "z3" ]; then
-            cd z3
-            git fetch origin --quiet 2>/dev/null || true
-            FULL_HASH=$(git rev-parse "${{ matrix.commit }}")
-            echo "commit_hash=$FULL_HASH" >> $GITHUB_OUTPUT
-            echo "Expanded ${{ matrix.commit }} to $FULL_HASH"
-          else
-            # Fallback: use matrix.commit as-is
-            echo "commit_hash=${{ matrix.commit }}" >> $GITHUB_OUTPUT
-            echo "Using ${{ matrix.commit }} as-is (repo not available)"
-          fi
+          cd z3
+          FULL_HASH=$(git rev-parse HEAD)
+          echo "commit_hash=$FULL_HASH" >> $GITHUB_OUTPUT
+          echo "Expanded ${{ matrix.commit }} to $FULL_HASH"
       
       - name: Download coverage binary
         run: |
