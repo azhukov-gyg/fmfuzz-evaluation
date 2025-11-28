@@ -172,11 +172,15 @@ jobs:
           pip install psutil fastcov
       
       - name: Run coverage analysis
+        working-directory: z3/build
+        env:
+          TEST_TIMEOUT: 120
         run: |
-          ${{ github.workspace }}/fmfuzz-dev/scripts/measure_time.sh \
-            ${{ github.workspace }}/fmfuzz-dev/scripts/z3/coverage/run_coverage_builder.sh \
-            ${{ matrix.chunk.start_index }} \
-            ${{ matrix.chunk.end_index }}
+          python3 ../../fmfuzz-dev/scripts/z3/coverage/coverage_mapper.py \
+            --build-dir . \
+            --z3test-dir ../../z3test \
+            --start-index ${{ matrix.chunk.start_index }} \
+            --end-index ${{ matrix.chunk.end_index }}
       
       - name: Upload coverage mapping chunk
         uses: actions/upload-artifact@v4
