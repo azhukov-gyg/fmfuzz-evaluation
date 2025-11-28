@@ -168,7 +168,7 @@ jobs:
           SKIP_COVERAGE_ENFORCEMENT: "true"
           MAX_JOBS: 4
         run: |
-          python3 ${{ github.workspace }}/fmfuzz-dev/scripts/z3/commit_fuzzer/prepare_commit_fuzzer.py \
+          python3 ${{ github.workspace }}/scripts/z3/commit_fuzzer/prepare_commit_fuzzer.py \
             ${{ steps.get-commit.outputs.commit_hash }} \
             --coverage-json ../coverage_mapping.json \
             --compile-commands build \
@@ -357,7 +357,7 @@ jobs:
       - name: Run fuzzing with coverage tracking
         run: |
           FUZZING_DURATION="${{ inputs.fuzzing_duration_minutes || 60 }}"
-          python3 scripts/z3/commit_fuzzer/simple_commit_fuzzer.py \
+          python3 ${{ github.workspace }}/scripts/z3/commit_fuzzer/simple_commit_fuzzer.py \
             --tests-json '${{ toJson(matrix.fuzzer_job.tests) }}' \
             --tests-root z3test \
             --z3-path z3/build/z3 \
@@ -413,8 +413,8 @@ jobs:
             exit 0
           fi
           
-          # Merge statistics (reuse Z3 script - it's solver-agnostic)
-          python3 scripts/z3/commit_fuzzer/merge_fuzzing_statistics.py \
+          # Merge statistics
+          python3 ${{ github.workspace }}/scripts/z3/commit_fuzzer/merge_fuzzing_statistics.py \
             $STATS_FILES \
             --output merged_statistics_${{ matrix.commit }}.json \
             --commit-hash ${{ matrix.commit }} \
