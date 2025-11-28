@@ -171,6 +171,134 @@ jobs:
           echo "Gcov version: $(gcov-14 --version | head -1)"
           pip install psutil fastcov
       
+      - name: Clear existing .gcda files and verify coverage setup
+        working-directory: z3/build
+        env:
+          TEST_TIMEOUT: 120
+        run: |
+          echo "=== Step 1: Check workspace structure ==="
+          echo "Current directory: $(pwd)"
+          echo "Workspace root: $GITHUB_WORKSPACE"
+          echo ""
+          
+          echo "=== Step 2: Check .gcno files ==="
+          SAMPLE_GCNO=$(find . -name "*.gcno" -type f | head -1)
+          if [ -n "$SAMPLE_GCNO" ]; then
+            echo "Sample .gcno: $SAMPLE_GCNO"
+            ABSOLUTE_PATH=$(strings "$SAMPLE_GCNO" | grep -E "^/.*\.cpp$" | head -1)
+            echo "Path in .gcno: $ABSOLUTE_PATH"
+            if [ -f "$ABSOLUTE_PATH" ]; then
+              echo "✓ Source file exists at absolute path"
+            else
+              echo "✗ Source file does NOT exist at absolute path"
+            fi
+          fi
+          echo ""
+          
+          echo "=== Step 3: Clear existing .gcda files ==="
+          find . -name "*.gcda" -type f -delete
+          echo "Cleared all .gcda files"
+          echo ""
+          
+          echo "=== Step 4: Check compiler/gcov versions ==="
+          echo "GCC version used for gcov:"
+          gcc --version
+          echo ""
+          echo "Gcov version:"
+          gcov --version
+          echo ""
+          echo "Checking what compiler was used to build (from .gcno file):"
+          if [ -n "$SAMPLE_GCNO" ]; then
+            echo "GCC version string in .gcno:"
+            strings "$SAMPLE_GCNO" | grep -i "gcc\|clang" | head -5
+            echo ""
+            echo "Version info in .gcno:"
+            strings "$SAMPLE_GCNO" | grep -E "version|Version|VERSION" | head -10
+          fi
+          echo ""
+          
+          echo "=== Step 5: Test fastcov with zerocounters ==="
+          fastcov --zerocounters --search-directory . --exclude "/usr/include/*" --exclude "*/deps/*" 2>&1
+          echo "✓ fastcov zerocounters completed"
+          echo ""
+          
+          echo "=== Step 6: Verify Z3 binary exists ==="
+          if [ -f "./z3" ]; then
+            echo "✓ Z3 binary found: ./z3"
+            ./z3 --version | head -1
+          else
+            echo "✗ Z3 binary NOT found at ./z3"
+            echo "Files in current directory:"
+            ls -la | head -10
+          fi
+          echo ""
+          
+          echo "=== Step 7: Check z3test directory ==="
+          if [ -d "../../z3test" ]; then
+            echo "✓ z3test directory found"
+            SMT_COUNT=$(find ../../z3test -name "*.smt" -o -name "*.smt2" | wc -l)
+            echo "  Found $SMT_COUNT SMT files"
+          else
+            echo "✗ z3test directory NOT found at ../../z3test"
+          fi
+          echo ""
+          
+          echo "=== Step 8: Test fastcov on a sample (after running a test) ==="
+          # Run a simple test to generate coverage
+          if [ -f "./z3" ] && [ -d "../../z3test" ]; then
+            SAMPLE_TEST=$(find ../../z3test -name "*.smt2" | head -1)
+            if [ -n "$SAMPLE_TEST" ]; then
+              echo "Running sample test: $SAMPLE_TEST"
+              timeout 10 ./z3 model_validate=true "$SAMPLE_TEST" > /dev/null 2>&1 || true
+              
+              # Check if .gcda files were created
+              GCDA_COUNT=$(find . -name "*.gcda" -type f 2>/dev/null | wc -l)
+              echo "Found $GCDA_COUNT .gcda files after test"
+              
+              if [ "$GCDA_COUNT" -gt 0 ]; then
+                echo "Sample .gcda files:"
+                find . -name "*.gcda" -type f | head -3
+                echo ""
+                
+                # Run fastcov to see what it produces
+                echo "Running fastcov test..."
+                fastcov --gcov gcov --search-directory . --output test_fastcov.json --exclude "/usr/include/*" --exclude "*/deps/*" --jobs 1 2>&1 | head -20
+                
+                if [ -f "test_fastcov.json" ]; then
+                  echo "✓ fastcov output file created"
+                  FILE_SIZE=$(wc -c < test_fastcov.json)
+                  echo "File size: $FILE_SIZE bytes"
+                  
+                  # Check if it has sources
+                  if command -v jq >/dev/null 2>&1; then
+                    SOURCE_COUNT=$(jq '.sources | length' test_fastcov.json 2>/dev/null || echo "0")
+                    echo "Number of sources in fastcov JSON: $SOURCE_COUNT"
+                    
+                    # Show a sample source path
+                    SAMPLE_SOURCE=$(jq -r '.sources | keys[0]' test_fastcov.json 2>/dev/null || echo "")
+                    if [ -n "$SAMPLE_SOURCE" ] && [ "$SAMPLE_SOURCE" != "null" ]; then
+                      echo "Sample source path: $SAMPLE_SOURCE"
+                      # Check if it would pass is_z3_source_file filter
+                      if [[ "$SAMPLE_SOURCE" == *"src/"* ]] && [[ "$SAMPLE_SOURCE" != *"/build/"* ]] && [[ "$SAMPLE_SOURCE" != *"/usr/include/"* ]]; then
+                        echo "  ✓ Would pass is_z3_source_file filter"
+                      else
+                        echo "  ✗ Would NOT pass is_z3_source_file filter"
+                      fi
+                    fi
+                  fi
+                  
+                  # Clean up
+                  rm -f test_fastcov.json
+                else
+                  echo "✗ fastcov output file NOT created"
+                fi
+              else
+                echo "⚠ No .gcda files created - coverage may not be working"
+              fi
+            fi
+          fi
+          echo ""
+      
       - name: Run coverage analysis
         working-directory: z3/build
         env:
