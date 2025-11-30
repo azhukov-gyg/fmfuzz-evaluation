@@ -41,6 +41,7 @@ class SimpleCommitFuzzer:
         num_workers: int = 4,
         iterations: int = 250,
         modulo: int = 2,
+        seed: int = 42,
         time_remaining: Optional[int] = None,
         job_start_time: Optional[float] = None,
         stop_buffer_minutes: int = 5,
@@ -54,6 +55,7 @@ class SimpleCommitFuzzer:
         self.bugs_folder = Path(bugs_folder)
         self.iterations = iterations
         self.modulo = modulo
+        self.seed = seed
         self.job_id = job_id
         self.start_time = time.time()
         
@@ -560,6 +562,7 @@ class SimpleCommitFuzzer:
             "typefuzz",
             "-i", str(self.iterations),
             "-m", str(self.modulo),
+            "--seed", str(self.seed),
             "--timeout", "120",
             "--bugs", str(bugs_folder),
             "--scratch", str(scratch_folder),
@@ -928,6 +931,12 @@ def main():
         help="Modulo parameter for typefuzz -m flag (default: 2)",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for typefuzz --seed flag (default: 42)",
+    )
+    parser.add_argument(
         "--z3-old-path",
         required=False,
         help="Path to z3-4.8.7 binary (not used, commented out)",
@@ -1013,6 +1022,7 @@ def main():
             num_workers=args.workers,
             iterations=args.iterations,
             modulo=args.modulo,
+            seed=args.seed,
             time_remaining=args.time_remaining,
             job_start_time=args.job_start_time,
             stop_buffer_minutes=args.stop_buffer_minutes,

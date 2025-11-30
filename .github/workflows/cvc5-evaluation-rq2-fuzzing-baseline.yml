@@ -121,6 +121,32 @@ jobs:
             echo "Using ${{ matrix.commit }} as-is (repo not available)"
           fi
       
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Download coverage mapping from S3
+        run: |
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/cvc5/coverage-mappings/variant1/coverage_mapping-${COMMIT_HASH}.json.gz"
+          
+          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY coverage_mapping.json.gz || {
+            echo "⚠️ Coverage mapping not found, falling back to discovering all tests"
+            echo "use_coverage_mapping=false" >> $GITHUB_ENV
+            exit 0
+          }
+          echo "✅ Downloaded coverage mapping for $COMMIT_HASH"
+          echo "use_coverage_mapping=true" >> $GITHUB_ENV
+      
+      - name: Extract coverage mapping
+        if: env.use_coverage_mapping == 'true'
+        run: |
+          gunzip coverage_mapping.json.gz
+          echo "✅ Extracted coverage mapping"
+      
       - name: Download coverage binary from S3
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
@@ -153,10 +179,33 @@ jobs:
           FUNCTION_COUNT=$(jq -r '.total_functions' changed_functions_data.json)
           echo "✅ Read $FUNCTION_COUNT changed functions from variant1 statistics"
       
-      - name: Shuffle all tests
+      - name: Extract tests from coverage mapping
         id: pick-tests
+        if: env.use_coverage_mapping == 'true'
+        run: |
+          python3 scripts/rq2/extract_tests_from_coverage.py \
+            --coverage-mapping coverage_mapping.json \
+            --seed 42 \
+            --output fuzzer_matrix.json
+          
+          TOTAL_TESTS=$(jq -r '.total_tests' fuzzer_matrix.json)
+          TOTAL_JOBS=$(jq -r '.total_jobs' fuzzer_matrix.json)
+          echo "✅ Extracted $TOTAL_TESTS tests from coverage mapping in $TOTAL_JOBS jobs"
+          
+          # Create combined matrix: commit + fuzzer_job
+          jq -c --arg commit "${{ matrix.commit }}" '{
+            "include": (.matrix.include | map({
+              "commit": $commit,
+              "fuzzer_job": .
+            }))
+          }' fuzzer_matrix.json > combined_matrix.json
+      
+      - name: Shuffle all tests (fallback)
+        id: pick-tests-fallback
+        if: env.use_coverage_mapping != 'true'
         run: |
           python3 scripts/rq2/pick_random_tests.py \
+            --solver cvc5 \
             --build-dir cvc5/build \
             --seed 42 \
             --output fuzzer_matrix.json
