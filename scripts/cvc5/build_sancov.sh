@@ -43,14 +43,16 @@ echo "  Jobs: $JOBS"
 echo "  CVC5 dir: $CVC5_DIR"
 echo "  Build dir: $BUILD_DIR"
 
-# Check if allowlist exists
+# Convert allowlist path to absolute path (required for CMake compiler tests)
 if [ ! -f "$ALLOWLIST_FILE" ]; then
     echo "⚠️  Warning: Allowlist file not found: $ALLOWLIST_FILE"
     echo "   Building without allowlist (all functions will be instrumented)"
     ALLOWLIST_FLAG=""
 else
-    echo "✅ Using allowlist: $ALLOWLIST_FILE"
-    ALLOWLIST_FLAG="-fsanitize-coverage-allowlist=$ALLOWLIST_FILE"
+    # Convert to absolute path
+    ALLOWLIST_ABS=$(cd "$(dirname "$ALLOWLIST_FILE")" && pwd)/$(basename "$ALLOWLIST_FILE")
+    echo "✅ Using allowlist: $ALLOWLIST_FILE (absolute: $ALLOWLIST_ABS)"
+    ALLOWLIST_FLAG="-fsanitize-coverage-allowlist=$ALLOWLIST_ABS"
 fi
 
 # Check if CVC5 directory exists
