@@ -326,6 +326,14 @@ jobs:
           git checkout ${{ matrix.commit }}
           echo "Checked out commit: $(git rev-parse HEAD)"
       
+      - name: Get full commit hash
+        id: get-commit
+        working-directory: cvc5
+        run: |
+          FULL_HASH=$(git rev-parse HEAD)
+          echo "commit_hash=$FULL_HASH" >> $GITHUB_OUTPUT
+          echo "Expanded ${{ matrix.commit }} to $FULL_HASH"
+      
       - name: Clean up git repositories to save space
         run: |
           rm -rf cvc5/.git yinyang/.git || true
@@ -340,11 +348,12 @@ jobs:
       
       - name: Download coverage binary from S3
         run: |
-          S3_KEY="evaluation/rq2/cvc5/builds/coverage/${{ matrix.commit }}.tar.gz"
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/cvc5/builds/coverage/${COMMIT_HASH}.tar.gz"
           
           mkdir -p artifacts
           aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY artifacts/artifacts.tar.gz
-          echo "✅ Downloaded coverage binary for ${{ matrix.commit }}"
+          echo "✅ Downloaded coverage binary for $COMMIT_HASH"
       
       - name: Extract coverage binary
         run: |

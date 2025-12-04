@@ -336,6 +336,14 @@ jobs:
           git checkout ${{ matrix.commit }}
           echo "Checked out commit: $(git rev-parse HEAD)"
       
+      - name: Get full commit hash
+        id: get-commit
+        working-directory: z3
+        run: |
+          FULL_HASH=$(git rev-parse HEAD)
+          echo "commit_hash=$FULL_HASH" >> $GITHUB_OUTPUT
+          echo "Expanded ${{ matrix.commit }} to $FULL_HASH"
+      
       - name: Clone z3test repository
         run: |
           if [ -d "z3test" ]; then
@@ -366,11 +374,12 @@ jobs:
       
       - name: Download coverage binary from S3
         run: |
-          S3_KEY="evaluation/rq2/z3/builds/coverage/${{ matrix.commit }}.tar.gz"
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/z3/builds/coverage/${COMMIT_HASH}.tar.gz"
           
           mkdir -p artifacts
           aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY artifacts/artifacts.tar.gz
-          echo "✅ Downloaded coverage binary for ${{ matrix.commit }}"
+          echo "✅ Downloaded coverage binary for $COMMIT_HASH"
       
       - name: Extract coverage binary
         run: |
