@@ -294,15 +294,30 @@ jobs:
       - name: Extract test list for this job
         id: extract-tests
         run: |
+          # Debug: show what we're looking for
+          echo "Looking for commit: ${{ matrix.commit }}, job_id: ${{ matrix.job_id }}"
+          
+          # Debug: show first few entries in the matrix
+          echo "First few matrix entries:"
+          jq '.include[0:3]' fuzzing_matrix.json || true
+          
           # Find the entry in the full matrix that matches this job
+          # Handle both string and numeric job_id, and commit hash matching (short or full)
           JOB_DATA=$(jq -c --arg commit "${{ matrix.commit }}" --arg job_id "${{ matrix.job_id }}" '
             .include[] | 
-            select(.commit == $commit and .fuzzer_job.job_id == $job_id) |
+            select(
+              (.commit == $commit or (.commit | startswith($commit)) or ($commit | startswith(.commit))) and
+              (.fuzzer_job.job_id == $job_id or (.fuzzer_job.job_id | tostring) == $job_id)
+            ) |
             .fuzzer_job.tests
           ' fuzzing_matrix.json)
           
           if [ -z "$JOB_DATA" ] || [ "$JOB_DATA" = "null" ]; then
             echo "❌ Error: Could not find test data for commit ${{ matrix.commit }}, job_id ${{ matrix.job_id }}"
+            echo "Available commits in matrix:"
+            jq -r '.include[].commit' fuzzing_matrix.json | sort -u | head -5
+            echo "Available job_ids for this commit:"
+            jq -r --arg commit "${{ matrix.commit }}" '.include[] | select(.commit == $commit or (.commit | startswith($commit)) or ($commit | startswith(.commit))) | .fuzzer_job.job_id' fuzzing_matrix.json | sort -u | head -5
             exit 1
           fi
           
