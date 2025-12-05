@@ -276,12 +276,31 @@ jobs:
             fi
           done
           
-          jq -c '{include: .}' /tmp/all_entries.json > /tmp/fuzzing_matrix.json
-          FUZZING_MATRIX=$(cat /tmp/fuzzing_matrix.json)
-          echo "fuzzing_matrix=$FUZZING_MATRIX" >> $GITHUB_OUTPUT
+          # Create final matrix structure with full data (for artifact)
+          jq -c '{include: .}' /tmp/all_entries.json > fuzzing_matrix.json
+          
+          # Create minimal matrix for job outputs (only commit + job_id to avoid size limits)
+          jq -c '{
+            include: [.include[] | {
+              commit: .commit,
+              job_id: .fuzzer_job.job_id
+            }]
+          }' /tmp/all_entries.json > fuzzing_matrix_minimal.json
           
           COUNT=$(jq 'length' /tmp/all_entries.json)
           echo "✅ Merged matrices: $COUNT total fuzzing jobs"
+          
+          # Use minimal matrix for job output (much smaller)
+          MINIMAL_MATRIX=$(cat fuzzing_matrix_minimal.json)
+          echo "fuzzing_matrix=$MINIMAL_MATRIX" >> $GITHUB_OUTPUT
+          echo "total_jobs=$COUNT" >> $GITHUB_OUTPUT
+      
+      - name: Upload merged matrix (full data)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzzing-matrix-full
+          path: fuzzing_matrix.json
+          retention-days: 1
 
   fuzzing-jobs:
     needs: [generate-matrix, prepare-baseline, collect-matrices]
@@ -297,6 +316,34 @@ jobs:
         uses: actions/checkout@v5
         with:
           submodules: recursive
+      
+      - name: Download full matrix data
+        uses: actions/download-artifact@v4
+        with:
+          name: fuzzing-matrix-full
+          path: .
+      
+      - name: Extract test list for this job
+        id: extract-tests
+        run: |
+          # Find the entry in the full matrix that matches this job
+          JOB_DATA=$(jq -c --arg commit "${{ matrix.commit }}" --arg job_id "${{ matrix.job_id }}" '
+            .include[] | 
+            select(.commit == $commit and .fuzzer_job.job_id == $job_id) |
+            .fuzzer_job.tests
+          ' fuzzing_matrix.json)
+          
+          if [ -z "$JOB_DATA" ] || [ "$JOB_DATA" = "null" ]; then
+            echo "❌ Error: Could not find test data for commit ${{ matrix.commit }}, job_id ${{ matrix.job_id }}"
+            exit 1
+          fi
+          
+          # Output tests as multiline JSON (GitHub Actions supports this)
+          echo "tests<<EOF" >> $GITHUB_OUTPUT
+          echo "$JOB_DATA" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "✅ Extracted $(echo "$JOB_DATA" | jq 'length') tests for job ${{ matrix.job_id }}"
       
       - name: Install system dependencies
         run: |
@@ -400,9 +447,11 @@ jobs:
         working-directory: z3
         run: |
           FUZZING_DURATION="${{ inputs.fuzzing_duration_minutes || 60 }}"
+          # Parse the tests JSON from the multiline output
+          TESTS_JSON='${{ steps.extract-tests.outputs.tests }}'
           python3 ${{ github.workspace }}/scripts/z3/commit_fuzzer/simple_commit_fuzzer.py \
-            --tests-json '${{ toJson(matrix.fuzzer_job.tests) }}' \
-            --job-id '${{ matrix.fuzzer_job.job_id }}' \
+            --tests-json "$TESTS_JSON" \
+            --job-id '${{ matrix.job_id }}' \
             --tests-root ../z3test \
             --fuzzing-duration-minutes ${FUZZING_DURATION} \
             --iterations 250 \
@@ -410,15 +459,15 @@ jobs:
             --cvc5-path $(which cvc5) \
             --changed-functions ../changed_functions.json \
             --build-dir ./build \
-            --output-statistics ../statistics_commit_${{ matrix.commit }}_job_${{ matrix.fuzzer_job.job_id }}.json \
+            --output-statistics ../statistics_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json \
             --commit-hash ${{ matrix.commit }}
       
       - name: Upload statistics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: baseline-statistics-commit-${{ matrix.commit }}-job-${{ matrix.fuzzer_job.job_id }}
-          path: statistics_commit_${{ matrix.commit }}_job_${{ matrix.fuzzer_job.job_id }}.json
+          name: baseline-statistics-commit-${{ matrix.commit }}-job-${{ matrix.job_id }}
+          path: statistics_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json
           if-no-files-found: ignore
 
   merge-statistics:
