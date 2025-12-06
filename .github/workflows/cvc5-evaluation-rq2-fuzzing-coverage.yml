@@ -12,6 +12,11 @@ on:
         description: 'Debug: Specific commit hash to test (e.g., 686e31842b7b020382e8af38507fd616fed78740). If provided, only this commit will be fuzzed.'
         required: false
         type: string
+      dry_run:
+        description: 'Dry run: Skip S3 uploads (default: false). Set to true to test without uploading results to S3.'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   generate-matrix:
@@ -460,6 +465,7 @@ jobs:
             --coverage-map-commit ${{ matrix.commit }}
       
       - name: Configure AWS credentials
+        if: ${{ !inputs.dry_run }}
         uses: aws-actions/configure-aws-credentials@v5.1.0
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -484,7 +490,7 @@ jobs:
           fi
       
       - name: Upload merged statistics to S3
-        if: always()
+        if: always() && !inputs.dry_run
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
           S3_KEY="evaluation/rq2/cvc5/fuzzing-statistics/variant1/fuzzing_statistics-${COMMIT_HASH}.json.gz"
@@ -502,3 +508,17 @@ jobs:
             --body merged_statistics_${COMMIT_HASH}.json.gz
           
           echo "✅ Uploaded fuzzing statistics to S3: $S3_KEY"
+      
+      - name: Dry run - Skip S3 upload
+        if: always() && inputs.dry_run
+        run: |
+          COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/cvc5/fuzzing-statistics/variant1/fuzzing_statistics-${COMMIT_HASH}.json.gz"
+          
+          if [ -f "merged_statistics_${{ matrix.commit }}.json" ]; then
+            echo "🔍 DRY RUN: Would upload to S3: $S3_KEY"
+            echo "🔍 DRY RUN: File exists: merged_statistics_${{ matrix.commit }}.json"
+            echo "🔍 DRY RUN: Skipping upload (dry_run=true)"
+          else
+            echo "⚠️ Merged statistics file not found"
+          fi
