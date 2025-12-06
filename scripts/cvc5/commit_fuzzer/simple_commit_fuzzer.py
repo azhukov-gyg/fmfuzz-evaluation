@@ -498,12 +498,42 @@ class SimpleCommitFuzzer:
         with self.resource_lock:
             return self.resource_state.get('paused', False)
     
-    def _get_solver_clis(self) -> str:
+    def _extract_command_line_flags(self, test_path: Path) -> str:
+        """Extract COMMAND-LINE flags from test file (like run_regression.py does).
+        
+        Returns the flags as a string, or empty string if no COMMAND-LINE comment found.
+        """
+        try:
+            with open(test_path, 'r') as f:
+                for line in f:
+                    # Look for COMMAND-LINE comments (can be ; or % depending on file type)
+                    stripped = line.lstrip()
+                    if stripped.startswith(';') or stripped.startswith('%'):
+                        line_content = stripped[1:].lstrip()
+                        if line_content.startswith('COMMAND-LINE:'):
+                            flags = line_content[len('COMMAND-LINE:'):].strip()
+                            return flags
+        except Exception as e:
+            print(f"[WARNING] Could not extract COMMAND-LINE flags from {test_path}: {e}", file=sys.stderr)
+        return ""
+    
+    def _get_solver_clis(self, test_path: Optional[Path] = None) -> str:
         solvers = [self.z3_new]
         # if self.z3_old_path:
         #     solvers.append(str(self.z3_old_path))
         # CVC5: No built-in memory limit - rely on our process killing mechanism (max_process_memory_mb)
-        solvers.append(f"{self.cvc5_path} --check-models --check-proofs --strings-exp")
+        base_flags = "--check-models --check-proofs --strings-exp"
+        
+        # Extract COMMAND-LINE flags from test file if provided (to match coverage mapping behavior)
+        test_flags = ""
+        if test_path and test_path.exists():
+            test_flags = self._extract_command_line_flags(test_path)
+            if test_flags:
+                # Merge test flags with base flags (test flags may override base flags)
+                # For now, just append test flags after base flags
+                base_flags = f"{base_flags} {test_flags}"
+        
+        solvers.append(f"{self.cvc5_path} {base_flags}")
         # if self.cvc4_path:
         #     solvers.append(str(self.cvc4_path))
         return ";".join(solvers)
@@ -556,7 +586,8 @@ class SimpleCommitFuzzer:
             folder.mkdir(parents=True, exist_ok=True)
         bugs_folder.mkdir(parents=True, exist_ok=True)
         
-        solver_clis = self._get_solver_clis()
+        # Extract COMMAND-LINE flags from test file and include them in solver command
+        solver_clis = self._get_solver_clis(test_path)
         
         cmd = [
             "typefuzz",
