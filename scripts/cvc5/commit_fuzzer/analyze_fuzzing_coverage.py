@@ -128,9 +128,18 @@ def find_function_in_fastcov(fastcov_data: Dict, file_path: str,
         file_data = fastcov_data['sources'].get(file_path)
     
     if not file_data:
-        # Try to find by basename (fastcov uses absolute paths)
-        basename = file_path.split('/')[-1]
-        matching_files = [f for f in fastcov_data['sources'].keys() if f.endswith('/' + basename) or f.endswith('\\' + basename)]
+        # Try to find by matching the end of the path (fastcov uses absolute paths)
+        # e.g., match "src/prop/cadical/cadical.cpp" in "/home/runner/.../cvc5/src/prop/cadical/cadical.cpp"
+        # First try normalized path
+        matching_files = [f for f in fastcov_data['sources'].keys() if f.endswith('/' + normalized_path) or f.endswith('\\' + normalized_path)]
+        if not matching_files:
+            # Then try original path
+            matching_files = [f for f in fastcov_data['sources'].keys() if f.endswith('/' + file_path) or f.endswith('\\' + file_path)]
+        
+        if not matching_files:
+            # Fallback: try by basename only
+            basename = file_path.split('/')[-1]
+            matching_files = [f for f in fastcov_data['sources'].keys() if f.endswith('/' + basename) or f.endswith('\\' + basename)]
         
         # Special handling for cadical files - check if they're being excluded
         if 'cadical' in file_path.lower():
