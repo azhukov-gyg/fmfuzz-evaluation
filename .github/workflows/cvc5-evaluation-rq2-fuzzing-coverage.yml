@@ -385,6 +385,30 @@ jobs:
         run: |
           ./scripts/cvc5/extract_build_artifacts.sh artifacts/artifacts.tar.gz cvc5/build true
 
+      - name: Verify build artifacts for cadical
+        run: |
+          echo "=== Verifying cadical-related files ==="
+          echo ""
+          echo "Cadical .gcno files:"
+          find cvc5/build -name "*.gcno" -path "*cadical*" | head -10
+          echo ""
+          echo "Cadical source files in build/src:"
+          find cvc5/build/src -name "*.cpp" -path "*cadical*" | head -10
+          echo ""
+          echo "Cadical source files in cvc5/src:"
+          find cvc5/src -name "*.cpp" -path "*cadical*" | head -10
+          echo ""
+          echo "Binary info:"
+          if [ -f "cvc5/build/bin/cvc5" ]; then
+            file cvc5/build/bin/cvc5
+            ldd cvc5/build/bin/cvc5 2>&1 | head -5 || echo "Binary is statically linked or ldd failed"
+            echo ""
+            echo "Checking if binary supports --sat-solver flag:"
+            cvc5/build/bin/cvc5 --help 2>&1 | grep -i "sat-solver" || echo "⚠️  --sat-solver flag not found in help"
+          else
+            echo "❌ Binary not found!"
+          fi
+
       - name: Download changed functions and matrix
         uses: actions/download-artifact@v4
         with:

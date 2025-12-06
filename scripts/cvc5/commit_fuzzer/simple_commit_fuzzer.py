@@ -615,6 +615,8 @@ class SimpleCommitFuzzer:
             str(test_path),
         ]
         
+        # Debug: Show the exact SOLVER_CLIS string being passed to typefuzz
+        print(f"[WORKER {worker_id}] SOLVER_CLIS passed to typefuzz: {solver_clis!r}", file=sys.stderr)
         print(f"[WORKER {worker_id}] Running typefuzz on: {test_name} (timeout: {per_test_timeout}s)" if per_test_timeout else f"[WORKER {worker_id}] Running typefuzz on: {test_name}")
         
         start_time = time.time()
@@ -877,6 +879,14 @@ def analyze_fuzzing_coverage(
         print(f"[DEBUG] Sample cadical .gcda files (first 5):", file=sys.stderr)
         for gcda in cadical_gcda_files[:5]:
             print(f"[DEBUG]   - {gcda}", file=sys.stderr)
+            # Check file size - empty or very small .gcda files indicate no execution
+            try:
+                size = gcda.stat().st_size
+                print(f"[DEBUG]     Size: {size} bytes", file=sys.stderr)
+                if size < 100:
+                    print(f"[DEBUG]     ⚠️  WARNING: Very small .gcda file - may contain only initialization code", file=sys.stderr)
+            except Exception as e:
+                print(f"[DEBUG]     Could not check size: {e}", file=sys.stderr)
     else:
         print(f"[DEBUG] ⚠️  WARNING: No cadical .gcda files found!", file=sys.stderr)
         print(f"[DEBUG] This suggests cadical functions were not executed during fuzzing", file=sys.stderr)
@@ -885,6 +895,15 @@ def analyze_fuzzing_coverage(
             print(f"[DEBUG] Sample cadical .gcno files (first 3):", file=sys.stderr)
             for gcno in cadical_gcno_files[:3]:
                 print(f"[DEBUG]   - {gcno}", file=sys.stderr)
+    
+    # Check if any cadical functions have non-zero execution counts in fastcov
+    # This will help diagnose if the issue is with fastcov reading or actual execution
+    print(f"[DEBUG] Note: If cadical .gcda files exist but execution_count is 0, this suggests:", file=sys.stderr)
+    print(f"[DEBUG]   1. Cadical solver is not being used (CVC5 defaults to minisat)", file=sys.stderr)
+    print(f"[DEBUG]   2. Or cadical code paths are not triggered by the fuzzed tests", file=sys.stderr)
+    print(f"[DEBUG]   3. Or .gcda files only contain initialization/constructor coverage", file=sys.stderr)
+    print(f"[DEBUG]   4. Or typefuzz is not passing flags correctly (but analysis shows it should)", file=sys.stderr)
+    print(f"[DEBUG]   5. Or CVC5 flag format is incorrect (verify: cvc5 --help | grep sat-solver)", file=sys.stderr)
     
     # Run fastcov to collect coverage
     fastcov_output = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
