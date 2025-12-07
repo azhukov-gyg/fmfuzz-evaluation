@@ -48,13 +48,20 @@ def batch_demangle_names(mangled_names: List[str]) -> Dict[str, str]:
         input_text = '\n'.join(names_to_demangle)
         proc = subprocess.run(['c++filt'], 
                             input=input_text,
-                            capture_output=True, text=True, check=False)
+                            capture_output=True, text=True, check=False,
+                            timeout=120)  # 2 minute timeout to prevent hangs
         if proc.returncode == 0 and proc.stdout:
             demangled_list = proc.stdout.strip().split('\n')
             for mangled, demangled in zip(names_to_demangle, demangled_list):
                 _demangle_cache[mangled] = demangled
                 result[mangled] = demangled
-    except Exception:
+    except subprocess.TimeoutExpired:
+        print(f"[WARNING] c++filt timed out after 120s for {len(names_to_demangle)} names", file=sys.stderr)
+        for name in names_to_demangle:
+            _demangle_cache[name] = name
+            result[name] = name
+    except Exception as e:
+        print(f"[WARNING] c++filt failed: {e}", file=sys.stderr)
         # On error, return original names
         for name in names_to_demangle:
             _demangle_cache[name] = name
@@ -311,27 +318,27 @@ def find_function_in_fastcov(fastcov_data: Dict, file_path: str,
         # Try exact match first (signature only, no line number check)
         if sig_full == demangled_full:
             if debug:
-                print(f"  [DEBUG] ✓ EXACT MATCH!")
-                print(f"  [DEBUG]   Raw fastcov data:")
-                print(f"  [DEBUG]     - Mangled name: {mangled_name}")
-                print(f"  [DEBUG]     - Demangled: {demangled_full}")
-                print(f"  [DEBUG]     - Execution count: {exec_count}")
-                print(f"  [DEBUG]     - Start line (fastcov): {fastcov_line}")
-                print(f"  [DEBUG]     - Expected line (libclang): {line_num}")
-                print(f"  [DEBUG]     - Full func_data: {json.dumps(func_data, indent=8)}")
+                print(f"  [DEBUG] ✓ EXACT MATCH!", flush=True)
+                print(f"  [DEBUG]   Raw fastcov data:", flush=True)
+                print(f"  [DEBUG]     - Mangled name: {mangled_name}", flush=True)
+                print(f"  [DEBUG]     - Demangled: {demangled_full}", flush=True)
+                print(f"  [DEBUG]     - Execution count: {exec_count}", flush=True)
+                print(f"  [DEBUG]     - Start line (fastcov): {fastcov_line}", flush=True)
+                print(f"  [DEBUG]     - Expected line (libclang): {line_num}", flush=True)
+                print(f"  [DEBUG]     - Full func_data: {json.dumps(func_data, indent=8)}", flush=True)
             return exec_count
         
         # Try normalized match (remove whitespace differences)
         if sig_normalized == demangled_normalized:
             if debug:
-                print(f"  [DEBUG] ✓ NORMALIZED MATCH!")
-                print(f"  [DEBUG]   Raw fastcov data:")
-                print(f"  [DEBUG]     - Mangled name: {mangled_name}")
-                print(f"  [DEBUG]     - Demangled: {demangled_full}")
-                print(f"  [DEBUG]     - Execution count: {exec_count}")
-                print(f"  [DEBUG]     - Start line (fastcov): {fastcov_line}")
-                print(f"  [DEBUG]     - Expected line (libclang): {line_num}")
-                print(f"  [DEBUG]     - Full func_data: {json.dumps(func_data, indent=8)}")
+                print(f"  [DEBUG] ✓ NORMALIZED MATCH!", flush=True)
+                print(f"  [DEBUG]   Raw fastcov data:", flush=True)
+                print(f"  [DEBUG]     - Mangled name: {mangled_name}", flush=True)
+                print(f"  [DEBUG]     - Demangled: {demangled_full}", flush=True)
+                print(f"  [DEBUG]     - Execution count: {exec_count}", flush=True)
+                print(f"  [DEBUG]     - Start line (fastcov): {fastcov_line}", flush=True)
+                print(f"  [DEBUG]     - Expected line (libclang): {line_num}", flush=True)
+                print(f"  [DEBUG]     - Full func_data: {json.dumps(func_data, indent=8)}", flush=True)
             return exec_count
     
     if debug:
@@ -381,8 +388,11 @@ def analyze_coverage(changed_functions_file: Path, fastcov_json_file: Path, debu
     # Analyze each function
     function_stats = []
     for i, func_id in enumerate(changed_functions):
+        # Progress indicator (always printed, with flush)
+        print(f"Processing function {i+1}/{len(changed_functions)}...", flush=True)
+        
         if debug:
-            print(f"\n[DEBUG] Analyzing function {i+1}/{len(changed_functions)}: {func_id}")
+            print(f"\n[DEBUG] Analyzing function {i+1}/{len(changed_functions)}: {func_id}", flush=True)
         
         file_path, signature, line_num = parse_changed_function(func_id)
         
