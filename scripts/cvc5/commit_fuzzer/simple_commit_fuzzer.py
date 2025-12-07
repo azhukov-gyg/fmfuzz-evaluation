@@ -522,9 +522,8 @@ class SimpleCommitFuzzer:
         # if self.z3_old_path:
         #     solvers.append(str(self.z3_old_path))
         # CVC5: No built-in memory limit - rely on our process killing mechanism (max_process_memory_mb)
-        # TEMPORARY: Add --sat-solver=cadical to ensure cadical functions are executed
-        # This is a debugging step to verify that cadical code paths are reachable
-        base_flags = "--check-models --check-proofs --strings-exp --sat-solver=cadical"
+        # TEMPORARY: --sat-solver=cadical --bitblast=eager to force SAT solver invocation for debugging
+        base_flags = "--check-models --check-proofs --strings-exp --sat-solver=cadical --bitblast=eager"
         
         # Extract COMMAND-LINE flags from test file if provided (to match coverage mapping behavior)
         test_flags = ""
@@ -771,7 +770,7 @@ class SimpleCommitFuzzer:
         print(f"Iterations per test: {self.iterations}, Modulo: {self.modulo}")
         print(f"CPU cores: {self.cpu_count}")
         print(f"Workers: {self.num_workers}")
-        print(f"Solvers: z3={self.z3_new}, cvc5={self.cvc5_path} --check-models --check-proofs --strings-exp")
+        print(f"Solvers: z3={self.z3_new}, cvc5={self.cvc5_path} --check-models --check-proofs --strings-exp --sat-solver=cadical --bitblast=eager")
         print()
         
         for test in self.tests:
