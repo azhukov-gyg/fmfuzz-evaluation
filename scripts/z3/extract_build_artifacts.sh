@@ -118,7 +118,10 @@ if [ -d "$SRC_BASE" ]; then
     if command -v rsync >/dev/null 2>&1; then
         # Use rsync with --ignore-existing to only copy files that don't exist
         rsync -a --include='*/' --include='*.cpp' --exclude='*' --ignore-existing "$SRC_BASE/" "$BUILD_DIR/src/" 2>/dev/null || true
-        MISSING_COUNT=$(rsync -a --include='*/' --include='*.cpp' --exclude='*' --ignore-existing --dry-run "$SRC_BASE/" "$BUILD_DIR/src/" 2>/dev/null | grep -c "\.cpp$" || echo "0")
+        # Count missing files (files that would be copied)
+        # Use Python to clean and validate the count (handles newlines/whitespace robustly)
+        MISSING_COUNT=$(rsync -a --include='*/' --include='*.cpp' --exclude='*' --ignore-existing --dry-run "$SRC_BASE/" "$BUILD_DIR/src/" 2>/dev/null | grep -c "\.cpp$" 2>/dev/null || echo "0")
+        MISSING_COUNT=$(echo "$MISSING_COUNT" | python3 -c "import sys; s = sys.stdin.read().strip(); print(int(s) if s.isdigit() else 0)")
     else
         find "$SRC_BASE" -type f -name "*.cpp" 2>/dev/null | while read -r cpp_file; do
             [ -z "$cpp_file" ] && continue
