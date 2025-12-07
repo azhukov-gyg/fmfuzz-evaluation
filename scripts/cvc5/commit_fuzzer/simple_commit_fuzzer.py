@@ -619,7 +619,13 @@ class SimpleCommitFuzzer:
         
         # Debug: Show the exact SOLVER_CLIS string being passed to typefuzz
         print(f"[WORKER {worker_id}] SOLVER_CLIS passed to typefuzz: {solver_clis!r}", file=sys.stderr)
-        print(f"[WORKER {worker_id}] Running typefuzz on: {test_name} (timeout: {per_test_timeout}s)" if per_test_timeout else f"[WORKER {worker_id}] Running typefuzz on: {test_name}")
+        print(f"[WORKER {worker_id}] Running typefuzz on: {test_name} (timeout: {per_test_timeout}s)" if per_test_timeout else f"[WORKER {worker_id}] Running typefuzz on: {test_name}", file=sys.stderr)
+        
+        # Debug: Verify --sat-solver=cadical is in the command
+        if '--sat-solver=cadical' in solver_clis:
+            print(f"[WORKER {worker_id}] ✓ --sat-solver=cadical confirmed in SOLVER_CLIS", file=sys.stderr)
+        else:
+            print(f"[WORKER {worker_id}] ⚠️  WARNING: --sat-solver=cadical NOT found in SOLVER_CLIS!", file=sys.stderr)
         
         start_time = time.time()
         
@@ -877,6 +883,18 @@ def analyze_fuzzing_coverage(
     cadical_gcda_files = [f for f in gcda_files if 'cadical' in str(f).lower()]
     cadical_gcno_files = [f for f in gcno_files if 'cadical' in str(f).lower()]
     print(f"[DEBUG] Found {len(cadical_gcda_files)} cadical .gcda files and {len(cadical_gcno_files)} cadical .gcno files", file=sys.stderr)
+    
+    # Check if cadical .gcda files were recreated after clearing
+    if cadical_gcno_files and not cadical_gcda_files:
+        print(f"[DEBUG] ⚠️  WARNING: Cadical .gcno files exist ({len(cadical_gcno_files)}) but NO .gcda files!", file=sys.stderr)
+        print(f"[DEBUG] This means cadical code was NOT executed during fuzzing", file=sys.stderr)
+        print(f"[DEBUG] Possible reasons:", file=sys.stderr)
+        print(f"[DEBUG]   1. CVC5 is using minisat (default) instead of cadical", file=sys.stderr)
+        print(f"[DEBUG]   2. Tests don't trigger cadical code paths", file=sys.stderr)
+        print(f"[DEBUG]   3. --sat-solver=cadical flag is not being passed correctly", file=sys.stderr)
+    elif cadical_gcda_files:
+        print(f"[DEBUG] ✓ Cadical .gcda files were recreated during fuzzing", file=sys.stderr)
+        print(f"[DEBUG]   This means cadical code WAS executed (at least initialization)", file=sys.stderr)
     if cadical_gcda_files:
         print(f"[DEBUG] Sample cadical .gcda files (first 5):", file=sys.stderr)
         for gcda in cadical_gcda_files[:5]:
@@ -1139,14 +1157,34 @@ def main():
         
         # Clear coverage data before fuzzing
         if args.changed_functions and args.output_statistics:
-            print("[INFO] Clearing existing .gcda files...")
+            print("[INFO] Clearing existing .gcda files...", file=sys.stderr)
             build_dir = Path(args.build_dir)
             if build_dir.exists():
-                for gcda_file in build_dir.rglob("*.gcda"):
+                # Record which .gcda files exist before clearing (for comparison later)
+                gcda_files_before = set(build_dir.rglob("*.gcda"))
+                cadical_gcda_before = {f for f in gcda_files_before if 'cadical' in str(f).lower()}
+                
+                gcda_count = 0
+                for gcda_file in gcda_files_before:
                     try:
                         gcda_file.unlink()
+                        gcda_count += 1
                     except Exception as e:
-                        print(f"[WARN] Failed to delete {gcda_file}: {e}")
+                        print(f"[WARN] Failed to delete {gcda_file}: {e}", file=sys.stderr)
+                print(f"[INFO] Cleared {gcda_count} .gcda files before fuzzing", file=sys.stderr)
+                if cadical_gcda_before:
+                    print(f"[INFO] Cleared {len(cadical_gcda_before)} cadical .gcda files (will verify recreation after fuzzing)", file=sys.stderr)
+                
+                # Verify they're actually gone
+                remaining_gcda = list(build_dir.rglob("*.gcda"))
+                if remaining_gcda:
+                    print(f"[WARN] {len(remaining_gcda)} .gcda files still exist after clearing!", file=sys.stderr)
+                    for gcda in remaining_gcda[:5]:
+                        print(f"[WARN]   - {gcda}", file=sys.stderr)
+                else:
+                    print(f"[INFO] ✓ All .gcda files successfully cleared", file=sys.stderr)
+            else:
+                print(f"[WARN] Build directory does not exist: {build_dir}", file=sys.stderr)
         
         fuzzer.run()
         
