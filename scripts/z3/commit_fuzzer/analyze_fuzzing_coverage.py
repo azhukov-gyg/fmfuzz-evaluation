@@ -14,24 +14,42 @@ import json
 import subprocess
 import sys
 import argparse
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# Timing stats for demangle
+_demangle_call_count = 0
+_demangle_total_time = 0.0
 
 def demangle_function_name(mangled_name: str) -> str:
     """Demangle C++ function names using c++filt"""
+    global _demangle_call_count, _demangle_total_time
+    
     if not mangled_name:
         return mangled_name
+    
+    _demangle_call_count += 1
+    start = time.time()
     
     try:
         result = subprocess.run(['c++filt', mangled_name], 
                               capture_output=True, text=True, check=False)
         if result.returncode == 0 and result.stdout:
+            _demangle_total_time += time.time() - start
             return result.stdout.strip()
     except Exception:
         pass
     
+    _demangle_total_time += time.time() - start
     return mangled_name
+
+def print_demangle_stats():
+    """Print demangle timing statistics"""
+    print(f"[TIMING] demangle_function_name called {_demangle_call_count} times", file=sys.stderr)
+    print(f"[TIMING] Total demangle time: {_demangle_total_time:.2f}s", file=sys.stderr)
+    if _demangle_call_count > 0:
+        print(f"[TIMING] Average per call: {_demangle_total_time/_demangle_call_count*1000:.2f}ms", file=sys.stderr)
 
 
 def normalize_file_path(file_path: str) -> str:
@@ -382,6 +400,9 @@ def main():
     print(f"Analyzed {total} functions")
     print(f"Triggered: {triggered} ({triggered/total*100:.1f}%)" if total > 0 else "Triggered: 0")
     print(f"Total executions: {total_executions}")
+    
+    # Print timing stats
+    print_demangle_stats()
     
     return 0
 
