@@ -1133,13 +1133,16 @@ def main():
         # Coverage analysis is now done in a separate workflow step
         # to avoid potential hang issues with subprocess capture
         
-        # Always exit with success
-        print("[INFO] Fuzzing complete, exiting", flush=True)
-        sys.exit(0)
+        # Always exit with success - use os._exit to force terminate
+        # without waiting for threads/cleanup handlers that may hang
+        print("[INFO] Fuzzing complete, forcing exit", flush=True)
+        import os
+        os._exit(0)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         # Still exit with success to not fail the workflow
-        sys.exit(0)
+        import os
+        os._exit(0)
 
 
 if __name__ == "__main__":

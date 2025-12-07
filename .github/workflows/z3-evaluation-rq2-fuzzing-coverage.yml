@@ -448,8 +448,11 @@ jobs:
 
       - name: Run fuzzing with coverage tracking
         working-directory: z3
+        timeout-minutes: ${{ fromJson(inputs.fuzzing_duration_minutes || '60') + 10 }}
         run: |
           FUZZING_DURATION="${{ inputs.fuzzing_duration_minutes || 60 }}"
+          
+          # Run fuzzer and capture its PID
           python3 ${{ github.workspace }}/scripts/z3/commit_fuzzer/simple_commit_fuzzer.py \
             --tests-file ../${{ steps.extract-tests.outputs.tests_file }} \
             --tests-root ../z3test \
@@ -458,7 +461,14 @@ jobs:
             --iterations 250 \
             --fuzzing-duration-minutes ${FUZZING_DURATION} \
             --job-id '${{ matrix.job_id }}' \
-            --build-dir ./build
+            --build-dir ./build || true
+          
+          echo "Python script exited, cleaning up any orphaned processes..."
+          # Kill any remaining cvc5 or z3 processes that might be hanging
+          pkill -9 -f "cvc5" 2>/dev/null || true
+          pkill -9 -f "z3" 2>/dev/null || true
+          pkill -9 -f "typefuzz" 2>/dev/null || true
+          
           echo "Fuzzing step completed"
 
       - name: Collect coverage with fastcov
