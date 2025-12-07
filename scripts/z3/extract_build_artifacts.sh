@@ -108,22 +108,35 @@ if [ "$EXTRACT_HEADERS" = "true" ]; then
     fi
 fi
 
-# Copy source files from checked-out z3 to build/src/ for fastcov path resolution
-# .gcno files contain absolute paths like /path/to/z3/src/... but fastcov looks for build/src/...
+# Copy source files from checked-out z3 to build/src/ ONLY if they don't exist from archive
+# The archive source files match the binary and .gcno files, so they should be preserved
+# Only copy missing files from checkout (for generated files that might not be in archive)
 SRC_BASE="$BUILD_DIR/../src"
 if [ -d "$SRC_BASE" ]; then
-    echo "   Copying .cpp files from checked-out source..."
+    echo "   Copying missing .cpp files from checked-out source (preserving archive files)..."
+    MISSING_COUNT=0
     if command -v rsync >/dev/null 2>&1; then
-        rsync -a --include='*/' --include='*.cpp' --exclude='*' "$SRC_BASE/" "$BUILD_DIR/src/" 2>/dev/null || true
+        # Use rsync with --ignore-existing to only copy files that don't exist
+        rsync -a --include='*/' --include='*.cpp' --exclude='*' --ignore-existing "$SRC_BASE/" "$BUILD_DIR/src/" 2>/dev/null || true
+        MISSING_COUNT=$(rsync -a --include='*/' --include='*.cpp' --exclude='*' --ignore-existing --dry-run "$SRC_BASE/" "$BUILD_DIR/src/" 2>/dev/null | grep -c "\.cpp$" || echo "0")
     else
         find "$SRC_BASE" -type f -name "*.cpp" 2>/dev/null | while read -r cpp_file; do
             [ -z "$cpp_file" ] && continue
             rel_path="${cpp_file#$SRC_BASE/}"
             build_target="$BUILD_DIR/src/$rel_path"
-            mkdir -p "$(dirname "$build_target")"
-            cp "$cpp_file" "$build_target"
-            echo "   [CHECKOUT] $rel_path"
+            # Only copy if file doesn't exist (preserve archive files)
+            if [ ! -f "$build_target" ]; then
+                mkdir -p "$(dirname "$build_target")"
+                cp "$cpp_file" "$build_target"
+                echo "   [CHECKOUT] $rel_path (missing from archive)"
+                MISSING_COUNT=$((MISSING_COUNT + 1))
+            fi
         done 2>/dev/null || true
+    fi
+    if [ "$MISSING_COUNT" -gt 0 ]; then
+        echo "   ✓ Copied $MISSING_COUNT missing .cpp files from checkout"
+    else
+        echo "   ✓ All .cpp files already present from archive (preserved)"
     fi
     # Update count after copying from checkout
     CPP_COUNT=$(find "$BUILD_DIR/src" -name "*.cpp" -type f 2>/dev/null | wc -l || echo "0")
