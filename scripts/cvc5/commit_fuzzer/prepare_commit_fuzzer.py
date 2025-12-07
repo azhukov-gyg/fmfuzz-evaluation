@@ -1084,17 +1084,84 @@ def main():
             tests_per_job = args.tests_per_job
             actual_jobs = (total_tests + tests_per_job - 1) // tests_per_job if total_tests > 0 else 0
         
-        # Group tests into jobs
+        # Group tests into jobs using two-phase deterministic proportional interleaving
+        # (Supermarket algorithm / Bresenham for N dimensions)
+        # This ensures tests for each function are evenly distributed across jobs
         jobs = []
-        for i in range(0, total_tests, tests_per_job):
-            job_tests = unique_tests[i:i + tests_per_job]
-            job_id = i // tests_per_job
+        function_matches = result.get('function_matches', {})
+        
+        # Check if we have function matches (fallback to sequential if not)
+        if function_matches and any(match.get('tests') for match in function_matches.values()):
+            # Multi-queue system: group tests by function
+            function_queues = {}
+            for func, match_data in function_matches.items():
+                func_tests = match_data.get('tests', [])
+                if func_tests:
+                    function_queues[func] = list(func_tests)
             
-            # Always use 'tests' as an array, even for single test
-            jobs.append({
-                'job_id': job_id,
-                'tests': job_tests
-            })
+            if function_queues:
+                # Two-phase approach: Phase 1 (allocation) + Phase 2 (interleaving)
+                for job_id in range(actual_jobs):
+                    # Phase 1: Compute exact count per function for this job
+                    this_job_counts = {}
+                    for func, tests in function_queues.items():
+                        n = len(tests)
+                        base = n // actual_jobs
+                        if job_id < n % actual_jobs:
+                            base += 1
+                        if base > 0:
+                            this_job_counts[func] = base
+                    
+                    # Phase 2: Supermarket interleaving (Bresenham-style)
+                    pointers = {f: 0 for f in this_job_counts}
+                    accum = {f: 0.0 for f in this_job_counts}
+                    weights = {f: len(function_queues[f]) for f in this_job_counts}
+                    job_tests = []
+                    
+                    total_in_job = sum(this_job_counts.values())
+                    total_weight = sum(weights.values())
+                    
+                    while len(job_tests) < total_in_job:
+                        best_func = None
+                        best_score = -1
+                        
+                        for func in this_job_counts:
+                            if pointers[func] < this_job_counts[func]:
+                                accum[func] += weights[func]
+                                if accum[func] > best_score:
+                                    best_score = accum[func]
+                                    best_func = func
+                        
+                        if best_func is None:
+                            break
+                        
+                        test = function_queues[best_func][pointers[best_func]]
+                        job_tests.append(test)
+                        pointers[best_func] += 1
+                        accum[best_func] -= total_weight
+                    
+                    jobs.append({
+                        'job_id': job_id,
+                        'tests': job_tests
+                    })
+            else:
+                # No function queues, fallback to sequential split
+                for i in range(0, total_tests, tests_per_job):
+                    job_tests = unique_tests[i:i + tests_per_job]
+                    job_id = i // tests_per_job
+                    jobs.append({
+                        'job_id': job_id,
+                        'tests': job_tests
+                    })
+        else:
+            # Fallback: no function matches, use sequential split
+            for i in range(0, total_tests, tests_per_job):
+                job_tests = unique_tests[i:i + tests_per_job]
+                job_id = i // tests_per_job
+                jobs.append({
+                    'job_id': job_id,
+                    'tests': job_tests
+                })
         
         matrix_data = {
             'matrix': {'include': jobs},

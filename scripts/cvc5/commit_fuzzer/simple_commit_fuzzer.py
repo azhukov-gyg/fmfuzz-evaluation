@@ -21,21 +21,6 @@ class SimpleCommitFuzzer:
     EXIT_CODE_UNSUPPORTED = 3
     EXIT_CODE_SUCCESS = 0
     
-    # Tests that explicitly use --sat-solver=cadical - prioritize these to ensure cadical coverage
-    CADICAL_PRIORITY_TESTS = [
-        "regress0/prop/cadical_bug1.smt2",
-        "regress0/prop/cadical_bug2.smt2",
-        "regress0/prop/cadical_bug3.smt2",
-        "regress0/prop/cadical_bug4.smt2",
-        "regress0/prop/cadical_bug5.smt2",
-        "regress0/prop/cadical_bug6.smt2",
-        "regress0/prop/cadical_bug7.smt2",
-        "regress0/prop/red-psyco-134.smt2",
-        "regress0/prop/issue11867.smt2",
-        "regress0/bv/eager-inc-cadical.smt2",
-        "regress1/sets/proj-issue668.smt2",
-    ]
-    
     RESOURCE_CONFIG = {
         'cpu_warning': 85.0,
         'cpu_critical': 95.0,
@@ -556,39 +541,6 @@ class SimpleCommitFuzzer:
         #     solvers.append(str(self.cvc4_path))
         return ";".join(solvers)
     
-    def _run_test_directly(self, test_name: str, timeout: int = 30) -> bool:
-        """Run CVC5 directly on a test (without typefuzz) to ensure coverage is recorded.
-        
-        Uses only the test's own COMMAND-LINE flags from the test file.
-        This ensures coverage is recorded for tests that trigger specific code paths.
-        """
-        test_path = self.tests_root / test_name
-        if not test_path.exists():
-            print(f"[DIRECT] Test not found: {test_path}", file=sys.stderr)
-            return False
-        
-        # Extract COMMAND-LINE flags from test file - use ONLY these flags
-        test_flags = self._extract_command_line_flags(test_path)
-        
-        # Build CVC5 command with test's own flags
-        cmd = [str(self.cvc5_path)]
-        if test_flags:
-            cmd.extend(test_flags.split())
-        cmd.append(str(test_path))
-        
-        print(f"[DIRECT] Running: {' '.join(cmd)}", file=sys.stderr)
-        
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            print(f"[DIRECT] Exit code: {result.returncode}, stdout: {result.stdout[:100] if result.stdout else '(empty)'}...", file=sys.stderr)
-            return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            print(f"[DIRECT] Timeout after {timeout}s", file=sys.stderr)
-            return False
-        except Exception as e:
-            print(f"[DIRECT] Error: {e}", file=sys.stderr)
-            return False
-    
     def _compute_time_remaining(self, job_start_time: float, stop_buffer_minutes: int) -> int:
         GITHUB_TIMEOUT = 21600
         MIN_REMAINING = 600
@@ -814,33 +766,8 @@ class SimpleCommitFuzzer:
         print(f"Solvers: z3={self.z3_new}, cvc5={self.cvc5_path} --check-models --check-proofs --strings-exp")
         print()
         
-        # Prioritize cadical tests at the front of the queue to ensure cadical coverage
-        priority_tests = []
-        other_tests = []
+        # Add all tests to queue
         for test in self.tests:
-            if any(test.endswith(p) or p in test for p in self.CADICAL_PRIORITY_TESTS):
-                priority_tests.append(test)
-            else:
-                other_tests.append(test)
-        
-        if priority_tests:
-            print(f"[INFO] Prioritizing {len(priority_tests)} cadical-specific tests at front of queue")
-            for pt in priority_tests:
-                print(f"  - {pt}")
-        
-        # Run priority tests DIRECTLY (without typefuzz) first to ensure coverage is recorded
-        # typefuzz can kill processes which prevents gcov from flushing coverage data
-        if priority_tests:
-            print(f"[INFO] Running {len(priority_tests)} cadical tests directly (without typefuzz) for coverage...")
-            for pt in priority_tests:
-                test_path = self.tests_root / pt
-                if test_path.exists():
-                    self._run_test_directly(pt)
-        
-        # Add priority tests first, then others
-        for test in priority_tests:
-            self.test_queue.put(test)
-        for test in other_tests:
             self.test_queue.put(test)
         
         workers = []
@@ -939,57 +866,11 @@ def analyze_fuzzing_coverage(
     """Collect coverage with fastcov and analyze changed functions"""
     import tempfile
     
-    # Debug: Check for .gcda files before running fastcov, specifically for cadical
+    # Debug: Check for .gcda files before running fastcov
     print(f"[DEBUG] Checking for coverage files in {build_dir}...", file=sys.stderr)
     gcda_files = list(build_dir.rglob("*.gcda"))
     gcno_files = list(build_dir.rglob("*.gcno"))
     print(f"[DEBUG] Found {len(gcda_files)} .gcda files and {len(gcno_files)} .gcno files", file=sys.stderr)
-    
-    # Check specifically for cadical .gcda files
-    cadical_gcda_files = [f for f in gcda_files if 'cadical' in str(f).lower()]
-    cadical_gcno_files = [f for f in gcno_files if 'cadical' in str(f).lower()]
-    print(f"[DEBUG] Found {len(cadical_gcda_files)} cadical .gcda files and {len(cadical_gcno_files)} cadical .gcno files", file=sys.stderr)
-    
-    # Check if cadical .gcda files were recreated after clearing
-    if cadical_gcno_files and not cadical_gcda_files:
-        print(f"[DEBUG] ⚠️  WARNING: Cadical .gcno files exist ({len(cadical_gcno_files)}) but NO .gcda files!", file=sys.stderr)
-        print(f"[DEBUG] This means cadical code was NOT executed during fuzzing", file=sys.stderr)
-        print(f"[DEBUG] Possible reasons:", file=sys.stderr)
-        print(f"[DEBUG]   1. CVC5 is using minisat (default) instead of cadical", file=sys.stderr)
-        print(f"[DEBUG]   2. Tests don't trigger cadical code paths", file=sys.stderr)
-        print(f"[DEBUG]   3. --sat-solver=cadical flag is not being passed correctly", file=sys.stderr)
-    elif cadical_gcda_files:
-        print(f"[DEBUG] ✓ Cadical .gcda files were recreated during fuzzing", file=sys.stderr)
-        print(f"[DEBUG]   This means cadical code WAS executed (at least initialization)", file=sys.stderr)
-    if cadical_gcda_files:
-        print(f"[DEBUG] Sample cadical .gcda files (first 5):", file=sys.stderr)
-        for gcda in cadical_gcda_files[:5]:
-            print(f"[DEBUG]   - {gcda}", file=sys.stderr)
-            # Check file size - empty or very small .gcda files indicate no execution
-            try:
-                size = gcda.stat().st_size
-                print(f"[DEBUG]     Size: {size} bytes", file=sys.stderr)
-                if size < 100:
-                    print(f"[DEBUG]     ⚠️  WARNING: Very small .gcda file - may contain only initialization code", file=sys.stderr)
-            except Exception as e:
-                print(f"[DEBUG]     Could not check size: {e}", file=sys.stderr)
-    else:
-        print(f"[DEBUG] ⚠️  WARNING: No cadical .gcda files found!", file=sys.stderr)
-        print(f"[DEBUG] This suggests cadical functions were not executed during fuzzing", file=sys.stderr)
-        if cadical_gcno_files:
-            print(f"[DEBUG] But cadical .gcno files exist ({len(cadical_gcno_files)}), so cadical is instrumented", file=sys.stderr)
-            print(f"[DEBUG] Sample cadical .gcno files (first 3):", file=sys.stderr)
-            for gcno in cadical_gcno_files[:3]:
-                print(f"[DEBUG]   - {gcno}", file=sys.stderr)
-    
-    # Check if any cadical functions have non-zero execution counts in fastcov
-    # This will help diagnose if the issue is with fastcov reading or actual execution
-    print(f"[DEBUG] Note: If cadical .gcda files exist but execution_count is 0, this suggests:", file=sys.stderr)
-    print(f"[DEBUG]   1. Cadical solver is not being used (CVC5 defaults to minisat)", file=sys.stderr)
-    print(f"[DEBUG]   2. Or cadical code paths are not triggered by the fuzzed tests", file=sys.stderr)
-    print(f"[DEBUG]   3. Or .gcda files only contain initialization/constructor coverage", file=sys.stderr)
-    print(f"[DEBUG]   4. Or typefuzz is not passing flags correctly (but analysis shows it should)", file=sys.stderr)
-    print(f"[DEBUG]   5. Or CVC5 flag format is incorrect (verify: cvc5 --help | grep sat-solver)", file=sys.stderr)
     
     # Run fastcov to collect coverage
     fastcov_output = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
@@ -1004,25 +885,8 @@ def analyze_fuzzing_coverage(
             "--output", str(fastcov_path),
             "--exclude", "/usr/include/*",
             "--exclude", "*/deps/*",
-            # Note: cadical is in src/prop/cadical/, not in deps/, so it should NOT be excluded
-            # If cadical files are missing, check if they're actually in deps/ or have a different path
             "--jobs", "4"
         ], cwd=build_dir.parent, capture_output=True, text=True, check=False)
-        
-        # Debug: Check if cadical files are in the fastcov output
-        if fastcov_path.exists():
-            try:
-                with open(fastcov_path, 'r') as f:
-                    fastcov_data = json.load(f)
-                if 'sources' in fastcov_data:
-                    cadical_files = [f for f in fastcov_data['sources'].keys() if 'cadical' in f.lower()]
-                    if cadical_files:
-                        print(f"[INFO] Found {len(cadical_files)} cadical files in fastcov output", file=sys.stderr)
-                    else:
-                        print(f"[WARNING] No cadical files found in fastcov output!", file=sys.stderr)
-                        print(f"[WARNING] This might indicate cadical files are being excluded or not instrumented", file=sys.stderr)
-            except Exception as e:
-                print(f"[WARNING] Could not check for cadical files in fastcov output: {e}", file=sys.stderr)
         
         if result.returncode != 0:
             print(f"[ERROR] fastcov failed: {result.stderr}", file=sys.stderr)
@@ -1226,10 +1090,8 @@ def main():
             print("[INFO] Clearing existing .gcda files...", file=sys.stderr)
             build_dir = Path(args.build_dir)
             if build_dir.exists():
-                # Record which .gcda files exist before clearing (for comparison later)
+                # Clear .gcda files before fuzzing
                 gcda_files_before = set(build_dir.rglob("*.gcda"))
-                cadical_gcda_before = {f for f in gcda_files_before if 'cadical' in str(f).lower()}
-                
                 gcda_count = 0
                 for gcda_file in gcda_files_before:
                     try:
@@ -1238,8 +1100,6 @@ def main():
                     except Exception as e:
                         print(f"[WARN] Failed to delete {gcda_file}: {e}", file=sys.stderr)
                 print(f"[INFO] Cleared {gcda_count} .gcda files before fuzzing", file=sys.stderr)
-                if cadical_gcda_before:
-                    print(f"[INFO] Cleared {len(cadical_gcda_before)} cadical .gcda files (will verify recreation after fuzzing)", file=sys.stderr)
                 
                 # Verify they're actually gone
                 remaining_gcda = list(build_dir.rglob("*.gcda"))

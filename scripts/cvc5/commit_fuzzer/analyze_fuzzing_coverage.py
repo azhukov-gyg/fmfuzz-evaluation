@@ -40,17 +40,10 @@ def normalize_file_path(file_path: str) -> str:
     if '/src/' in file_path:
         parts = file_path.split('/src/')
         if len(parts) > 1:
-            normalized = 'src/' + parts[1]
-            # Debug: log cadical files specifically
-            if 'cadical' in normalized.lower():
-                print(f"[DEBUG] Normalized cadical path: {file_path} -> {normalized}", file=sys.stderr)
-            return normalized
+            return 'src/' + parts[1]
     
     # If it already starts with src/, return as is
     if file_path.startswith('src/'):
-        # Debug: log cadical files specifically
-        if 'cadical' in file_path.lower():
-            print(f"[DEBUG] Cadical path (already normalized): {file_path}", file=sys.stderr)
         return file_path
     
     # Otherwise return as is (might be absolute path)
@@ -140,21 +133,6 @@ def find_function_in_fastcov(fastcov_data: Dict, file_path: str,
             # Fallback: try by basename only
             basename = file_path.split('/')[-1]
             matching_files = [f for f in fastcov_data['sources'].keys() if f.endswith('/' + basename) or f.endswith('\\' + basename)]
-        
-        # Special handling for cadical files - check if they're being excluded
-        if 'cadical' in file_path.lower():
-            print(f"[DEBUG] Cadical file not found with direct path matching", file=sys.stderr)
-            print(f"[DEBUG]   Looking for: {file_path} (normalized: {normalized_path})", file=sys.stderr)
-            # Check if any cadical files exist in fastcov at all
-            cadical_files = [f for f in fastcov_data['sources'].keys() if 'cadical' in f.lower()]
-            if cadical_files:
-                print(f"[DEBUG]   Found {len(cadical_files)} cadical files in fastcov:", file=sys.stderr)
-                for cf in cadical_files[:5]:
-                    print(f"[DEBUG]     - {cf}", file=sys.stderr)
-            else:
-                print(f"[DEBUG]   ⚠️  WARNING: No cadical files found in fastcov output at all!", file=sys.stderr)
-                print(f"[DEBUG]   This suggests cadical files might be excluded by fastcov", file=sys.stderr)
-                print(f"[DEBUG]   Check if cadical is in a deps/ directory or excluded by other patterns", file=sys.stderr)
         
         if debug:
             print(f"  [DEBUG] File not found with normalized or original path")
@@ -332,35 +310,6 @@ def analyze_coverage(changed_functions_file: Path, fastcov_json_file: Path, debu
     # Load fastcov JSON
     with open(fastcov_json_file, 'r') as f:
         fastcov_data = json.load(f)
-    
-    # Diagnostic: Check if ANY cadical functions have non-zero execution counts
-    if debug and 'sources' in fastcov_data:
-        cadical_files = [f for f in fastcov_data['sources'].keys() if 'cadical' in f.lower()]
-        total_cadical_executions = 0
-        cadical_funcs_with_executions = []
-        for cf in cadical_files:
-            file_data = fastcov_data['sources'].get(cf, {})
-            if '' in file_data and 'functions' in file_data['']:
-                for mangled, func_data in file_data['']['functions'].items():
-                    exec_count = func_data.get('execution_count', 0)
-                    if exec_count > 0:
-                        demangled = demangle_function_name(mangled)
-                        cadical_funcs_with_executions.append((cf, demangled, exec_count))
-                        total_cadical_executions += exec_count
-        
-        if cadical_funcs_with_executions:
-            print(f"\n[DEBUG] ✓ CADICAL FUNCTIONS WITH EXECUTIONS ({len(cadical_funcs_with_executions)} total):", file=sys.stderr)
-            for filepath, func, count in sorted(cadical_funcs_with_executions, key=lambda x: x[2], reverse=True)[:20]:
-                print(f"  {count:>8} | {func[:80]}...", file=sys.stderr)
-            print(f"[DEBUG] Total cadical function executions: {total_cadical_executions}", file=sys.stderr)
-        else:
-            print(f"\n[DEBUG] ⚠️  NO CADICAL FUNCTIONS HAVE EXECUTION COUNTS > 0", file=sys.stderr)
-            print(f"[DEBUG] This indicates the SAT solver was never actually invoked during fuzzing.", file=sys.stderr)
-            print(f"[DEBUG] Possible reasons:", file=sys.stderr)
-            print(f"[DEBUG]   1. Tests were solved by theory solvers alone (no SAT solving needed)", file=sys.stderr)
-            print(f"[DEBUG]   2. CVC5 execution time was too short (e.g., Z3 finished first)", file=sys.stderr)
-            print(f"[DEBUG]   3. Tests don't require propositional reasoning", file=sys.stderr)
-            print(f"[DEBUG] Suggestion: Use only CVC5 (not Z3) and include QF_BV/QF_UF tests", file=sys.stderr)
     
     if debug:
         print(f"[DEBUG] Loaded fastcov data")
