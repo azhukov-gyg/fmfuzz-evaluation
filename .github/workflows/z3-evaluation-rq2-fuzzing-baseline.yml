@@ -312,23 +312,21 @@ jobs:
         run: |
           echo "Looking for commit: ${{ matrix.commit }}, job_id: ${{ matrix.job_id }}"
           
-          # Use Python script for reliable extraction
-          TESTS_JSON=$(python3 ${{ github.workspace }}/scripts/extract_matrix_tests.py \
+          # Use Python script for reliable extraction - write to file to avoid "Argument list too long"
+          python3 ${{ github.workspace }}/scripts/extract_matrix_tests.py \
             fuzzing_matrix.json \
             "${{ matrix.commit }}" \
-            "${{ matrix.job_id }}")
+            "${{ matrix.job_id }}" > tests_job_${{ matrix.job_id }}.json
           
           if [ $? -ne 0 ]; then
             echo "❌ Failed to extract test data"
             exit 1
           fi
           
-          # Output tests as multiline JSON (GitHub Actions supports this)
-          echo "tests<<EOF" >> $GITHUB_OUTPUT
-          echo "$TESTS_JSON" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          # Output file path
+          echo "tests_file=tests_job_${{ matrix.job_id }}.json" >> $GITHUB_OUTPUT
           
-          TEST_COUNT=$(echo "$TESTS_JSON" | python3 -c "import sys, json; print(len(json.load(sys.stdin)))")
+          TEST_COUNT=$(python3 -c "import json; print(len(json.load(open('tests_job_${{ matrix.job_id }}.json'))))")
           echo "✅ Extracted $TEST_COUNT tests for job ${{ matrix.job_id }}"
       
       - name: Install system dependencies
@@ -433,10 +431,8 @@ jobs:
         working-directory: z3
         run: |
           FUZZING_DURATION="${{ inputs.fuzzing_duration_minutes || 60 }}"
-          # Parse the tests JSON from the multiline output
-          TESTS_JSON='${{ steps.extract-tests.outputs.tests }}'
           python3 ${{ github.workspace }}/scripts/z3/commit_fuzzer/simple_commit_fuzzer.py \
-            --tests-json "$TESTS_JSON" \
+            --tests-file ../${{ steps.extract-tests.outputs.tests_file }} \
             --job-id '${{ matrix.job_id }}' \
             --tests-root ../z3test \
             --fuzzing-duration-minutes ${FUZZING_DURATION} \

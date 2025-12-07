@@ -969,10 +969,15 @@ def main():
     parser = argparse.ArgumentParser(
         description="Simple commit fuzzer that runs typefuzz on tests with multiple solvers"
     )
-    parser.add_argument(
+    # Support both --tests-json (inline) and --tests-file (file path) to avoid "Argument list too long"
+    tests_group = parser.add_mutually_exclusive_group(required=True)
+    tests_group.add_argument(
         "--tests-json",
-        required=True,
         help="JSON array of test names (relative to --tests-root)",
+    )
+    tests_group.add_argument(
+        "--tests-file",
+        help="Path to JSON file containing array of test names (avoids shell argument limits)",
     )
     parser.add_argument(
         "--job-id",
@@ -1080,13 +1085,21 @@ def main():
     
     args = parser.parse_args()
     
-    # Parse tests JSON
+    # Parse tests from JSON string or file
     try:
-        tests = json.loads(args.tests_json)
+        if args.tests_file:
+            with open(args.tests_file, 'r') as f:
+                tests = json.load(f)
+            print(f"[INFO] Loaded tests from file: {args.tests_file}")
+        else:
+            tests = json.loads(args.tests_json)
         if not isinstance(tests, list):
-            raise ValueError("tests-json must be a JSON array")
+            raise ValueError("tests must be a JSON array")
+    except FileNotFoundError as e:
+        print(f"Error: Tests file not found: {args.tests_file}", file=sys.stderr)
+        sys.exit(1)
     except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON in --tests-json: {e}", file=sys.stderr)
+        print(f"Error: Invalid JSON: {e}", file=sys.stderr)
         sys.exit(1)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
