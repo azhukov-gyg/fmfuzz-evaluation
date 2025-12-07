@@ -522,7 +522,9 @@ class SimpleCommitFuzzer:
         # if self.z3_old_path:
         #     solvers.append(str(self.z3_old_path))
         # CVC5: No built-in memory limit - rely on our process killing mechanism (max_process_memory_mb)
-        base_flags = "--check-models --check-proofs --strings-exp"
+        # TEMPORARY: Add --sat-solver=cadical to ensure cadical functions are executed
+        # This is a debugging step to verify that cadical code paths are reachable
+        base_flags = "--check-models --check-proofs --strings-exp --sat-solver=cadical"
         
         # Extract COMMAND-LINE flags from test file if provided (to match coverage mapping behavior)
         test_flags = ""
