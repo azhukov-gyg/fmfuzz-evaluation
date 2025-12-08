@@ -74,17 +74,18 @@ echo "✅ Using Clang: $(clang++ --version | head -1)"
 
 # Set up environment variables for sancov (Clang-specific)
 # 
-# Using inline-8bit-counters,pc-table with our custom coverage agent.
+# Using trace-pc-guard,pc-table with our custom coverage agent.
+# trace-pc-guard is simpler than inline-8bit-counters - it just tracks which
+# edges (guards) were hit, which is exactly what we need for coverage.
 # This writes coverage to shared memory which the Python fuzzer reads.
-# NO reliance on ASAN_OPTIONS=coverage=1 (which doesn't work reliably).
 #
 # NOTE: Allowlist is DISABLED for now to instrument the full binary.
 # This helps verify coverage is working before restricting to specific functions.
 export CC=clang
 export CXX=clang++
-export CXXFLAGS="${CXXFLAGS} -fsanitize-coverage=inline-8bit-counters,pc-table -fsanitize=address -O1 -g -fno-omit-frame-pointer"
-export CFLAGS="${CFLAGS} -fsanitize-coverage=inline-8bit-counters,pc-table -fsanitize=address -O1 -g -fno-omit-frame-pointer"
-export LDFLAGS="${LDFLAGS} -fsanitize-coverage=inline-8bit-counters,pc-table -fsanitize=address"
+export CXXFLAGS="${CXXFLAGS} -fsanitize-coverage=trace-pc-guard,pc-table -fsanitize=address -O1 -g -fno-omit-frame-pointer"
+export CFLAGS="${CFLAGS} -fsanitize-coverage=trace-pc-guard,pc-table -fsanitize=address -O1 -g -fno-omit-frame-pointer"
+export LDFLAGS="${LDFLAGS} -fsanitize-coverage=trace-pc-guard,pc-table -fsanitize=address"
 
 # Configure CVC5 with debug build (required for coverage)
 echo "🔨 Configuring CVC5..."
@@ -101,9 +102,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_SRC="${SCRIPT_DIR}/coverage_agent.cpp"
 
 if [ -f "$AGENT_SRC" ]; then
+    # Agent doesn't need instrumentation - it just provides callbacks
     clang++ -shared -fPIC -o libcov_agent.so "$AGENT_SRC" \
         -O2 -g -std=c++17 -Wall -Wextra \
-        -fsanitize-coverage=inline-8bit-counters,pc-table \
         -lrt
     echo "✅ Coverage agent built: $(pwd)/libcov_agent.so"
 else

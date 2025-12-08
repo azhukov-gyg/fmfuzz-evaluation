@@ -17,9 +17,11 @@ import json
 import uuid
 
 # Shared memory constants (must match coverage_agent.cpp)
-MAX_COUNTERS = 65536
+# Structure: pid(4+4), guard_count(4+4), hit_guard_count(4+4), pc_table_size(4+4),
+#            hit_guards bitmap(MAX_GUARDS/8), pc_table(MAX_PCS*8)
+MAX_GUARDS = 65536
 MAX_PCS = 65536
-SHM_SIZE = 4 + 4 + 4 + 4 + 4 + 4 + MAX_COUNTERS + MAX_PCS * 8
+SHM_SIZE = 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + (MAX_GUARDS // 8) + MAX_PCS * 8
 
 
 class SancovCoverageTracker:
@@ -143,20 +145,20 @@ class SancovCoverageTracker:
     def _read_shm_at_path(self, shm_path: str) -> Tuple[Set[int], Set[int], int, int]:
         """
         Read coverage from shared memory at specified path.
-        Returns: (covered_indices, pcs, counter_count, pc_table_size)
+        Returns: (covered_guard_indices, pcs, guard_count, pc_table_size)
         """
-        covered_indices = set()
+        covered_guard_indices = set()
         pcs = set()
-        counter_count = 0
+        guard_count = 0
         pc_table_size = 0
         
         try:
             if not os.path.exists(shm_path):
-                return covered_indices, pcs, counter_count, pc_table_size
+                return covered_guard_indices, pcs, guard_count, pc_table_size
             
             file_size = os.path.getsize(shm_path)
             if file_size < SHM_SIZE:
-                return covered_indices, pcs, counter_count, pc_table_size
+                return covered_guard_indices, pcs, guard_count, pc_table_size
             
             with os.fdopen(os.open(shm_path, os.O_RDONLY), 'rb') as fd:
                 shm_mmap = mmap.mmap(fd.fileno(), file_size, access=mmap.ACCESS_READ)
@@ -168,27 +170,36 @@ class SancovCoverageTracker:
                     pid = struct.unpack('I', shm_mmap.read(4))[0]
                     shm_mmap.read(4)  # Skip padding
                     
-                    # counter_count (atomic<uint32_t>) - offset 8, 4 bytes
-                    counter_count = struct.unpack('I', shm_mmap.read(4))[0]
+                    # guard_count (atomic<uint32_t>) - offset 8, 4 bytes
+                    guard_count = struct.unpack('I', shm_mmap.read(4))[0]
                     shm_mmap.read(4)  # Skip padding
                     
-                    # pc_table_size (atomic<uint32_t>) - offset 16, 4 bytes
+                    # hit_guard_count (atomic<uint32_t>) - offset 16, 4 bytes
+                    hit_guard_count = struct.unpack('I', shm_mmap.read(4))[0]
+                    shm_mmap.read(4)  # Skip padding
+                    
+                    # pc_table_size (atomic<uint32_t>) - offset 24, 4 bytes
                     pc_table_size = struct.unpack('I', shm_mmap.read(4))[0]
                     shm_mmap.read(4)  # Skip padding
                     
-                    if counter_count == 0:
-                        return covered_indices, pcs, counter_count, pc_table_size
+                    if guard_count == 0:
+                        return covered_guard_indices, pcs, guard_count, pc_table_size
                     
-                    # counters array starts at offset 24
-                    counters = shm_mmap.read(MAX_COUNTERS)
+                    # hit_guards bitmap starts at offset 32
+                    hit_guards_bytes = shm_mmap.read(MAX_GUARDS // 8)
                     
-                    # PC table starts after counters
+                    # PC table starts after hit_guards bitmap
                     pc_table_bytes = shm_mmap.read(MAX_PCS * 8)
                     
-                    # Extract covered indices (counter indices with non-zero values)
-                    for i in range(min(counter_count, MAX_COUNTERS)):
-                        if counters[i] > 0:
-                            covered_indices.add(i)
+                    # Extract covered guard indices from bitmap
+                    for byte_idx in range(min(len(hit_guards_bytes), MAX_GUARDS // 8)):
+                        byte_val = hit_guards_bytes[byte_idx]
+                        if byte_val != 0:
+                            for bit_idx in range(8):
+                                if byte_val & (1 << bit_idx):
+                                    guard_idx = byte_idx * 8 + bit_idx
+                                    if guard_idx < guard_count:
+                                        covered_guard_indices.add(guard_idx)
                     
                     # Extract PCs
                     for i in range(min(pc_table_size, MAX_PCS)):
@@ -200,7 +211,7 @@ class SancovCoverageTracker:
         except Exception as e:
             print(f"[Sancov] Error reading shared memory at {shm_path}: {e}", file=sys.stderr)
         
-        return covered_indices, pcs, counter_count, pc_table_size
+        return covered_guard_indices, pcs, guard_count, pc_table_size
     
     def get_coverage_stats(self) -> Dict:
         """Get current coverage statistics."""

@@ -570,9 +570,18 @@ jobs:
           if [ -f /tmp/coverage_agent.log ]; then
             echo "✅ Agent log exists! Agent WAS loaded into cvc5 processes"
             echo "Total agent loads: $(grep -c '\[AGENT\] Loaded' /tmp/coverage_agent.log || echo 0)"
-            echo "Total counter inits: $(grep -c '__sanitizer_cov_8bit_counters_init' /tmp/coverage_agent.log || echo 0)"
-            echo "Last 20 lines:"
-            tail -20 /tmp/coverage_agent.log
+            echo "Total guard inits: $(grep -c '__sanitizer_cov_trace_pc_guard_init' /tmp/coverage_agent.log || echo 0)"
+            echo "Total guards initialized: $(grep -c 'Guards initialized' /tmp/coverage_agent.log || echo 0)"
+            echo "Total hit guards written: $(grep -c 'Wrote.*hit guards' /tmp/coverage_agent.log || echo 0)"
+            echo ""
+            echo "Guard init details:"
+            grep '__sanitizer_cov_trace_pc_guard_init' /tmp/coverage_agent.log | head -10
+            echo ""
+            echo "Warnings/Errors:"
+            grep -E 'WARNING|ERROR' /tmp/coverage_agent.log | head -10 || echo "  None"
+            echo ""
+            echo "Last 30 lines:"
+            tail -30 /tmp/coverage_agent.log
           else
             echo "❌ coverage_agent.log NOT FOUND - Agent was NEVER loaded!"
             echo "This means LD_PRELOAD failed (likely relative path issue)"
@@ -591,7 +600,7 @@ jobs:
           fi
           
           echo ""
-          echo "=== Check counter_count in shm files ==="
+          echo "=== Check guard_count in shm files ==="
           for SHM in /dev/shm/cvc5_cov_*; do
             if [ -f "$SHM" ]; then
               echo "File: $SHM"
@@ -602,14 +611,15 @@ jobs:
               with os.fdopen(os.open(shm_path, os.O_RDONLY), 'rb') as f:
                   m = mmap.mmap(f.fileno(), 589840, access=mmap.ACCESS_READ)
                   m.seek(0); pid = struct.unpack('I', m.read(4))[0]
-                  m.seek(8); counter_count = struct.unpack('I', m.read(4))[0]
-                  m.seek(16); pc_table_size = struct.unpack('I', m.read(4))[0]
-                  print(f'  pid={pid}, counter_count={counter_count}, pc_table_size={pc_table_size}')
-                  if counter_count > 0:
-                      m.seek(24)
-                      counters = m.read(min(counter_count, 65536))
-                      nonzero = sum(1 for c in counters if c > 0)
-                      print(f'  Non-zero counters: {nonzero} / {counter_count}')
+                  m.seek(8); guard_count = struct.unpack('I', m.read(4))[0]
+                  m.seek(16); hit_guard_count = struct.unpack('I', m.read(4))[0]
+                  m.seek(24); pc_table_size = struct.unpack('I', m.read(4))[0]
+                  print(f'  pid={pid}, guard_count={guard_count}, hit_guards={hit_guard_count}, pc_table_size={pc_table_size}')
+                  if guard_count > 0 and hit_guard_count > 0:
+                      m.seek(32)
+                      hit_guards = m.read(min(guard_count // 8 + 1, 8192))
+                      bits_set = sum(bin(b).count('1') for b in hit_guards)
+                      print(f'  Hit guards (from bitmap): {bits_set} / {guard_count}')
                   m.close()
           except Exception as e:
               print(f'  Error reading shm: {e}')
