@@ -580,25 +580,25 @@ jobs:
           for SHM in /dev/shm/cvc5_cov_*; do
             if [ -f "$SHM" ]; then
               echo "File: $SHM"
-              python3 << EOF
-import struct, mmap, os
-shm_path = "$SHM"
-try:
-    with os.fdopen(os.open(shm_path, os.O_RDONLY), 'rb') as f:
-        m = mmap.mmap(f.fileno(), 589840, access=mmap.ACCESS_READ)
-        m.seek(0); pid = struct.unpack('I', m.read(4))[0]
-        m.seek(8); counter_count = struct.unpack('I', m.read(4))[0]
-        m.seek(16); pc_table_size = struct.unpack('I', m.read(4))[0]
-        print(f'  pid={pid}, counter_count={counter_count}, pc_table_size={pc_table_size}')
-        if counter_count > 0:
-            m.seek(24)
-            counters = m.read(min(counter_count, 65536))
-            nonzero = sum(1 for c in counters if c > 0)
-            print(f'  Non-zero counters: {nonzero} / {counter_count}')
-        m.close()
-except Exception as e:
-    print(f'  Error reading shm: {e}')
-EOF
+              python3 -c "
+          import struct, mmap, os
+          shm_path = '$SHM'
+          try:
+              with os.fdopen(os.open(shm_path, os.O_RDONLY), 'rb') as f:
+                  m = mmap.mmap(f.fileno(), 589840, access=mmap.ACCESS_READ)
+                  m.seek(0); pid = struct.unpack('I', m.read(4))[0]
+                  m.seek(8); counter_count = struct.unpack('I', m.read(4))[0]
+                  m.seek(16); pc_table_size = struct.unpack('I', m.read(4))[0]
+                  print(f'  pid={pid}, counter_count={counter_count}, pc_table_size={pc_table_size}')
+                  if counter_count > 0:
+                      m.seek(24)
+                      counters = m.read(min(counter_count, 65536))
+                      nonzero = sum(1 for c in counters if c > 0)
+                      print(f'  Non-zero counters: {nonzero} / {counter_count}')
+                  m.close()
+          except Exception as e:
+              print(f'  Error reading shm: {e}')
+          " 2>&1 || echo "  Error running python"
             fi
           done || echo "No shm files found"
           
