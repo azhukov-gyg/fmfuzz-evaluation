@@ -81,7 +81,68 @@ class SancovCoverageTracker:
     
     def read_shm_coverage(self) -> Tuple[Set[int], Set[int], int, int]:
         """
-        Read coverage from shared memory.
+        Read coverage from default shared memory.
+        Returns: (covered_indices, pcs, counter_count, pc_table_size)
+        """
+        return self._read_shm_at_path(self.shm_path)
+    
+    def update_coverage(self, test_id: Optional[str] = None) -> Dict[str, int]:
+        """
+        Update coverage by reading from default shared memory.
+        
+        Returns:
+            Dict with 'new_pcs', 'total_pcs', 'new_files' counts
+        """
+        return self.update_coverage_from_shm(shm_name=self.shm_name, test_id=test_id)
+    
+    def update_coverage_from_shm(self, shm_name: str, test_id: Optional[str] = None) -> Dict[str, int]:
+        """
+        Update coverage by reading from specified shared memory.
+        
+        Args:
+            shm_name: Name of the shared memory segment to read
+            test_id: Optional test identifier for tracking per-test coverage
+        
+        Returns:
+            Dict with 'new_pcs', 'total_pcs', 'new_files' counts
+        """
+        # Read from the specified shared memory
+        shm_path = f"/dev/shm/{shm_name}"
+        covered_indices, pcs, counter_count, pc_table_size = self._read_shm_at_path(shm_path)
+        
+        # Track new coverage
+        new_indices = covered_indices - self.covered_indices
+        new_pcs = pcs - self.covered_pcs
+        
+        if new_indices or new_pcs:
+            self.processed_count += 1
+            
+            # Update test coverage if test_id provided
+            if test_id:
+                if test_id not in self.test_coverage:
+                    self.test_coverage[test_id] = set()
+                self.test_coverage[test_id].update(covered_indices)
+        
+        # Update total coverage
+        self.covered_indices.update(new_indices)
+        self.covered_pcs.update(new_pcs)
+        
+        # Clean up this worker's shared memory
+        try:
+            if os.path.exists(shm_path):
+                os.unlink(shm_path)
+        except:
+            pass
+        
+        return {
+            'new_pcs': len(new_indices),  # Use indices as "PCs" for consistency
+            'total_pcs': len(self.covered_indices),
+            'new_files': 1 if new_indices else 0
+        }
+    
+    def _read_shm_at_path(self, shm_path: str) -> Tuple[Set[int], Set[int], int, int]:
+        """
+        Read coverage from shared memory at specified path.
         Returns: (covered_indices, pcs, counter_count, pc_table_size)
         """
         covered_indices = set()
@@ -90,14 +151,14 @@ class SancovCoverageTracker:
         pc_table_size = 0
         
         try:
-            if not os.path.exists(self.shm_path):
+            if not os.path.exists(shm_path):
                 return covered_indices, pcs, counter_count, pc_table_size
             
-            file_size = os.path.getsize(self.shm_path)
+            file_size = os.path.getsize(shm_path)
             if file_size < SHM_SIZE:
                 return covered_indices, pcs, counter_count, pc_table_size
             
-            with os.fdopen(os.open(self.shm_path, os.O_RDONLY), 'rb') as fd:
+            with os.fdopen(os.open(shm_path, os.O_RDONLY), 'rb') as fd:
                 shm_mmap = mmap.mmap(fd.fileno(), file_size, access=mmap.ACCESS_READ)
                 
                 try:
@@ -137,44 +198,9 @@ class SancovCoverageTracker:
                 finally:
                     shm_mmap.close()
         except Exception as e:
-            print(f"[Sancov] Error reading shared memory: {e}", file=sys.stderr)
+            print(f"[Sancov] Error reading shared memory at {shm_path}: {e}", file=sys.stderr)
         
         return covered_indices, pcs, counter_count, pc_table_size
-    
-    def update_coverage(self, test_id: Optional[str] = None) -> Dict[str, int]:
-        """
-        Update coverage by reading from shared memory.
-        
-        Returns:
-            Dict with 'new_pcs', 'total_pcs', 'new_files' counts
-        """
-        covered_indices, pcs, counter_count, pc_table_size = self.read_shm_coverage()
-        
-        # Track new coverage
-        new_indices = covered_indices - self.covered_indices
-        new_pcs = pcs - self.covered_pcs
-        
-        if new_indices or new_pcs:
-            self.processed_count += 1
-            
-            # Update test coverage if test_id provided
-            if test_id:
-                if test_id not in self.test_coverage:
-                    self.test_coverage[test_id] = set()
-                self.test_coverage[test_id].update(covered_indices)
-        
-        # Update total coverage
-        self.covered_indices.update(new_indices)
-        self.covered_pcs.update(new_pcs)
-        
-        # Clean up shared memory for next test
-        self.cleanup_shm()
-        
-        return {
-            'new_pcs': len(new_indices),  # Use indices as "PCs" for consistency
-            'total_pcs': len(self.covered_indices),
-            'new_files': 1 if new_indices else 0
-        }
     
     def get_coverage_stats(self) -> Dict:
         """Get current coverage statistics."""

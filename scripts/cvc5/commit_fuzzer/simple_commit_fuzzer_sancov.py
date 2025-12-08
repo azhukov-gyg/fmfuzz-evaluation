@@ -621,9 +621,12 @@ class SimpleCommitFuzzer:
         try:
             # Set up environment
             env = os.environ.copy()
+            worker_shm_name = None
             if self.enable_sancov and self.coverage_tracker:
-                # Use shared memory for coverage tracking
-                env['COVERAGE_SHM_NAME'] = self.coverage_tracker.shm_name
+                # Use per-worker shared memory to avoid conflicts between parallel workers
+                import uuid
+                worker_shm_name = f"cvc5_cov_w{worker_id}_{uuid.uuid4().hex[:6]}"
+                env['COVERAGE_SHM_NAME'] = worker_shm_name
                 env['ASAN_OPTIONS'] = 'abort_on_error=0:detect_leaks=0'
                 
                 # Use LD_PRELOAD to inject coverage agent
@@ -644,9 +647,13 @@ class SimpleCommitFuzzer:
             bug_files = self._collect_bug_files(bugs_folder)
             
             # Update sancov coverage tracking if enabled
-            if self.enable_sancov and self.coverage_tracker:
+            if self.enable_sancov and self.coverage_tracker and worker_shm_name:
                 try:
-                    coverage_info = self.coverage_tracker.update_coverage(test_id=test_name)
+                    # Read coverage from this worker's shared memory
+                    coverage_info = self.coverage_tracker.update_coverage_from_shm(
+                        shm_name=worker_shm_name,
+                        test_id=test_name
+                    )
                     if coverage_info['new_pcs'] > 0:
                         print(f"[WORKER {worker_id}] [Sancov] New coverage: {coverage_info['new_pcs']} edges (total: {coverage_info['total_pcs']})")
                 except Exception as e:
