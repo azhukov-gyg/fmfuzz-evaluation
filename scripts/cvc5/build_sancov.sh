@@ -74,16 +74,16 @@ echo "✅ Using Clang: $(clang++ --version | head -1)"
 
 # Set up environment variables for sancov (Clang-specific)
 # 
-# Using trace-pc-guard,pc-table which generates .sancov files automatically
-# when combined with ASan and ASAN_OPTIONS=coverage=1.
-# This was tested and works in the partial-instrumentation/experiment_partial_sancov folder.
+# Using inline-8bit-counters,pc-table with our custom coverage agent.
+# This writes coverage to shared memory which the Python fuzzer reads.
+# NO reliance on ASAN_OPTIONS=coverage=1 (which doesn't work reliably).
 #
-# The allowlist (-fsanitize-coverage-allowlist) restricts instrumentation to specific functions.
+# The allowlist restricts instrumentation to specific functions.
 export CC=clang
 export CXX=clang++
-export CXXFLAGS="${CXXFLAGS} -fsanitize-coverage=trace-pc-guard,pc-table -fsanitize=address -O1 -g -fno-omit-frame-pointer ${ALLOWLIST_FLAG}"
-export CFLAGS="${CFLAGS} -fsanitize-coverage=trace-pc-guard,pc-table -fsanitize=address -O1 -g -fno-omit-frame-pointer ${ALLOWLIST_FLAG}"
-export LDFLAGS="${LDFLAGS} -fsanitize-coverage=trace-pc-guard,pc-table -fsanitize=address"
+export CXXFLAGS="${CXXFLAGS} -fsanitize-coverage=inline-8bit-counters,pc-table -fsanitize=address -O1 -g -fno-omit-frame-pointer ${ALLOWLIST_FLAG}"
+export CFLAGS="${CFLAGS} -fsanitize-coverage=inline-8bit-counters,pc-table -fsanitize=address -O1 -g -fno-omit-frame-pointer ${ALLOWLIST_FLAG}"
+export LDFLAGS="${LDFLAGS} -fsanitize-coverage=inline-8bit-counters,pc-table -fsanitize=address"
 
 # Configure CVC5 with debug build (required for coverage)
 echo "🔨 Configuring CVC5..."
@@ -94,10 +94,27 @@ echo "🔨 Building CVC5..."
 cd "$BUILD_DIR"
 make -j"$JOBS"
 
+# Build coverage agent shared library
+echo "🔨 Building coverage agent..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENT_SRC="${SCRIPT_DIR}/coverage_agent.cpp"
+
+if [ -f "$AGENT_SRC" ]; then
+    clang++ -shared -fPIC -o libcov_agent.so "$AGENT_SRC" \
+        -O2 -g -std=c++17 -Wall -Wextra \
+        -fsanitize-coverage=inline-8bit-counters,pc-table \
+        -lrt
+    echo "✅ Coverage agent built: $(pwd)/libcov_agent.so"
+else
+    echo "⚠️  Coverage agent source not found: $AGENT_SRC"
+    echo "   Coverage tracking may not work without the agent!"
+fi
+
+echo ""
 echo "✅ Build complete!"
 echo ""
-echo "To run with sancov coverage, set:"
-echo "  export ASAN_OPTIONS='coverage=1:coverage_dir=.:abort_on_error=0:detect_leaks=0'"
+echo "To run with sancov coverage using shared memory:"
+echo "  LD_PRELOAD=./libcov_agent.so COVERAGE_SHM_NAME=cvc5_cov ./bin/cvc5 input.smt2"
 echo ""
-echo "Coverage files will be written as: <pid>.<binary>.sancov"
+echo "The Python fuzzer will read coverage from shared memory."
 

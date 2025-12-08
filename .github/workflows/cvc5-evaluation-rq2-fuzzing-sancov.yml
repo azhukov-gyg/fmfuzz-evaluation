@@ -482,18 +482,63 @@ jobs:
           echo ""
           echo "=== Checking for 8bit counter symbols ==="
           nm ./build/bin/cvc5 2>/dev/null | grep -E "__sanitizer_cov_8bit" | head -10 || echo "No 8bit counter symbols found"
+          
+          # Check for coverage agent
+          echo ""
+          echo "=== Checking for coverage agent ==="
+          if [ -f "./build/libcov_agent.so" ]; then
+            echo "✅ Coverage agent found: ./build/libcov_agent.so"
+            ls -lh ./build/libcov_agent.so
+          elif [ -f "./build/bin/libcov_agent.so" ]; then
+            echo "✅ Coverage agent found: ./build/bin/libcov_agent.so"
+            ls -lh ./build/bin/libcov_agent.so
+          else
+            echo "❌ Coverage agent NOT found!"
+            echo "Looking for libcov_agent.so..."
+            find . -name "libcov_agent.so" -type f 2>/dev/null || echo "Not found anywhere"
+          fi
+          
+          # Quick test with shared memory coverage
+          echo ""
+          echo "=== Quick test: running cvc5 with shared memory coverage ==="
+          AGENT_PATH=$(find ./build -name "libcov_agent.so" -type f 2>/dev/null | head -1)
+          if [ -n "$AGENT_PATH" ] && [ -n "$TEST_FILE" ]; then
+            echo "Using agent: $AGENT_PATH"
+            echo "Running: LD_PRELOAD=$AGENT_PATH COVERAGE_SHM_NAME=test_cov ./build/bin/cvc5 $TEST_FILE"
+            LD_PRELOAD="$AGENT_PATH" COVERAGE_SHM_NAME=test_cov ASAN_OPTIONS='abort_on_error=0:detect_leaks=0' \
+              timeout 10 ./build/bin/cvc5 "$TEST_FILE" 2>&1 || true
+            
+            echo ""
+            echo "=== Shared memory file after test ==="
+            if [ -f "/dev/shm/test_cov" ]; then
+              echo "✅ Shared memory file created!"
+              ls -la /dev/shm/test_cov
+              echo "File size: $(stat -c%s /dev/shm/test_cov) bytes"
+            else
+              echo "❌ Shared memory file NOT created"
+              echo "Contents of /dev/shm/:"
+              ls -la /dev/shm/ | head -20
+            fi
+          else
+            echo "Skipping test - agent or test file not found"
+          fi
 
       - name: Run fuzzing with sancov coverage tracking
         working-directory: cvc5
-        env:
-          ASAN_OPTIONS: 'coverage=1:coverage_dir=./coverage:abort_on_error=0:detect_leaks=0'
         run: |
           FUZZING_DURATION="${{ inputs.fuzzing_duration_minutes || 60 }}"
           mkdir -p coverage
           
-          echo "=== Starting fuzzing with sancov ==="
-          echo "ASAN_OPTIONS: $ASAN_OPTIONS"
+          echo "=== Starting fuzzing with sancov (shared memory mode) ==="
           echo "Coverage dir: ./coverage"
+          
+          # Find coverage agent
+          AGENT_PATH=$(find ./build -name "libcov_agent.so" -type f 2>/dev/null | head -1)
+          if [ -n "$AGENT_PATH" ]; then
+            echo "Coverage agent: $AGENT_PATH"
+          else
+            echo "WARNING: Coverage agent not found!"
+          fi
           
           python3 ${{ github.workspace }}/scripts/cvc5/commit_fuzzer/simple_commit_fuzzer_sancov.py \
             --tests-file ../${{ steps.extract-tests.outputs.tests_file }} \
@@ -507,15 +552,12 @@ jobs:
             --coverage-report ../sancov_coverage_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json || true
           
           echo ""
-          echo "=== Coverage files after fuzzing ==="
-          echo "Number of .sancov files: $(find ./coverage -name '*.sancov' -type f 2>/dev/null | wc -l)"
-          find ./coverage -name "*.sancov" -type f 2>/dev/null | head -20 || echo "No .sancov files found"
+          echo "=== Coverage status after fuzzing ==="
+          echo "Shared memory files in /dev/shm/:"
+          ls -la /dev/shm/cvc5_cov* 2>/dev/null | head -10 || echo "No cvc5_cov shared memory files"
           echo ""
           echo "Coverage dir contents:"
           ls -la ./coverage/ 2>/dev/null | head -20 || echo "Coverage dir empty or missing"
-          echo ""
-          echo "Total size of coverage dir:"
-          du -sh ./coverage/ 2>/dev/null || echo "Coverage dir not found"
       
       - name: Debug - Check coverage report
         if: always()

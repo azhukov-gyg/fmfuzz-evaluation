@@ -129,6 +129,7 @@ class SimpleCommitFuzzer:
         self.coverage_dir = Path(coverage_dir) if enable_sancov else None
         self.coverage_report = coverage_report
         self.coverage_tracker = None
+        self.cov_agent_path = None
         
         if self.enable_sancov:
             try:
@@ -141,18 +142,20 @@ class SimpleCommitFuzzer:
                     binary_path=str(self.cvc5_path)
                 )
                 
-                # Set ASAN_OPTIONS for sancov if not already set
-                asan_opts = os.environ.get('ASAN_OPTIONS', '')
-                if 'coverage=1' not in asan_opts:
-                    coverage_opts = f'coverage=1:coverage_dir={self.coverage_dir}:abort_on_error=0:detect_leaks=0'
-                    if asan_opts:
-                        os.environ['ASAN_OPTIONS'] = f"{asan_opts}:{coverage_opts}"
-                    else:
-                        os.environ['ASAN_OPTIONS'] = coverage_opts
+                # Find coverage agent shared library
+                self.cov_agent_path = self.cvc5_path.parent / 'libcov_agent.so'
+                if not self.cov_agent_path.exists():
+                    # Try parent directory
+                    self.cov_agent_path = self.cvc5_path.parent.parent / 'libcov_agent.so'
                 
-                print(f"[Sancov] Coverage tracking enabled")
+                print(f"[Sancov] Coverage tracking enabled (shared memory mode)")
                 print(f"[Sancov] Coverage directory: {self.coverage_dir}")
-                print(f"[Sancov] ASAN_OPTIONS: {os.environ.get('ASAN_OPTIONS')}")
+                print(f"[Sancov] Shared memory name: {self.coverage_tracker.shm_name}")
+                if self.cov_agent_path.exists():
+                    print(f"[Sancov] Coverage agent: {self.cov_agent_path}")
+                else:
+                    print(f"[WARN] Coverage agent not found at {self.cov_agent_path}")
+                    print(f"[WARN] Coverage tracking may not work without the agent!")
             except ImportError as e:
                 print(f"[WARN] Sancov tracking requested but sancov_coverage_tracker not available: {e}", file=sys.stderr)
                 self.enable_sancov = False
@@ -616,18 +619,20 @@ class SimpleCommitFuzzer:
         start_time = time.time()
         
         try:
-            # Ensure ASAN_OPTIONS is passed to subprocess
+            # Set up environment
             env = os.environ.copy()
-            if self.enable_sancov:
-                # Make sure ASAN_OPTIONS is set with absolute path for coverage_dir
-                asan_opts = env.get('ASAN_OPTIONS', '')
-                coverage_dir_abs = str(self.coverage_dir.resolve())
-                if 'coverage=1' not in asan_opts:
-                    coverage_opts = f'coverage=1:coverage_dir={coverage_dir_abs}:abort_on_error=0:detect_leaks=0'
-                    env['ASAN_OPTIONS'] = f"{asan_opts}:{coverage_opts}" if asan_opts else coverage_opts
-                elif 'coverage_dir=' not in asan_opts:
-                    # Update coverage_dir to absolute path
-                    env['ASAN_OPTIONS'] = f"{asan_opts}:coverage_dir={coverage_dir_abs}"
+            if self.enable_sancov and self.coverage_tracker:
+                # Use shared memory for coverage tracking
+                env['COVERAGE_SHM_NAME'] = self.coverage_tracker.shm_name
+                env['ASAN_OPTIONS'] = 'abort_on_error=0:detect_leaks=0'
+                
+                # Use LD_PRELOAD to inject coverage agent
+                if self.cov_agent_path and self.cov_agent_path.exists():
+                    existing_preload = env.get('LD_PRELOAD', '')
+                    if existing_preload:
+                        env['LD_PRELOAD'] = f"{self.cov_agent_path}:{existing_preload}"
+                    else:
+                        env['LD_PRELOAD'] = str(self.cov_agent_path)
             
             if per_test_timeout and per_test_timeout > 0:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=per_test_timeout, env=env)
@@ -641,16 +646,9 @@ class SimpleCommitFuzzer:
             # Update sancov coverage tracking if enabled
             if self.enable_sancov and self.coverage_tracker:
                 try:
-                    # List .sancov files for debugging
-                    sancov_files = list(self.coverage_dir.glob("*.sancov"))
-                    if sancov_files:
-                        print(f"[WORKER {worker_id}] [Sancov] Found {len(sancov_files)} .sancov file(s) in {self.coverage_dir}")
-                    
                     coverage_info = self.coverage_tracker.update_coverage(test_id=test_name)
                     if coverage_info['new_pcs'] > 0:
-                        print(f"[WORKER {worker_id}] [Sancov] New coverage: {coverage_info['new_pcs']} PCs (total: {coverage_info['total_pcs']})")
-                    elif coverage_info['new_files'] > 0:
-                        print(f"[WORKER {worker_id}] [Sancov] Found {coverage_info['new_files']} new .sancov file(s) but no new PCs")
+                        print(f"[WORKER {worker_id}] [Sancov] New coverage: {coverage_info['new_pcs']} edges (total: {coverage_info['total_pcs']})")
                 except Exception as e:
                     print(f"[WORKER {worker_id}] [Sancov] Error updating coverage: {e}", file=sys.stderr)
                     import traceback
