@@ -431,16 +431,47 @@ jobs:
             grep -i "sancov\|sanitize\|coverage" ./build/CMakeCache.txt | head -20 || echo "No sancov flags found in CMakeCache"
           fi
           
-          # Quick test run to see if .sancov files are generated
+          # Show allowlist contents
           echo ""
-          echo "=== Quick test: running cvc5 to check if .sancov files are generated ==="
+          echo "=== Allowlist contents (first 50 lines) ==="
+          if [ -f "../coverage_allowlist.txt" ]; then
+            echo "Allowlist file exists, $(wc -l < ../coverage_allowlist.txt) lines total"
+            echo "Number of fun: entries: $(grep -c '^fun:' ../coverage_allowlist.txt || echo 0)"
+            echo "Number of src: entries: $(grep -c '^src:' ../coverage_allowlist.txt || echo 0)"
+            echo ""
+            head -50 ../coverage_allowlist.txt
+          else
+            echo "❌ Allowlist file NOT found!"
+          fi
+          
+          # Quick test run with a real SMT2 file (not just --version)
+          echo ""
+          echo "=== Quick test: running cvc5 on a real test file ==="
           mkdir -p ./test_coverage
-          export ASAN_OPTIONS='coverage=1:coverage_dir=./test_coverage'
-          timeout 5 ./build/bin/cvc5 --version || true
+          export ASAN_OPTIONS='coverage=1:coverage_dir=./test_coverage:abort_on_error=0:detect_leaks=0'
+          
+          # Find a simple regression test
+          TEST_FILE=$(find ./test/regress/cli/regress0 -name "*.smt2" -type f | head -1)
+          if [ -n "$TEST_FILE" ]; then
+            echo "Running: ./build/bin/cvc5 $TEST_FILE"
+            timeout 10 ./build/bin/cvc5 "$TEST_FILE" 2>&1 || true
+          else
+            echo "No test file found, running --version"
+            timeout 5 ./build/bin/cvc5 --version || true
+          fi
+          
           echo ""
           echo "=== .sancov files after test run ==="
           find ./test_coverage -name "*.sancov" -type f 2>/dev/null | head -10 || echo "No .sancov files found"
           ls -la ./test_coverage/ 2>/dev/null || echo "test_coverage dir empty or missing"
+          
+          # If sancov files exist, show their sizes
+          SANCOV_COUNT=$(find ./test_coverage -name "*.sancov" -type f 2>/dev/null | wc -l)
+          if [ "$SANCOV_COUNT" -gt 0 ]; then
+            echo ""
+            echo "=== .sancov file details ==="
+            find ./test_coverage -name "*.sancov" -type f -exec ls -la {} \;
+          fi
 
       - name: Run fuzzing with sancov coverage tracking
         working-directory: cvc5
