@@ -143,6 +143,9 @@ class CoverageGuidedFuzzer:
             'generations_completed': 0,
         })
         
+        # Track excluded tests (unsupported/timeout) so we don't re-add them on queue refill
+        self.excluded_tests = self.manager.list()
+        
         # Coverage-guided: Shared coverage map (shared across all workers)
         # Tracks which edges have been seen (0xFF = unseen, 0x00 = seen)
         # Created in run() using multiprocessing.Array
@@ -193,11 +196,20 @@ class CoverageGuidedFuzzer:
         self._queue_push((0.0, 0, test_name))
     
     def _queue_push_initial_batch(self, test_names: list):
-        """Push multiple initial tests efficiently."""
-        items = [(0.0, 0, name) for name in test_names]
+        """Push multiple initial tests efficiently, filtering out excluded tests."""
+        # Filter out tests that were marked as unsupported/timeout
+        excluded_set = set(self.excluded_tests)
+        filtered_tests = [name for name in test_names if name not in excluded_set]
+        skipped_count = len(test_names) - len(filtered_tests)
+        
+        items = [(0.0, 0, name) for name in filtered_tests]
         queue_size_before = self._queue_size()
         self._queue_push_batch(items)
-        print(f"[QUEUE] Loaded {len(items)} initial tests (queue: {queue_size_before} -> {self._queue_size()})")
+        
+        if skipped_count > 0:
+            print(f"[QUEUE] Loaded {len(items)} initial tests, skipped {skipped_count} excluded (queue: {queue_size_before} -> {self._queue_size()})")
+        else:
+            print(f"[QUEUE] Loaded {len(items)} initial tests (queue: {queue_size_before} -> {self._queue_size()})")
     
     def _queue_pop(self, timeout: float = 1.0) -> Optional[tuple]:
         """Pop highest priority item (lowest runtime). Returns None if timeout."""
@@ -629,7 +641,7 @@ class CoverageGuidedFuzzer:
         
         print(f"[STATUS] Coverage: {total_edges} total edges, {self.stats.get('total_new_edges', 0)} new this run")
         print(f"[STATUS] Mutants: {self.stats.get('mutants_created', 0)} created, {self.stats.get('mutants_with_new_coverage', 0)} with new coverage")
-        print(f"[STATUS] Tests: {self.stats.get('tests_processed', 0)} processed, {self.stats.get('tests_removed_unsupported', 0)} unsupported, {self.stats.get('tests_removed_timeout', 0)} timeout")
+        print(f"[STATUS] Tests: {self.stats.get('tests_processed', 0)} processed, {len(self.excluded_tests)} excluded ({self.stats.get('tests_removed_unsupported', 0)} unsupported, {self.stats.get('tests_removed_timeout', 0)} timeout)")
         print(f"[STATUS] Generations: {self.stats.get('generations_completed', 0)} completed")
         print(f"[STATUS] Bugs: {self.stats.get('bugs_found', 0)} found")
         print(f"[STATUS] Rate: {tests_per_min:.1f} tests/min, {edges_per_min:.1f} new edges/min")
@@ -956,6 +968,14 @@ class CoverageGuidedFuzzer:
                         # Handle exit code
                         action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
                         self.stats['tests_processed'] += 1
+                        
+                        # Track excluded seed tests (unsupported/timeout) to avoid re-adding on refill
+                        if action == 'remove' and generation == 0:
+                            # Get original test identifier from queue item
+                            original_test_id = test_item[2]  # The string path before conversion
+                            if original_test_id not in self.excluded_tests:
+                                self.excluded_tests.append(original_test_id)
+                                print(f"[WORKER {worker_id}] [EXCLUDE] {test_name} excluded from future refills")
                         
                         # Read coverage from shared memory (trace_bits)
                         shm.seek(0)
