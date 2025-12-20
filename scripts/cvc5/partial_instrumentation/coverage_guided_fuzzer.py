@@ -195,7 +195,9 @@ class CoverageGuidedFuzzer:
     def _queue_push_initial_batch(self, test_names: list):
         """Push multiple initial tests efficiently."""
         items = [(0.0, 0, name) for name in test_names]
+        queue_size_before = self._queue_size()
         self._queue_push_batch(items)
+        print(f"[QUEUE] Loaded {len(items)} initial tests (queue: {queue_size_before} -> {self._queue_size()})")
     
     def _queue_pop(self, timeout: float = 1.0) -> Optional[tuple]:
         """Pop highest priority item (lowest runtime). Returns None if timeout."""
@@ -577,6 +579,63 @@ class CoverageGuidedFuzzer:
         with self.resource_lock:
             return self.resource_state.get('paused', False)
     
+    def _log_periodic_status(self, global_coverage_map=None):
+        """Log periodic status summary for monitoring."""
+        elapsed = time.time() - self.start_time
+        remaining = self._get_time_remaining()
+        
+        # Gather worker status
+        active_workers = []
+        idle_workers = []
+        for w_id in range(1, self.num_workers + 1):
+            status = self.worker_status.get(w_id)
+            if status:
+                active_workers.append((w_id, status))
+            else:
+                idle_workers.append(w_id)
+        
+        # Queue stats
+        queue_size = self._queue_size()
+        
+        # Coverage stats from shared map
+        total_edges = 0
+        if global_coverage_map is not None:
+            try:
+                total_edges = sum(1 for b in global_coverage_map if b == 0x00)
+            except Exception:
+                pass
+        
+        # Resource stats
+        with self.resource_lock:
+            cpu_avg = self.resource_state.get('avg_cpu', 0.0)
+            mem_used_gb = self.resource_state.get('memory_used_gb', 0.0)
+            mem_avail_gb = self.resource_state.get('memory_available_gb', 0.0)
+            resource_status = self.resource_state.get('status', 'unknown')
+        
+        # Calculate rates
+        tests_per_min = (self.stats.get('tests_processed', 0) / elapsed * 60) if elapsed > 0 else 0
+        edges_per_min = (self.stats.get('total_new_edges', 0) / elapsed * 60) if elapsed > 0 else 0
+        
+        # Print status block
+        print()
+        print(f"[STATUS] ═══════════════════════════════════════════════════════")
+        print(f"[STATUS] Time: {elapsed:.0f}s elapsed, {remaining:.0f}s remaining ({elapsed/60:.1f}m / {(elapsed+remaining)/60:.1f}m)")
+        print(f"[STATUS] Resources: CPU {cpu_avg:.1f}%, Mem {mem_used_gb:.1f}GB used / {mem_avail_gb:.1f}GB avail [{resource_status}]")
+        print(f"[STATUS] Queue: {queue_size} items pending")
+        print(f"[STATUS] Workers: {len(active_workers)} active, {len(idle_workers)} idle")
+        
+        for w_id, test in active_workers:
+            print(f"[STATUS]   Worker {w_id}: {test}")
+        
+        print(f"[STATUS] Coverage: {total_edges} total edges, {self.stats.get('total_new_edges', 0)} new this run")
+        print(f"[STATUS] Mutants: {self.stats.get('mutants_created', 0)} created, {self.stats.get('mutants_with_new_coverage', 0)} with new coverage")
+        print(f"[STATUS] Tests: {self.stats.get('tests_processed', 0)} processed, {self.stats.get('tests_removed_unsupported', 0)} unsupported, {self.stats.get('tests_removed_timeout', 0)} timeout")
+        print(f"[STATUS] Generations: {self.stats.get('generations_completed', 0)} completed")
+        print(f"[STATUS] Bugs: {self.stats.get('bugs_found', 0)} found")
+        print(f"[STATUS] Rate: {tests_per_min:.1f} tests/min, {edges_per_min:.1f} new edges/min")
+        print(f"[STATUS] ═══════════════════════════════════════════════════════")
+        print()
+    
     # -------------------------------------------------------------------------
     # AFL-style Coverage Tracking
     # -------------------------------------------------------------------------
@@ -718,9 +777,10 @@ class CoverageGuidedFuzzer:
             env = os.environ.copy()
             # Set shared memory ID for coverage agent (afl_shm_{ID})
             env['__AFL_SHM_ID'] = shm_id
-            # PGO profiling
-            profraw_file = self.profraw_dir / f"worker_{worker_id}_{uuid.uuid4().hex[:8]}.profraw"
-            env['LLVM_PROFILE_FILE'] = str(profraw_file)
+            # PGO profiling - use %p (pid) and %m (merge pool) for unique files per cvc5 invocation
+            # typefuzz runs cvc5 multiple times, each needs its own profraw file
+            profraw_pattern = self.profraw_dir / f"worker_{worker_id}_%p_%m.profraw"
+            env['LLVM_PROFILE_FILE'] = str(profraw_pattern)
             # Disable ASAN leak detection
             env['ASAN_OPTIONS'] = 'abort_on_error=0:detect_leaks=0'
             
@@ -862,6 +922,12 @@ class CoverageGuidedFuzzer:
                         test_path = self.tests_root / test_path
                     
                     test_name = test_path.name if isinstance(test_path, Path) else Path(test_path).name
+                    is_mutant = generation > 0
+                    
+                    # Log test pickup
+                    queue_size = self._queue_size()
+                    test_type = f"mutant(gen:{generation})" if is_mutant else "seed"
+                    print(f"[WORKER {worker_id}] [PICK] {test_type} {test_name} (priority:{runtime_priority:.2f}, queue:{queue_size})")
                     
                     # Mark worker as busy
                     self.worker_status[worker_id] = test_name
@@ -895,14 +961,19 @@ class CoverageGuidedFuzzer:
                         shm.seek(0)
                         trace_bits = shm.read(AFL_MAP_SIZE)
                         
+                        # Count edges hit in this execution
+                        edges_hit = sum(1 for b in trace_bits if b != 0)
+                        
                         # Check for new coverage using SHARED global_coverage_map (with lock)
                         # This ensures all workers see the same global coverage state
                         has_new = False
                         new_edges = 0
+                        total_edges_before = 0
                         
                         with coverage_map_lock:
                             # Read current coverage map
                             coverage_bytes = bytes(global_coverage_map[:])
+                            total_edges_before = sum(1 for b in coverage_bytes if b == 0x00)
                             
                             # Check and update atomically
                             for i in range(AFL_MAP_SIZE):
@@ -912,12 +983,17 @@ class CoverageGuidedFuzzer:
                                     new_edges += 1
                                     has_new = True
                         
+                        # Log coverage details
+                        total_edges_after = total_edges_before + new_edges
+                        print(f"[WORKER {worker_id}] [COV] Test: {test_name} | gen:{generation} | hit:{edges_hit} | new:{new_edges} | total:{total_edges_after}")
+                        
                         if has_new:
                             self.stats['total_new_edges'] += new_edges
-                            print(f"[WORKER {worker_id}] ✨ New coverage: {new_edges} edges (test: {test_name}, gen: {generation})")
+                            print(f"[WORKER {worker_id}] ✨ New coverage found: {new_edges} edges (total now: {total_edges_after})")
                             
                             # Process mutants: MOVE to pending folder (so they survive scratch cleanup)
                             mutants_to_queue = []
+                            print(f"[WORKER {worker_id}] [MUTANT] Processing {len(mutant_files)} mutant(s) from {test_name} (gen {generation})")
                             for mutant_file in mutant_files:
                                 try:
                                     # Move to pending folder with unique name
@@ -931,11 +1007,15 @@ class CoverageGuidedFuzzer:
                             
                             if mutants_to_queue:
                                 self.stats['mutants_with_new_coverage'] += 1
+                                queue_size_before = self._queue_size()
                                 # Add mutants directly to priority queue (sorted by runtime)
                                 for mutant_item in mutants_to_queue:
                                     self._queue_push(mutant_item)
+                                print(f"[WORKER {worker_id}] [QUEUE] Added {len(mutants_to_queue)} mutant(s) to queue (queue size: {queue_size_before} -> {self._queue_size()})")
                         else:
                             # No new coverage - delete mutants immediately
+                            if mutant_files:
+                                print(f"[WORKER {worker_id}] [MUTANT] No new coverage, discarding {len(mutant_files)} mutant(s)")
                             for mutant_file in mutant_files:
                                 try:
                                     mutant_file.unlink()
@@ -1021,11 +1101,16 @@ class CoverageGuidedFuzzer:
             workers.append(worker)
         
         self.workers = workers
+        print(f"[INFO] Started {len(workers)} worker processes")
         
         # Start resource monitor
         monitor_thread = threading.Thread(target=self._monitor_resources, daemon=True)
         monitor_thread.start()
         print("[DEBUG] Resource monitoring started")
+        
+        # Log initial state
+        print(f"[INFO] Initialization complete. Coverage bitmap: {AFL_MAP_SIZE} bytes ({AFL_MAP_SIZE // 1024}KB)")
+        print(f"[INFO] Starting fuzzing loop...")
         
         # Signal handlers
         def signal_handler(signum, frame):
@@ -1039,6 +1124,8 @@ class CoverageGuidedFuzzer:
         try:
             end_time = self.start_time + self.time_remaining if self.time_remaining else None
             last_refill_check = time.time()
+            last_status_log = time.time()
+            status_log_interval = 30  # Log status every 30 seconds
             
             while any(w.is_alive() for w in workers):
                 if end_time and time.time() >= end_time:
@@ -1046,10 +1133,16 @@ class CoverageGuidedFuzzer:
                     self.shutdown_event.set()
                     break
                 
+                current_time = time.time()
+                
+                # Periodic status logging
+                if current_time - last_status_log >= status_log_interval:
+                    self._log_periodic_status(global_coverage_map)
+                    last_status_log = current_time
+                
                 # Refill when queue is empty AND at least one worker is idle
                 # This prevents idle workers from waiting for slow tests to finish
                 # Don't refill too frequently (min 2 seconds between checks)
-                current_time = time.time()
                 if current_time - last_refill_check >= 2.0:
                     idle_workers = sum(1 for w_id in range(1, self.num_workers + 1) 
                                       if self.worker_status.get(w_id) is None)
