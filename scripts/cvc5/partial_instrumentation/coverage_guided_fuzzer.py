@@ -733,12 +733,47 @@ class CoverageGuidedFuzzer:
     # Typefuzz Execution
     # -------------------------------------------------------------------------
     
-    def _get_solver_clis(self) -> str:
-        """Get solver CLI string for typefuzz (z3 + cvc5)."""
-        solvers = [
-            self.z3_cmd,
-            f"{self.cvc5_path} --check-models --check-proofs --strings-exp"
-        ]
+    def _extract_command_line_flags(self, test_path: Path) -> str:
+        """Extract COMMAND-LINE flags from test file (like CVC5's run_regression.py does).
+        
+        CVC5 regression tests use comments like:
+        ; COMMAND-LINE: --flag1 --flag2
+        
+        Returns the flags as a string, or empty string if no COMMAND-LINE comment found.
+        """
+        try:
+            with open(test_path, 'r') as f:
+                for line in f:
+                    # Skip lines that do not start with a comment character
+                    stripped = line.lstrip()
+                    if stripped.startswith(';') or stripped.startswith('%'):
+                        line_content = stripped[1:].lstrip()
+                        if line_content.startswith('COMMAND-LINE:'):
+                            flags = line_content[len('COMMAND-LINE:'):].strip()
+                            return flags
+        except Exception as e:
+            print(f"[WARNING] Could not extract COMMAND-LINE flags from {test_path}: {e}", file=sys.stderr)
+        return ""
+    
+    def _get_solver_clis(self, test_path: Optional[Path] = None) -> str:
+        """Get solver CLI string for typefuzz (z3 + cvc5).
+        
+        If test_path is provided, extracts COMMAND-LINE flags from test file
+        and appends them to the CVC5 command (matching CVC5 regression behavior).
+        """
+        solvers = [self.z3_cmd]
+        
+        # Base CVC5 flags
+        base_flags = "--check-models --check-proofs --strings-exp"
+        
+        # Extract COMMAND-LINE flags from test file if provided
+        if test_path and test_path.exists():
+            test_flags = self._extract_command_line_flags(test_path)
+            if test_flags:
+                # Append test-specific flags to base flags
+                base_flags = f"{base_flags} {test_flags}"
+        
+        solvers.append(f"{self.cvc5_path} {base_flags}")
         return ";".join(solvers)
     
     def _collect_bug_files(self, folder: Path) -> List[Path]:
@@ -771,7 +806,8 @@ class CoverageGuidedFuzzer:
             folder.mkdir(parents=True, exist_ok=True)
         bugs_folder.mkdir(parents=True, exist_ok=True)
         
-        solver_clis = self._get_solver_clis()
+        # Extract COMMAND-LINE flags from test file and build solver command
+        solver_clis = self._get_solver_clis(test_path)
         
         # typefuzz -i 1 -k (1 iteration, keep mutants)
         cmd = [
