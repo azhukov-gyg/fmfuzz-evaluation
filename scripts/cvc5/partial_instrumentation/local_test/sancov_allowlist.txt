@@ -1,0 +1,31 @@
+# Sancov Allowlist - Specific Functions (Mangled Names)
+# ======================================================
+# Format: src:* must come first, then fun: entries
+
+# Allow all source files (required!)
+src:*
+
+# NodeValue::dec()
+fun:_ZN4cvc58internal4expr9NodeValue3decEv
+
+# NodeValue::inc()
+fun:_ZN4cvc58internal4expr9NodeValue3incEv
+
+# Rational::isIntegral() const
+fun:_ZNK4cvc58internal8Rational10isIntegralEv
+
+# Variable::isLeafMember(NodeTemplate<true>)
+fun:_ZN4cvc58internal6theory5arith6linear8Variable12isLeafMemberENS0_12NodeTemplateILb1EEE
+
+# Rewriter::getPostRewriteCache(TheoryId, NodeTemplate<false>)
+fun:_ZN4cvc58internal6theory8Rewriter19getPostRewriteCacheENS1_8TheoryIdENS0_12NodeTemplateILb0EEE
+
+# String::String(char const*, bool)
+fun:_ZN4cvc58internal6StringC2EPKcb
+
+# TheoryBV::needsEqualityEngine(EeSetupInfo&)
+fun:_ZN4cvc58internal6theory2bv8TheoryBV19needsEqualityEngineERNS1_11EeSetupInfoE
+
+# BvInverter::BvInverter(Rewriter*)
+fun:_ZN4cvc58internal6theory11quantifiers10BvInverterC1EPNS1_8RewriterE
+fun:_ZN4cvc58internal6theory11quantifiers10BvInverterC2EPNS1_8RewriterE

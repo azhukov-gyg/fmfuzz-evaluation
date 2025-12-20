@@ -1,0 +1,26 @@
+# Dockerfile for testing incremental instrumentation
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build git \
+    python3 python3-pip python3-venv \
+    ca-certificates wget gnupg software-properties-common \
+    libbsd-dev libcln-dev libedit-dev libgmp-dev libtinfo-dev libfl-dev \
+    file binutils m4 time \
+    && rm -rf /var/lib/apt/lists/*
+
+# LLVM 17 (clang + sancov + pgo tools)
+RUN wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc \
+    && add-apt-repository -y "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-17 main" \
+    && apt-get update && apt-get install -y clang-17 llvm-17 lld-17 \
+    && for tool in clang clang++ llvm-profdata llvm-cov llvm-ar llvm-nm; do \
+         ln -sf /usr/bin/${tool}-17 /usr/bin/${tool}; done \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir pyelftools
+
+WORKDIR /workspace
+CMD ["/bin/bash"]

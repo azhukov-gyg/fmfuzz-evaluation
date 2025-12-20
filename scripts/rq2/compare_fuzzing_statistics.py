@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Compare baseline vs variant1 fuzzing statistics
+"""Compare baseline vs variant fuzzing statistics
 
-This script downloads both baseline and variant1 statistics for each commit
+This script downloads both baseline and variant statistics for each commit
 and compares them to determine which approach is better.
+
+Supports comparing baseline with:
+- variant1 (simple commit fuzzing)
+- coverage-guided (coverage-guided fuzzing)
 """
 
 import os
@@ -35,57 +39,58 @@ def download_statistics(s3_client, bucket: str, solver: str, commit_hash: str, v
             return None
         raise
 
-def compare_statistics(baseline: Dict, variant1: Dict) -> Dict:
+def compare_statistics(baseline: Dict, variant: Dict, variant_name: str = "variant") -> Dict:
     """Compare two statistics files and return comparison results"""
     baseline_funcs = {f['function_id']: f for f in baseline.get('functions', [])}
-    variant1_funcs = {f['function_id']: f for f in variant1.get('functions', [])}
+    variant_funcs = {f['function_id']: f for f in variant.get('functions', [])}
     
-    all_function_ids = set(baseline_funcs.keys()) | set(variant1_funcs.keys())
+    all_function_ids = set(baseline_funcs.keys()) | set(variant_funcs.keys())
     
     comparison = {
         'total_functions': len(all_function_ids),
+        'variant_name': variant_name,
         'functions': [],
         'summary': {
             'total_functions': len(all_function_ids),
             'baseline_triggered': 0,
-            'variant1_triggered': 0,
+            'variant_triggered': 0,
             'both_triggered': 0,
             'neither_triggered': 0,
-            'baseline_better': 0,  # Baseline triggered but variant1 didn't
-            'variant1_better': 0,  # Variant1 triggered but baseline didn't
+            'baseline_better': 0,  # Baseline triggered but variant didn't
+            'variant_better': 0,  # Variant triggered but baseline didn't
             'baseline_more_executions': 0,  # Both triggered, baseline has more
-            'variant1_more_executions': 0,  # Both triggered, variant1 has more
+            'variant_more_executions': 0,  # Both triggered, variant has more
             'total_baseline_executions': 0,
-            'total_variant1_executions': 0
+            'total_variant_executions': 0
         }
     }
     
     for func_id in sorted(all_function_ids):
         baseline_func = baseline_funcs.get(func_id, {'triggered': False, 'total_executions': 0})
-        variant1_func = variant1_funcs.get(func_id, {'triggered': False, 'total_executions': 0})
+        variant_func = variant_funcs.get(func_id, {'triggered': False, 'total_executions': 0})
         
         baseline_triggered = baseline_func.get('triggered', False)
-        variant1_triggered = variant1_func.get('triggered', False)
+        variant_triggered = variant_func.get('triggered', False)
         baseline_exec = baseline_func.get('total_executions', 0)
-        variant1_exec = variant1_func.get('total_executions', 0)
+        variant_exec = variant_func.get('total_executions', 0)
         
         comparison['summary']['total_baseline_executions'] += baseline_exec
-        comparison['summary']['total_variant1_executions'] += variant1_exec
+        comparison['summary']['total_variant_executions'] += variant_exec
         
         if baseline_triggered:
             comparison['summary']['baseline_triggered'] += 1
-        if variant1_triggered:
-            comparison['summary']['variant1_triggered'] += 1
-        if baseline_triggered and variant1_triggered:
+        if variant_triggered:
+            comparison['summary']['variant_triggered'] += 1
+        if baseline_triggered and variant_triggered:
             comparison['summary']['both_triggered'] += 1
-            if baseline_exec > variant1_exec:
+            if baseline_exec > variant_exec:
                 comparison['summary']['baseline_more_executions'] += 1
-            elif variant1_exec > baseline_exec:
-                comparison['summary']['variant1_more_executions'] += 1
-        elif baseline_triggered and not variant1_triggered:
+            elif variant_exec > baseline_exec:
+                comparison['summary']['variant_more_executions'] += 1
+        elif baseline_triggered and not variant_triggered:
             comparison['summary']['baseline_better'] += 1
-        elif variant1_triggered and not baseline_triggered:
-            comparison['summary']['variant1_better'] += 1
+        elif variant_triggered and not baseline_triggered:
+            comparison['summary']['variant_better'] += 1
         else:
             comparison['summary']['neither_triggered'] += 1
         
@@ -95,23 +100,25 @@ def compare_statistics(baseline: Dict, variant1: Dict) -> Dict:
                 'triggered': baseline_triggered,
                 'total_executions': baseline_exec
             },
-            'variant1': {
-                'triggered': variant1_triggered,
-                'total_executions': variant1_exec
+            'variant': {
+                'triggered': variant_triggered,
+                'total_executions': variant_exec
             },
-            'better': 'baseline' if (baseline_triggered and not variant1_triggered) or (baseline_triggered and variant1_triggered and baseline_exec > variant1_exec) else ('variant1' if (variant1_triggered and not baseline_triggered) or (baseline_triggered and variant1_triggered and variant1_exec > baseline_exec) else 'neither')
+            'better': 'baseline' if (baseline_triggered and not variant_triggered) or (baseline_triggered and variant_triggered and baseline_exec > variant_exec) else ('variant' if (variant_triggered and not baseline_triggered) or (baseline_triggered and variant_triggered and variant_exec > baseline_exec) else 'neither')
         })
     
     return comparison
 
 def main():
-    parser = argparse.ArgumentParser(description='Compare baseline vs variant1 fuzzing statistics')
+    parser = argparse.ArgumentParser(description='Compare baseline vs variant fuzzing statistics')
     parser.add_argument('--solver', required=True, choices=['cvc5', 'z3'], help='Solver name (cvc5 or z3)')
     parser.add_argument('--commit', required=True, help='Commit hash to compare')
     parser.add_argument('--output', required=True, help='Output JSON file')
+    parser.add_argument('--variant', default='variant1', help='Variant to compare against baseline (default: variant1)')
     parser.add_argument('--max-commits', type=int, help='Maximum number of commits to process (for testing)')
     
     args = parser.parse_args()
+    variant_name = args.variant
     
     bucket = os.getenv('AWS_S3_BUCKET')
     if not bucket:
@@ -121,19 +128,19 @@ def main():
     
     # If commit is provided, compare single commit
     if args.commit:
-        print(f"🔍 Comparing statistics for commit: {args.commit}", file=sys.stderr)
+        print(f"🔍 Comparing baseline vs {variant_name} for commit: {args.commit}", file=sys.stderr)
         
         baseline = download_statistics(s3_client, bucket, args.solver, args.commit, 'baseline')
-        variant1 = download_statistics(s3_client, bucket, args.solver, args.commit, 'variant1')
+        variant = download_statistics(s3_client, bucket, args.solver, args.commit, variant_name)
         
         if not baseline:
             print(f"❌ Baseline statistics not found for commit {args.commit}", file=sys.stderr)
             sys.exit(1)
-        if not variant1:
-            print(f"❌ Variant1 statistics not found for commit {args.commit}", file=sys.stderr)
+        if not variant:
+            print(f"❌ {variant_name} statistics not found for commit {args.commit}", file=sys.stderr)
             sys.exit(1)
         
-        comparison = compare_statistics(baseline, variant1)
+        comparison = compare_statistics(baseline, variant, variant_name)
         comparison['commit_hash'] = args.commit
         
         with open(args.output, 'w') as f:
@@ -143,21 +150,21 @@ def main():
         print(f"📊 Summary:", file=sys.stderr)
         print(f"   Total functions: {comparison['summary']['total_functions']}", file=sys.stderr)
         print(f"   Baseline triggered: {comparison['summary']['baseline_triggered']}", file=sys.stderr)
-        print(f"   Variant1 triggered: {comparison['summary']['variant1_triggered']}", file=sys.stderr)
+        print(f"   {variant_name} triggered: {comparison['summary']['variant_triggered']}", file=sys.stderr)
         print(f"   Both triggered: {comparison['summary']['both_triggered']}", file=sys.stderr)
         print(f"   Neither triggered: {comparison['summary']['neither_triggered']}", file=sys.stderr)
         print(f"   Baseline better: {comparison['summary']['baseline_better']}", file=sys.stderr)
-        print(f"   Variant1 better: {comparison['summary']['variant1_better']}", file=sys.stderr)
+        print(f"   {variant_name} better: {comparison['summary']['variant_better']}", file=sys.stderr)
         print(f"   Total baseline executions: {comparison['summary']['total_baseline_executions']:,}", file=sys.stderr)
-        print(f"   Total variant1 executions: {comparison['summary']['total_variant1_executions']:,}", file=sys.stderr)
+        print(f"   Total {variant_name} executions: {comparison['summary']['total_variant_executions']:,}", file=sys.stderr)
         print(f"   Baseline more executions (when both triggered): {comparison['summary']['baseline_more_executions']}", file=sys.stderr)
-        print(f"   Variant1 more executions (when both triggered): {comparison['summary']['variant1_more_executions']}", file=sys.stderr)
+        print(f"   {variant_name} more executions (when both triggered): {comparison['summary']['variant_more_executions']}", file=sys.stderr)
     else:
         # Compare all commits
-        print("🔍 Comparing all commits...", file=sys.stderr)
+        print(f"🔍 Comparing all commits (baseline vs {variant_name})...", file=sys.stderr)
         
-        # List all commits with variant1 statistics
-        prefix = f"evaluation/rq2/{args.solver}/fuzzing-statistics/variant1/"
+        # List all commits with variant statistics
+        prefix = f"evaluation/rq2/{args.solver}/fuzzing-statistics/{variant_name}/"
         commits = []
         
         try:
@@ -186,17 +193,18 @@ def main():
         all_comparisons = []
         for commit in commits:
             baseline = download_statistics(s3_client, bucket, args.solver, commit, 'baseline')
-            variant1 = download_statistics(s3_client, bucket, args.solver, commit, 'variant1')
+            variant = download_statistics(s3_client, bucket, args.solver, commit, variant_name)
             
-            if not baseline or not variant1:
+            if not baseline or not variant:
                 print(f"⚠️ Skipping commit {commit} (missing statistics)", file=sys.stderr)
                 continue
             
-            comparison = compare_statistics(baseline, variant1)
+            comparison = compare_statistics(baseline, variant, variant_name)
             comparison['commit_hash'] = commit
             all_comparisons.append(comparison)
         
         output = {
+            'variant_name': variant_name,
             'commits': all_comparisons,
             'total_commits': len(all_comparisons)
         }

@@ -1,0 +1,28 @@
+# Exclude build directories
+**/build/
+**/build-*/
+**/.build/
+
+# Exclude git
+.git/
+.gitignore
+
+# Exclude other large directories
+**/node_modules/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+
+# Exclude logs
+*.log
+log/
+
+# Exclude test artifacts
+**/test-results/
+**/coverage/
+
+# Keep only what we need for building
+!cvc5/
+!scripts/
+!yinyang/
+

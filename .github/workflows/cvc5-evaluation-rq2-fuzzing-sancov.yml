@@ -1,4 +1,4 @@
-name: CVC5 RQ2 Fuzzing with Sancov Coverage Tracking
+name: CVC5 RQ2 Coverage-Guided Fuzzing
 
 on:
   workflow_dispatch:
@@ -9,11 +9,11 @@ on:
         type: number
         default: 60
       debug_commit_hash:
-        description: 'Debug: Specific commit hash to test (e.g., 686e31842b7b020382e8af38507fd616fed78740). If provided, only this commit will be fuzzed.'
+        description: 'Debug: Specific commit hash to test. If provided, only this commit will be fuzzed.'
         required: false
         type: string
       dry_run:
-        description: 'Dry run: Skip S3 uploads (default: false). Set to true to test without uploading results to S3.'
+        description: 'Dry run: Skip S3 uploads (default: false)'
         required: false
         type: boolean
         default: false
@@ -26,10 +26,8 @@ jobs:
       total_commits: ${{ steps.generate-matrix.outputs.total_commits }}
     
     steps:
-      - name: Checkout repository and submodules
+      - name: Checkout repository
         uses: actions/checkout@v5
-        with:
-          submodules: recursive
       
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,8 +35,7 @@ jobs:
           python-version: '3.12'
       
       - name: Install dependencies
-        run: |
-          pip install boto3
+        run: pip install boto3
       
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5.1.0
@@ -47,33 +44,26 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
       
-      - name: Generate commit matrix from coverage mappings
+      - name: Generate commit matrix
         id: generate-matrix
         env:
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
-          # If debug commit hash is provided, use only that commit
           if [ -n "${{ inputs.debug_commit_hash }}" ]; then
             echo "🔍 Debug mode: Using specific commit ${{ inputs.debug_commit_hash }}"
             DEBUG_COMMIT="${{ inputs.debug_commit_hash }}"
-            # Create a matrix with just this commit
             COMMIT_MATRIX=$(python3 -c "import json; print(json.dumps({'include': [{'commit': '$DEBUG_COMMIT'}]}, separators=(',', ':')))")
             TOTAL_COMMITS=1
-            echo "commit_matrix=$COMMIT_MATRIX" >> $GITHUB_OUTPUT
-            echo "total_commits=$TOTAL_COMMITS" >> $GITHUB_OUTPUT
-            echo "✅ Debug mode: Generated matrix with 1 commit ($DEBUG_COMMIT)"
           else
             RESULT=$(python3 scripts/rq2/generate_fuzzing_matrix.py cvc5)
-            
             COMMIT_MATRIX=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(json.dumps({'include': data['include']}, separators=(',', ':')))")
             TOTAL_COMMITS=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['total_commits'])")
-            
-            echo "commit_matrix=$COMMIT_MATRIX" >> $GITHUB_OUTPUT
-            echo "total_commits=$TOTAL_COMMITS" >> $GITHUB_OUTPUT
-            
-            echo "✅ Generated matrix: $TOTAL_COMMITS commits"
           fi
+          
+          echo "commit_matrix=$COMMIT_MATRIX" >> $GITHUB_OUTPUT
+          echo "total_commits=$TOTAL_COMMITS" >> $GITHUB_OUTPUT
+          echo "✅ Generated matrix: $TOTAL_COMMITS commits"
 
   prepare-commit-fuzzer:
     needs: generate-matrix
@@ -82,12 +72,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.generate-matrix.outputs.commit_matrix) }}
-    outputs:
-      commit_hash: ${{ steps.get-commit.outputs.commit_hash }}
-      changed_functions_file: ${{ steps.prepare.outputs.changed_functions_file }}
-      combined_matrix: ${{ steps.prepare.outputs.combined_matrix }}
-      total_tests: ${{ steps.prepare.outputs.total_tests }}
-      allowlist_file: ${{ steps.prepare.outputs.allowlist_file }}
     
     steps:
       - name: Checkout
@@ -104,30 +88,19 @@ jobs:
       - name: Export LIBCLANG_PATH
         run: echo "LIBCLANG_PATH=${{ env.LLVM_PATH }}/lib" >> $GITHUB_ENV
 
-      - name: Install system development packages
+      - name: Install system packages
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
-            libc6-dev \
-            gcc \
-            g++ \
-            binutils \
-            libstdc++-14-dev \
-            libc++-dev \
-            libc++abi-dev \
-            zlib1g \
-            zlib1g-dev
+            build-essential libc6-dev gcc g++ binutils \
+            libstdc++-14-dev libc++-dev libc++abi-dev zlib1g zlib1g-dev
 
       - name: Install Python dependencies
-        run: |
-          pip install gitpython unidiff "libclang==17.0.6"
+        run: pip install gitpython unidiff "libclang==17.0.6"
 
       - name: Clone CVC5 repository
         run: |
-          if [ -d "cvc5" ]; then
-            echo "CVC5 directory already exists, skipping clone"
-          else
+          if [ ! -d "cvc5" ]; then
             git clone https://github.com/cvc5/cvc5.git cvc5
           fi
 
@@ -135,7 +108,6 @@ jobs:
         working-directory: cvc5
         run: |
           COMMIT_HASH="${{ matrix.commit }}"
-          echo "🔨 Checking out commit: $COMMIT_HASH"
           git fetch origin
           git checkout $COMMIT_HASH
           echo "Checked out commit: $(git rev-parse HEAD)"
@@ -155,33 +127,15 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Download coverage map from S3
+      - name: Download coverage mapping from S3
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
           S3_KEY="evaluation/rq2/cvc5/coverage-mappings/variant1/coverage_mapping-${COMMIT_HASH}.json.gz"
-          
           aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY coverage_mapping.json.gz
-          echo "✅ Downloaded coverage mapping for $COMMIT_HASH"
-      
-      - name: Extract coverage map
-        run: |
           gunzip coverage_mapping.json.gz
+          echo "✅ Downloaded coverage mapping"
 
-      - name: Download coverage binary from S3
-        run: |
-          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/cvc5/builds/coverage/${COMMIT_HASH}.tar.gz"
-          
-          mkdir -p artifacts
-          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY artifacts/artifacts.tar.gz
-          echo "✅ Downloaded coverage binary for $COMMIT_HASH"
-
-      - name: Extract coverage binary with headers
-        run: |
-          mkdir -p cvc5/build
-          ./scripts/cvc5/extract_build_artifacts.sh artifacts/artifacts.tar.gz cvc5/build true
-
-      - name: Run prepare commit fuzzer (sancov version)
+      - name: Run prepare commit fuzzer
         id: prepare
         working-directory: cvc5
         env:
@@ -198,12 +152,10 @@ jobs:
           
           echo "changed_functions_file=changed_functions.json" >> $GITHUB_OUTPUT
           
-          # Extract matrix and total_tests, and create combined matrix with commit
           if [ -f "../fuzzer_matrix.json" ]; then
             TOTAL_TESTS=$(jq -r '.total_tests' ../fuzzer_matrix.json)
             echo "total_tests=$TOTAL_TESTS" >> $GITHUB_OUTPUT
             
-            # Create combined matrix: commit + fuzzer_job
             jq -c --arg commit "${{ matrix.commit }}" '{
               "include": (.matrix.include | map({
                 "commit": $commit,
@@ -215,32 +167,37 @@ jobs:
             echo "{\"include\":[]}" > ../combined_matrix.json
           fi
 
-      - name: Generate sancov allowlist
-        id: generate-allowlist
+      - name: Generate allowlists (sancov + PGO)
+        id: generate-allowlists
         run: |
           if [ -f "changed_functions.json" ]; then
-            python3 ${{ github.workspace }}/scripts/cvc5/generate_sancov_allowlist.py \
-              changed_functions.json \
-              -o coverage_allowlist.txt
+            python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/generate_allowlists.py \
+              --input changed_functions.json \
+              --output-sancov sancov_allowlist.txt \
+              --output-pgo pgo_allowlist.txt
             
-            if [ -f "coverage_allowlist.txt" ]; then
-              echo "allowlist_file=coverage_allowlist.txt" >> $GITHUB_OUTPUT
-              echo "✅ Generated allowlist with $(grep -c '^fun:' coverage_allowlist.txt) functions"
-            else
-              echo "⚠️ Allowlist file not generated"
+            if [ -f "sancov_allowlist.txt" ]; then
+              echo "sancov_allowlist=sancov_allowlist.txt" >> $GITHUB_OUTPUT
+              echo "✅ Generated sancov allowlist with $(grep -c '^fun:' sancov_allowlist.txt || echo 0) functions"
+            fi
+            
+            if [ -f "pgo_allowlist.txt" ]; then
+              echo "pgo_allowlist=pgo_allowlist.txt" >> $GITHUB_OUTPUT
+              echo "✅ Generated PGO allowlist with $(grep -c '^fun:' pgo_allowlist.txt || echo 0) functions"
             fi
           else
-            echo "⚠️ changed_functions.json not found, skipping allowlist generation"
+            echo "⚠️ changed_functions.json not found"
           fi
       
-      - name: Upload changed functions, matrix, and allowlist
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: changed-functions-${{ matrix.commit }}
           path: |
             changed_functions.json
             fuzzer_matrix.json
-            coverage_allowlist.txt
+            sancov_allowlist.txt
+            pgo_allowlist.txt
           if-no-files-found: ignore
       
       - name: Upload combined matrix
@@ -271,18 +228,16 @@ jobs:
       - name: Merge all matrices
         id: merge-matrices
         run: |
-          # Use Python script for reliable matrix merging
           TOTAL_JOBS=$(python3 ${{ github.workspace }}/scripts/merge_fuzzing_matrices.py \
             fuzzing_matrix.json \
             "matrices/combined-matrix-*/combined_matrix.json" \
             --minimal-output fuzzing_matrix_minimal.json)
           
-          # Use minimal matrix for job output (much smaller)
           MINIMAL_MATRIX=$(cat fuzzing_matrix_minimal.json)
           echo "fuzzing_matrix=$MINIMAL_MATRIX" >> $GITHUB_OUTPUT
           echo "total_jobs=$TOTAL_JOBS" >> $GITHUB_OUTPUT
       
-      - name: Upload merged matrix (full data)
+      - name: Upload merged matrix
         uses: actions/upload-artifact@v4
         with:
           name: fuzzing-matrix-full
@@ -296,7 +251,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.collect-matrices.outputs.fuzzing_matrix) }}
-    timeout-minutes: 75  # 60 minutes fuzzing + 15 minutes buffer
+    timeout-minutes: 90  # 60 minutes fuzzing + 30 minutes for build/setup
     
     steps:
       - name: Checkout
@@ -311,22 +266,12 @@ jobs:
       - name: Extract test list for this job
         id: extract-tests
         run: |
-          echo "Looking for commit: ${{ matrix.commit }}, job_id: ${{ matrix.job_id }}"
-          
-          # Use Python script for reliable extraction - write to file to avoid "Argument list too long"
           python3 ${{ github.workspace }}/scripts/extract_matrix_tests.py \
             fuzzing_matrix.json \
             "${{ matrix.commit }}" \
             "${{ matrix.job_id }}" > tests_job_${{ matrix.job_id }}.json
           
-          if [ $? -ne 0 ]; then
-            echo "❌ Failed to extract test data"
-            exit 1
-          fi
-          
-          # Output file path
           echo "tests_file=tests_job_${{ matrix.job_id }}.json" >> $GITHUB_OUTPUT
-          
           TEST_COUNT=$(python3 -c "import json; print(len(json.load(open('tests_job_${{ matrix.job_id }}.json'))))")
           echo "✅ Extracted $TEST_COUNT tests for job ${{ matrix.job_id }}"
       
@@ -334,47 +279,34 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            python3 \
-            python3-pip \
-            unzip \
-            wget \
-            binutils \
-            clang \
-            libc++-dev \
-            libc++abi-dev
+            python3 python3-pip unzip wget binutils \
+            clang llvm lld libc++-dev libc++abi-dev cmake ninja-build
           sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
+          # Verify llvm-profdata is available
+          which llvm-profdata || echo "Warning: llvm-profdata not found"
 
       - name: Install fuzzing dependencies
         run: |
-          pip install antlr4-python3-runtime==4.9.2
-          pip install z3-solver
-          pip install psutil
+          pip install antlr4-python3-runtime==4.9.2 z3-solver psutil
           git clone https://github.com/testsmt/yinyang.git
-          cd yinyang
-          pip install -e .
-          cd ..
+          cd yinyang && pip install -e . && cd ..
           pip cache purge || true
 
       - name: Clone CVC5 repository
         run: |
-          if [ -d "cvc5" ]; then
-            echo "CVC5 directory already exists, skipping clone"
-          else
+          if [ ! -d "cvc5" ]; then
             git clone https://github.com/cvc5/cvc5.git cvc5
           fi
 
-      - name: Checkout same commit
+      - name: Checkout commit
         working-directory: cvc5
         run: |
           git fetch origin
           git checkout ${{ matrix.commit }}
           echo "Checked out commit: $(git rev-parse HEAD)"
       
-      - name: Clean up git repositories to save space
-        run: |
-          rm -rf cvc5/.git yinyang/.git || true
-          echo "✅ Cleaned up git repositories"
+      - name: Clean up git repositories
+        run: rm -rf cvc5/.git yinyang/.git || true
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5.1.0
@@ -383,296 +315,137 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Download changed functions and allowlist
+      - name: Download allowlists
         uses: actions/download-artifact@v4
         with:
           name: changed-functions-${{ matrix.commit }}
           path: .
 
-      - name: Build CVC5 with sancov
-        working-directory: cvc5
+      - name: Build CVC5 with sancov + PGO instrumentation
         run: |
-          if [ -f "../coverage_allowlist.txt" ]; then
-            echo "✅ Building with allowlist: $(grep -c '^fun:' ../coverage_allowlist.txt) functions"
-            ${{ github.workspace }}/scripts/cvc5/build_sancov.sh \
-              --allowlist=../coverage_allowlist.txt \
-              --jobs=4 \
-              --cvc5-dir=. \
-              --build-dir=build
-          else
-            echo "⚠️ Allowlist not found, building without allowlist (all functions instrumented)"
-            ${{ github.workspace }}/scripts/cvc5/build_sancov.sh \
-              --jobs=4 \
-              --cvc5-dir=. \
-              --build-dir=build
+          echo "=== Building CVC5 with coverage instrumentation (production mode) ==="
+          
+          # Setup environment for build script
+          export WORKSPACE="${{ github.workspace }}"
+          export COVERAGE_AGENT="${{ github.workspace }}/scripts/cvc5/partial_instrumentation/coverage_agent.cpp"
+          
+          # Setup allowlists (downloaded to current directory by previous step)
+          SANCOV_ARG=""
+          PGO_ARG=""
+          
+          if [ -f "sancov_allowlist.txt" ]; then
+            SANCOV_ARG="$(pwd)/sancov_allowlist.txt"
+            echo "Using sancov allowlist: $(grep -c '^fun:' sancov_allowlist.txt || echo 0) functions"
           fi
-
-      - name: Setup coverage wrapper script
-        working-directory: cvc5
-        run: |
-          # Copy wrapper script to build directory and make executable
-          cp ${{ github.workspace }}/scripts/cvc5/cvc5_coverage_wrapper.sh ./build/
-          chmod +x ./build/cvc5_coverage_wrapper.sh
           
-          # Verify wrapper is set up
-          echo "✅ Wrapper script: ./build/cvc5_coverage_wrapper.sh"
-          ls -la ./build/cvc5_coverage_wrapper.sh
+          if [ -f "pgo_allowlist.txt" ]; then
+            PGO_ARG="$(pwd)/pgo_allowlist.txt"
+            echo "Using PGO allowlist: $(grep -c '^fun:' pgo_allowlist.txt || echo 0) functions"
+          fi
           
-          # Also copy to scripts location for the fuzzer to find
-          chmod +x ${{ github.workspace }}/scripts/cvc5/cvc5_coverage_wrapper.sh
+          # Run production build script
+          ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/build_cvc5_instrumented.sh \
+            "${{ matrix.commit }}" \
+            "$SANCOV_ARG" \
+            "$PGO_ARG"
+          
+          echo "✅ Build complete"
+          ls -la cvc5/build/bin/cvc5
       
-      - name: Verify solver binaries
+      - name: Verify instrumentation
+        run: |
+          echo "=== Verifying instrumentation ==="
+          SANCOV_SYM=$(nm cvc5/build/bin/cvc5 2>/dev/null | grep -c "__sanitizer_cov" || echo "0")
+          PGO_SYM=$(nm cvc5/build/bin/cvc5 2>/dev/null | grep -c "__llvm_profile" || echo "0")
+          echo "Sancov symbols: $SANCOV_SYM"
+          echo "PGO symbols: $PGO_SYM"
+          
+          # Quick test
+          cvc5/build/bin/cvc5 --version
+          echo "✅ Binary works"
+      
+      - name: Verify solvers
         run: |
           z3 --version
           cvc5/build/bin/cvc5 --version
 
-      - name: Debug - Check sancov instrumentation
-        working-directory: cvc5
-        run: |
-          echo "=== Checking if binary has sancov instrumentation ==="
-          # Check binary size (instrumented binaries are larger)
-          ls -lh ./build/bin/cvc5
-          
-          # Check for sancov symbols
-          echo ""
-          echo "=== Checking for sancov symbols ==="
-          nm ./build/bin/cvc5 2>/dev/null | grep -i sancov | head -20 || echo "No sancov symbols found (might be stripped)"
-          
-          # Check compiler flags used
-          echo ""
-          echo "=== Checking build flags ==="
-          if [ -f "./build/CMakeCache.txt" ]; then
-            grep -i "sancov\|sanitize\|coverage" ./build/CMakeCache.txt | head -20 || echo "No sancov flags found in CMakeCache"
-          fi
-          
-          # Show allowlist contents
-          echo ""
-          echo "=== Allowlist contents (first 50 lines) ==="
-          if [ -f "../coverage_allowlist.txt" ]; then
-            echo "Allowlist file exists, $(wc -l < ../coverage_allowlist.txt) lines total"
-            echo "Number of fun: entries: $(grep -c '^fun:' ../coverage_allowlist.txt || echo 0)"
-            echo "Number of src: entries: $(grep -c '^src:' ../coverage_allowlist.txt || echo 0)"
-            echo ""
-            head -50 ../coverage_allowlist.txt
-          else
-            echo "❌ Allowlist file NOT found!"
-          fi
-          
-          # Quick test run with a real SMT2 file (not just --version)
-          echo ""
-          echo "=== Quick test: running cvc5 on a real test file ==="
-          mkdir -p ./test_coverage
-          export ASAN_OPTIONS='coverage=1:coverage_dir=./test_coverage:abort_on_error=0:detect_leaks=0'
-          
-          # Find a simple regression test
-          TEST_FILE=$(find ./test/regress/cli/regress0 -name "*.smt2" -type f | head -1)
-          if [ -n "$TEST_FILE" ]; then
-            echo "Running: ./build/bin/cvc5 $TEST_FILE"
-            timeout 10 ./build/bin/cvc5 "$TEST_FILE" 2>&1 || true
-          else
-            echo "No test file found, running --version"
-            timeout 5 ./build/bin/cvc5 --version || true
-          fi
-          
-          echo ""
-          echo "=== .sancov files after test run ==="
-          find ./test_coverage -name "*.sancov" -type f 2>/dev/null | head -10 || echo "No .sancov files found"
-          ls -la ./test_coverage/ 2>/dev/null || echo "test_coverage dir empty or missing"
-          
-          # If sancov files exist, show their sizes
-          SANCOV_COUNT=$(find ./test_coverage -name "*.sancov" -type f 2>/dev/null | wc -l)
-          if [ "$SANCOV_COUNT" -gt 0 ]; then
-            echo ""
-            echo "=== .sancov file details ==="
-            find ./test_coverage -name "*.sancov" -type f -exec ls -la {} \;
-          fi
-          
-          # Check if trace-pc-guard symbols are in the binary
-          echo ""
-          echo "=== Checking for trace-pc-guard callback symbols ==="
-          nm ./build/bin/cvc5 2>/dev/null | grep -E "__sanitizer_cov_trace_pc|trace_pc_guard" | head -10 || echo "No trace-pc-guard symbols found"
-          
-          # Check for 8bit counter symbols (alternative)
-          echo ""
-          echo "=== Checking for 8bit counter symbols ==="
-          nm ./build/bin/cvc5 2>/dev/null | grep -E "__sanitizer_cov_8bit" | head -10 || echo "No 8bit counter symbols found"
-          
-          # Check for coverage agent
-          echo ""
-          echo "=== Checking for coverage agent ==="
-          if [ -f "./build/libcov_agent.so" ]; then
-            echo "✅ Coverage agent found: ./build/libcov_agent.so"
-            ls -lh ./build/libcov_agent.so
-          elif [ -f "./build/bin/libcov_agent.so" ]; then
-            echo "✅ Coverage agent found: ./build/bin/libcov_agent.so"
-            ls -lh ./build/bin/libcov_agent.so
-          else
-            echo "❌ Coverage agent NOT found!"
-            echo "Looking for libcov_agent.so..."
-            find . -name "libcov_agent.so" -type f 2>/dev/null || echo "Not found anywhere"
-          fi
-          
-          # Quick test with shared memory coverage
-          echo ""
-          echo "=== Quick test: running cvc5 with shared memory coverage ==="
-          AGENT_PATH=$(find ./build -name "libcov_agent.so" -type f 2>/dev/null | head -1)
-          if [ -n "$AGENT_PATH" ] && [ -n "$TEST_FILE" ]; then
-            echo "Using agent: $AGENT_PATH"
-            echo "Running: LD_PRELOAD=$AGENT_PATH COVERAGE_SHM_NAME=test_cov ./build/bin/cvc5 $TEST_FILE"
-            LD_PRELOAD="$AGENT_PATH" COVERAGE_SHM_NAME=test_cov ASAN_OPTIONS='abort_on_error=0:detect_leaks=0' \
-              timeout 10 ./build/bin/cvc5 "$TEST_FILE" 2>&1 || true
-            
-            echo ""
-            echo "=== Shared memory file after test ==="
-            if [ -f "/dev/shm/test_cov" ]; then
-              echo "✅ Shared memory file created!"
-              ls -la /dev/shm/test_cov
-              echo "File size: $(stat -c%s /dev/shm/test_cov) bytes"
-            else
-              echo "❌ Shared memory file NOT created"
-              echo "Contents of /dev/shm/:"
-              ls -la /dev/shm/ | head -20
-            fi
-          else
-            echo "Skipping test - agent or test file not found"
-          fi
-
-      - name: Run fuzzing with sancov coverage tracking
+      - name: Run coverage-guided fuzzing
         working-directory: cvc5
         run: |
           FUZZING_DURATION="${{ inputs.fuzzing_duration_minutes || 60 }}"
-          mkdir -p coverage
           
-          echo "=== Starting fuzzing with sancov (shared memory mode) ==="
-          echo "Coverage dir: ./coverage"
+          mkdir -p output profraw bugs
           
-          # Find coverage agent
-          AGENT_PATH=$(find ./build -name "libcov_agent.so" -type f 2>/dev/null | head -1)
-          if [ -n "$AGENT_PATH" ]; then
-            echo "Coverage agent: $AGENT_PATH"
-          else
-            echo "WARNING: Coverage agent not found!"
-          fi
+          echo "=== Starting coverage-guided fuzzing ==="
+          echo "Duration: ${FUZZING_DURATION} minutes"
+          echo "Workers: 4"
           
-          python3 ${{ github.workspace }}/scripts/cvc5/commit_fuzzer/simple_commit_fuzzer_sancov.py \
+          python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/coverage_guided_fuzzer.py \
             --tests-file ../${{ steps.extract-tests.outputs.tests_file }} \
             --job-id '${{ matrix.job_id }}' \
             --tests-root 'test/regress/cli' \
             --fuzzing-duration-minutes ${FUZZING_DURATION} \
-            --iterations 250 \
+            --iterations 1 \
             --cvc5-path ./build/bin/cvc5 \
-            --enable-sancov \
-            --coverage-dir ./coverage \
-            --coverage-report ../sancov_coverage_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json || true
+            --workers 4 \
+            --bugs-folder ./bugs \
+            --output-dir ./output \
+            --profraw-dir ./profraw || true
           
-          echo ""
-          echo "=== Coverage agent logs (PROOF agent loaded) ==="
-          if [ -f /tmp/coverage_agent.log ]; then
-            echo "✅ Agent log exists! Agent WAS loaded into cvc5 processes"
-            echo "Total agent loads: $(grep -c '\[AGENT\] Loaded' /tmp/coverage_agent.log || echo 0)"
-            echo "Total guard inits: $(grep -c '__sanitizer_cov_trace_pc_guard_init' /tmp/coverage_agent.log || echo 0)"
-            echo "Total guards initialized: $(grep -c 'Guards initialized' /tmp/coverage_agent.log || echo 0)"
-            echo "Total hit guards written: $(grep -c 'Wrote.*hit guards' /tmp/coverage_agent.log || echo 0)"
-            echo ""
-            echo "Guard init details:"
-            grep '__sanitizer_cov_trace_pc_guard_init' /tmp/coverage_agent.log | head -10
-            echo ""
-            echo "Warnings/Errors:"
-            grep -E 'WARNING|ERROR' /tmp/coverage_agent.log | head -10 || echo "  None"
-            echo ""
-            echo "Last 30 lines:"
-            tail -30 /tmp/coverage_agent.log
-          else
-            echo "❌ coverage_agent.log NOT FOUND - Agent was NEVER loaded!"
-            echo "This means LD_PRELOAD failed (likely relative path issue)"
-          fi
+          echo "=== Fuzzing complete ==="
+          echo "Coverage stats:"
+          cat ./output/coverage_stats.json || echo "No coverage stats"
+      
+      - name: Extract function counts from PGO data
+        if: always()
+        working-directory: cvc5
+        run: |
+          echo "=== Extracting function counts ==="
           
-          echo ""
-          echo "=== Wrapper debug logs ==="
-          if [ -f /tmp/wrapper_calls.log ]; then
-            echo "Wrapper was called $(wc -l < /tmp/wrapper_calls.log) times"
-            echo "Checking if absolute paths were used:"
-            grep "Agent absolute path" /tmp/wrapper_calls.log | head -5 || echo "  No absolute path logs found"
-            echo "Last 20 lines of wrapper_calls.log:"
-            tail -20 /tmp/wrapper_calls.log
-          else
-            echo "❌ wrapper_calls.log NOT FOUND - wrapper was never called!"
-          fi
+          # Count profraw files
+          PROFRAW_COUNT=$(find ./profraw -name "*.profraw" -type f 2>/dev/null | wc -l)
+          echo "Found $PROFRAW_COUNT profraw files"
           
-          echo ""
-          echo "=== Check guard_count in shm files ==="
-          for SHM in /dev/shm/cvc5_cov_*; do
-            if [ -f "$SHM" ]; then
-              echo "File: $SHM"
-              python3 -c "
-          import struct, mmap, os
-          shm_path = '$SHM'
-          try:
-              with os.fdopen(os.open(shm_path, os.O_RDONLY), 'rb') as f:
-                  m = mmap.mmap(f.fileno(), 589840, access=mmap.ACCESS_READ)
-                  m.seek(0); pid = struct.unpack('I', m.read(4))[0]
-                  m.seek(8); guard_count = struct.unpack('I', m.read(4))[0]
-                  m.seek(16); hit_guard_count = struct.unpack('I', m.read(4))[0]
-                  m.seek(24); pc_table_size = struct.unpack('I', m.read(4))[0]
-                  print(f'  pid={pid}, guard_count={guard_count}, hit_guards={hit_guard_count}, pc_table_size={pc_table_size}')
-                  if guard_count > 0 and hit_guard_count > 0:
-                      m.seek(32)
-                      hit_guards = m.read(min(guard_count // 8 + 1, 8192))
-                      bits_set = sum(bin(b).count('1') for b in hit_guards)
-                      print(f'  Hit guards (from bitmap): {bits_set} / {guard_count}')
-                  m.close()
-          except Exception as e:
-              print(f'  Error reading shm: {e}')
-          " 2>&1 || echo "  Error running python"
+          if [ "$PROFRAW_COUNT" -gt 0 ]; then
+            # Merge profraw files
+            llvm-profdata merge -sparse -o ./output/merged.profdata ./profraw/*.profraw || true
+            
+            if [ -f "./output/merged.profdata" ]; then
+              echo "✅ Merged profdata created"
+              
+              # Extract function counts
+              python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/extract_function_counts.py \
+                ./build/bin/cvc5 \
+                --profdata ./output/merged.profdata \
+                --output ../function_counts_${{ matrix.commit }}_${{ matrix.job_id }}.json || true
+              
+              # Convert to baseline-compatible format
+              if [ -f "../function_counts_${{ matrix.commit }}_${{ matrix.job_id }}.json" ]; then
+                python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/convert_function_counts.py \
+                  ../function_counts_${{ matrix.commit }}_${{ matrix.job_id }}.json \
+                  --commit '${{ matrix.commit }}' \
+                  --job-id '${{ matrix.job_id }}'
+              fi
             fi
-          done || echo "No shm files found"
+          fi
           
-          echo ""
-          echo "=== Coverage status after fuzzing ==="
-          echo "Shared memory files in /dev/shm/:"
-          ls -la /dev/shm/cvc5_cov* 2>/dev/null | head -10 || echo "No cvc5_cov shared memory files"
-          echo ""
-          echo "Coverage dir contents:"
-          ls -la ./coverage/ 2>/dev/null | head -20 || echo "Coverage dir empty or missing"
-      
-      - name: Debug - Check coverage report
-        if: always()
-        run: |
-          echo "=== Checking coverage report file ==="
-          if [ -f "sancov_coverage_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json" ]; then
-            echo "✅ Coverage report file exists"
-            echo "File size: $(ls -lh sancov_coverage_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json | awk '{print $5}')"
-            echo "First 50 lines:"
-            head -50 "sancov_coverage_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json"
-          else
-            echo "❌ Coverage report file NOT found: sancov_coverage_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json"
-            echo "Files in current directory:"
-            ls -la *.json 2>/dev/null || echo "No JSON files found"
-          fi
-
-      - name: Parse sancov statistics
-        if: always()
-        run: |
-          if [ -f "sancov_coverage_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json" ]; then
-            python3 ${{ github.workspace }}/scripts/cvc5/parse_sancov_stats.py \
-              sancov_coverage_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json \
-              --format json > sancov_stats_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json
-            echo "✅ Parsed sancov statistics"
-          else
-            echo "⚠️ Sancov coverage report not found"
+          # Also save coverage stats
+          if [ -f "./output/coverage_stats.json" ]; then
+            cp ./output/coverage_stats.json ../coverage_stats_${{ matrix.commit }}_${{ matrix.job_id }}.json
           fi
       
-      - name: Upload sancov coverage and statistics
+      - name: Upload fuzzing results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sancov-coverage-commit-${{ matrix.commit }}-job-${{ matrix.job_id }}
+          name: fuzzing-results-${{ matrix.commit }}-job-${{ matrix.job_id }}
           path: |
-            sancov_coverage_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json
-            sancov_stats_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json
+            function_counts_${{ matrix.commit }}_${{ matrix.job_id }}.json
+            coverage_stats_${{ matrix.commit }}_${{ matrix.job_id }}.json
+            cvc5/bugs/**/*.smt2
           if-no-files-found: ignore
 
-  merge-sancov-statistics:
+  merge-statistics:
     needs: [generate-matrix, prepare-commit-fuzzer, fuzzing-jobs]
     if: always() && needs.prepare-commit-fuzzer.result == 'success'
     runs-on: ubuntu-latest
@@ -684,53 +457,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
       
-      - name: Download all sancov coverage artifacts for commit
+      - name: Download all results for commit
         uses: actions/download-artifact@v4
         with:
-          path: sancov-artifacts
-          pattern: sancov-coverage-commit-${{ matrix.commit }}-job-*
+          path: results-artifacts
+          pattern: fuzzing-results-${{ matrix.commit }}-job-*
           merge-multiple: false
       
-      - name: Merge sancov statistics
+      - name: Download changed functions
+        uses: actions/download-artifact@v4
+        with:
+          name: changed-functions-${{ matrix.commit }}
+          path: .
+      
+      - name: Merge statistics
         run: |
-          # Find all sancov statistics files for this commit
-          STATS_FILES=$(find sancov-artifacts -name "sancov_stats_commit_${{ matrix.commit }}_job_*.json" -type f | sort)
-          
-          if [ -z "$STATS_FILES" ]; then
-            echo "⚠️ No sancov statistics files found for commit ${{ matrix.commit }}"
-            exit 0
-          fi
-          
-          # Merge statistics (combine all coverage data)
-          python3 -c "
-          import json
-          import sys
-          from pathlib import Path
-          
-          all_pcs = set()
-          all_tests = {}
-          total_files = 0
-          
-          for stats_file in Path('sancov-artifacts').rglob('sancov_stats_commit_${{ matrix.commit }}_job_*.json'):
-              try:
-                  with open(stats_file) as f:
-                      data = json.load(f)
-                      all_pcs.update(data.get('total_pcs', 0))
-                      # Note: test_coverage would need to be merged from full coverage files
-                      total_files += data.get('processed_files', 0)
-              except Exception as e:
-                  print(f'Error reading {stats_file}: {e}', file=sys.stderr)
-          
-          merged = {
-              'commit': '${{ matrix.commit }}',
-              'total_unique_pcs': len(all_pcs),
-              'total_processed_files': total_files,
-              'jobs_processed': len(list(Path('sancov-artifacts').rglob('sancov_stats_commit_${{ matrix.commit }}_job_*.json')))
-          }
-          
-          with open('merged_sancov_statistics_${{ matrix.commit }}.json', 'w') as f:
-              json.dump(merged, f, indent=2)
-          "
+          # Use dedicated merge script
+          python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/merge_coverage_stats.py \
+            results-artifacts \
+            --commit '${{ matrix.commit }}' \
+            --output 'merged_statistics_${{ matrix.commit }}.json' || {
+              echo "⚠️ No results found for commit ${{ matrix.commit }}"
+              exit 0
+            }
       
       - name: Configure AWS credentials
         if: ${{ !inputs.dry_run }}
@@ -742,52 +491,39 @@ jobs:
 
       - name: Get full commit hash
         id: get-commit-merge
-        if: always()
         run: |
-          # Expand short hash to full hash if needed
-          if [ -d "cvc5" ]; then
-            cd cvc5
-            git fetch origin --quiet 2>/dev/null || true
-            FULL_HASH=$(git rev-parse "${{ matrix.commit }}")
-            echo "commit_hash=$FULL_HASH" >> $GITHUB_OUTPUT
-            echo "Expanded ${{ matrix.commit }} to $FULL_HASH"
-          else
-            # Fallback: use matrix.commit as-is
-            echo "commit_hash=${{ matrix.commit }}" >> $GITHUB_OUTPUT
-            echo "Using ${{ matrix.commit }} as-is (repo not available)"
-          fi
+          echo "commit_hash=${{ matrix.commit }}" >> $GITHUB_OUTPUT
       
-      - name: Upload merged sancov statistics to S3
+      - name: Upload statistics to S3
         if: always() && !inputs.dry_run
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/cvc5/sancov-statistics/variant1/sancov_statistics-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/cvc5/fuzzing-statistics/coverage-guided/fuzzing_statistics-${COMMIT_HASH}.json.gz"
           
-          if [ ! -f "merged_sancov_statistics_${{ matrix.commit }}.json" ]; then
-            echo "⚠️ Merged sancov statistics file not found"
+          if [ ! -f "merged_statistics_${{ matrix.commit }}.json" ]; then
+            echo "⚠️ Merged statistics file not found"
             exit 0
           fi
           
-          gzip -c "merged_sancov_statistics_${{ matrix.commit }}.json" > merged_sancov_statistics_${COMMIT_HASH}.json.gz
+          gzip -c "merged_statistics_${{ matrix.commit }}.json" > merged_statistics_${COMMIT_HASH}.json.gz
           
           aws s3api put-object \
             --bucket ${{ secrets.AWS_S3_BUCKET }} \
             --key "$S3_KEY" \
-            --body merged_sancov_statistics_${COMMIT_HASH}.json.gz
+            --body merged_statistics_${COMMIT_HASH}.json.gz
           
-          echo "✅ Uploaded sancov statistics to S3: $S3_KEY"
+          echo "✅ Uploaded coverage-guided statistics to S3: $S3_KEY"
       
       - name: Dry run - Skip S3 upload
         if: always() && inputs.dry_run
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/cvc5/sancov-statistics/variant1/sancov_statistics-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/cvc5/fuzzing-statistics/coverage-guided/fuzzing_statistics-${COMMIT_HASH}.json.gz"
           
-          if [ -f "merged_sancov_statistics_${{ matrix.commit }}.json" ]; then
+          if [ -f "merged_statistics_${{ matrix.commit }}.json" ]; then
             echo "🔍 DRY RUN: Would upload to S3: $S3_KEY"
-            echo "🔍 DRY RUN: File exists: merged_sancov_statistics_${{ matrix.commit }}.json"
-            echo "🔍 DRY RUN: Skipping upload (dry_run=true)"
+            echo "Contents:"
+            head -50 "merged_statistics_${{ matrix.commit }}.json"
           else
-            echo "⚠️ Merged sancov statistics file not found"
+            echo "⚠️ Merged statistics file not found"
           fi
-
