@@ -432,15 +432,19 @@ jobs:
           # DEBUG: Check profraw file sizes (showing first 10 files)
           echo "=== DEBUG: Checking profraw file sizes ==="
           COUNT=0
-          for f in ./profraw/*.profraw 2>/dev/null; do
-            if [ -f "$f" ] && [ $COUNT -lt 10 ]; then
-              FILE_SIZE=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo "unknown")
-              echo "  $f: size=${FILE_SIZE}B"
-              COUNT=$((COUNT + 1))
+          if ls ./profraw/*.profraw 1>/dev/null 2>&1; then
+            for f in ./profraw/*.profraw; do
+              if [ -f "$f" ] && [ $COUNT -lt 10 ]; then
+                FILE_SIZE=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo "unknown")
+                echo "  $f: size=${FILE_SIZE}B"
+                COUNT=$((COUNT + 1))
+              fi
+            done
+            if [ $COUNT -eq 10 ]; then
+              echo "  ... and more files"
             fi
-          done
-          if [ $COUNT -eq 10 ]; then
-            echo "  ... and more files"
+          else
+            echo "  No profraw files found"
           fi
           
           # Check if fuzzer already created merged.profdata
