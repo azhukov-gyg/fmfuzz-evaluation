@@ -417,31 +417,39 @@ jobs:
         run: |
           echo "=== Extracting function counts ==="
           
-          # Count profraw files
-          PROFRAW_COUNT=$(find ./profraw -name "*.profraw" -type f 2>/dev/null | wc -l)
-          echo "Found $PROFRAW_COUNT profraw files"
-          
-          if [ "$PROFRAW_COUNT" -gt 0 ]; then
-            # Merge profraw files
-            llvm-profdata merge -sparse -o ./output/merged.profdata ./profraw/*.profraw || true
+          # Check if fuzzer already created merged.profdata
+          if [ -f "./output/merged.profdata" ]; then
+            echo "✅ Using existing merged.profdata from fuzzer"
+          else
+            # Fallback: merge profraw files if they exist
+            PROFRAW_COUNT=$(find ./profraw -name "*.profraw" -type f 2>/dev/null | wc -l)
+            echo "Found $PROFRAW_COUNT profraw files"
             
-            if [ -f "./output/merged.profdata" ]; then
-              echo "✅ Merged profdata created"
-              
-              # Extract function counts
-              python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/extract_function_counts.py \
-                ./build/bin/cvc5 \
-                --profdata ./output/merged.profdata \
-                --output ../function_counts_${{ matrix.commit }}_${{ matrix.job_id }}.json || true
-              
-              # Convert to baseline-compatible format
-              if [ -f "../function_counts_${{ matrix.commit }}_${{ matrix.job_id }}.json" ]; then
-                python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/convert_function_counts.py \
-                  ../function_counts_${{ matrix.commit }}_${{ matrix.job_id }}.json \
-                  --commit '${{ matrix.commit }}' \
-                  --job-id '${{ matrix.job_id }}'
-              fi
+            if [ "$PROFRAW_COUNT" -gt 0 ]; then
+              echo "Merging profraw files..."
+              llvm-profdata merge -sparse -o ./output/merged.profdata ./profraw/*.profraw || true
             fi
+          fi
+          
+          # Extract function counts if we have profdata
+          if [ -f "./output/merged.profdata" ]; then
+            echo "✅ Merged profdata available"
+            
+            # Extract function counts
+            python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/extract_function_counts.py \
+              ./build/bin/cvc5 \
+              --profdata ./output/merged.profdata \
+              --output ../function_counts_${{ matrix.commit }}_${{ matrix.job_id }}.json || true
+            
+            # Convert to baseline-compatible format
+            if [ -f "../function_counts_${{ matrix.commit }}_${{ matrix.job_id }}.json" ]; then
+              python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/convert_function_counts.py \
+                ../function_counts_${{ matrix.commit }}_${{ matrix.job_id }}.json \
+                --commit '${{ matrix.commit }}' \
+                --job-id '${{ matrix.job_id }}'
+            fi
+          else
+            echo "⚠️ No profdata available for function count extraction"
           fi
           
           # Also save coverage stats
