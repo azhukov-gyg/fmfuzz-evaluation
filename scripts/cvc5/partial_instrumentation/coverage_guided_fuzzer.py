@@ -198,7 +198,8 @@ class CoverageGuidedFuzzer:
     def _queue_push_initial_batch(self, test_names: list):
         """Push multiple initial tests efficiently, filtering out excluded tests."""
         # Filter out tests that were marked as unsupported/timeout
-        excluded_set = set(self.excluded_tests)
+        excluded_list = list(self.excluded_tests)  # Copy to local list for reliable comparison
+        excluded_set = set(excluded_list)
         filtered_tests = [name for name in test_names if name not in excluded_set]
         skipped_count = len(test_names) - len(filtered_tests)
         
@@ -210,6 +211,11 @@ class CoverageGuidedFuzzer:
             print(f"[QUEUE] Loaded {len(items)} initial tests, skipped {skipped_count} excluded (queue: {queue_size_before} -> {self._queue_size()})")
         else:
             print(f"[QUEUE] Loaded {len(items)} initial tests (queue: {queue_size_before} -> {self._queue_size()})")
+        
+        # Debug: show excluded list status
+        if len(excluded_list) > 0:
+            print(f"[QUEUE] [DEBUG] Excluded list has {len(excluded_list)} items: {excluded_list[:3]}...")
+        sys.stdout.flush()
     
     def _queue_pop(self, timeout: float = 1.0) -> Optional[tuple]:
         """Pop highest priority item (lowest runtime). Returns None if timeout."""
@@ -647,6 +653,7 @@ class CoverageGuidedFuzzer:
         print(f"[STATUS] Rate: {tests_per_min:.1f} tests/min, {edges_per_min:.1f} new edges/min")
         print(f"[STATUS] ═══════════════════════════════════════════════════════")
         print()
+        sys.stdout.flush()
     
     # -------------------------------------------------------------------------
     # AFL-style Coverage Tracking
@@ -973,9 +980,16 @@ class CoverageGuidedFuzzer:
                         if action == 'remove' and generation == 0:
                             # Get original test identifier from queue item
                             original_test_id = test_item[2]  # The string path before conversion
-                            if original_test_id not in self.excluded_tests:
+                            # Manager list doesn't support 'in' well across processes, use list() copy
+                            current_excluded = list(self.excluded_tests)
+                            if original_test_id not in current_excluded:
                                 self.excluded_tests.append(original_test_id)
-                                print(f"[WORKER {worker_id}] [EXCLUDE] {test_name} excluded from future refills")
+                                print(f"[WORKER {worker_id}] [EXCLUDE] {test_name} (id={original_test_id}) added to exclusion list ({len(current_excluded)+1} total)")
+                                sys.stdout.flush()
+                        elif action == 'remove':
+                            # Debug: why wasn't this excluded?
+                            print(f"[WORKER {worker_id}] [DEBUG] Not excluding {test_name}: generation={generation}, action={action}")
+                            sys.stdout.flush()
                         
                         # Read coverage from shared memory (trace_bits)
                         shm.seek(0)
@@ -983,6 +997,12 @@ class CoverageGuidedFuzzer:
                         
                         # Count edges hit in this execution
                         edges_hit = sum(1 for b in trace_bits if b != 0)
+                        
+                        # Debug: log if we're getting any coverage at all
+                        if edges_hit == 0 and self.stats.get('tests_processed', 0) < 5:
+                            # Only log first few tests to avoid spam
+                            nonzero_sample = [(i, trace_bits[i]) for i in range(min(100, len(trace_bits))) if trace_bits[i] != 0]
+                            print(f"[DEBUG] SHM {shm_name}: edges_hit={edges_hit}, sample_nonzero={nonzero_sample[:10]}, __AFL_SHM_ID={shm_id}")
                         
                         # Check for new coverage using SHARED global_coverage_map (with lock)
                         # This ensures all workers see the same global coverage state

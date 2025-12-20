@@ -138,7 +138,7 @@ log "Phase 6: Recompiling selected files with instrumentation"
 cd "$BUILD_DIR"
 
 # Instrumentation flags
-SANCOV_FLAGS="-fsanitize-coverage=trace-pc-guard -fsanitize-coverage-allowlist=${ALLOWLIST}"
+SANCOV_FLAGS="-fsanitize-coverage=trace-pc-guard -fno-sanitize-coverage-link-runtime -fsanitize-coverage-allowlist=${ALLOWLIST}"
 PGO_FLAGS="-fprofile-instr-generate -fcoverage-mapping -fprofile-list=${ALLOWLIST}"
 INST_FLAGS="$SANCOV_FLAGS $PGO_FLAGS"
 

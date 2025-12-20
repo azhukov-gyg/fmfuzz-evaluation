@@ -93,10 +93,21 @@ static void init_coverage_agent() {
             char shm_name[64];
             snprintf(shm_name, sizeof(shm_name), "/afl_shm_%s", shm_id);
             init_shm(shm_name);
+            // Debug: verify our coverage agent is being used (not LLVM's runtime)
+            if (getenv("COVERAGE_AGENT_DEBUG")) {
+                fprintf(stderr, "[coverage_agent] Initialized SHM: %s (bitmap=%p)\n", 
+                        shm_name, (void*)g_bitmap);
+            }
         } else {
             const char* shm_name = getenv("COVERAGE_SHM_NAME");
             if (shm_name) {
                 init_shm(shm_name);
+                if (getenv("COVERAGE_AGENT_DEBUG")) {
+                    fprintf(stderr, "[coverage_agent] Initialized custom SHM: %s (bitmap=%p)\n",
+                            shm_name, (void*)g_bitmap);
+                }
+            } else if (getenv("COVERAGE_AGENT_DEBUG")) {
+                fprintf(stderr, "[coverage_agent] No SHM configured (__AFL_SHM_ID or COVERAGE_SHM_NAME not set)\n");
             }
         }
     }
