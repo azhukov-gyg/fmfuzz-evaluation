@@ -135,6 +135,21 @@ jobs:
           gunzip coverage_mapping.json.gz
           echo "✅ Downloaded coverage mapping"
 
+      - name: Download coverage binary from S3 (for compile_commands.json)
+        run: |
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/cvc5/builds/coverage/${COMMIT_HASH}.tar.gz"
+          
+          mkdir -p artifacts
+          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY artifacts/artifacts.tar.gz
+          echo "✅ Downloaded coverage binary for $COMMIT_HASH"
+
+      - name: Extract coverage binary
+        run: |
+          mkdir -p cvc5/build
+          ./scripts/cvc5/extract_build_artifacts.sh artifacts/artifacts.tar.gz cvc5/build true
+          echo "✅ Extracted build artifacts (includes compile_commands.json)"
+
       - name: Run prepare commit fuzzer
         id: prepare
         working-directory: cvc5
