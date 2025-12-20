@@ -417,16 +417,44 @@ jobs:
         run: |
           echo "=== Extracting function counts ==="
           
+          # DEBUG: List all profraw files before any merge
+          echo "=== DEBUG: Profraw files in ./profraw ==="
+          ls -la ./profraw/*.profraw 2>/dev/null || echo "No profraw files in ./profraw"
+          PROFRAW_COUNT=$(find ./profraw -name "*.profraw" -type f 2>/dev/null | wc -l)
+          echo "Total profraw files: $PROFRAW_COUNT"
+          
+          # DEBUG: Check accumulated.profdata from periodic merges
+          if [ -f "./output/accumulated.profdata" ]; then
+            echo "=== DEBUG: accumulated.profdata exists (from periodic merges) ==="
+            ls -la ./output/accumulated.profdata
+          fi
+          
+          # DEBUG: Check profraw file sizes (showing first 10 files)
+          echo "=== DEBUG: Checking profraw file sizes ==="
+          COUNT=0
+          for f in ./profraw/*.profraw 2>/dev/null; do
+            if [ -f "$f" ] && [ $COUNT -lt 10 ]; then
+              FILE_SIZE=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo "unknown")
+              echo "  $f: size=${FILE_SIZE}B"
+              COUNT=$((COUNT + 1))
+            fi
+          done
+          if [ $COUNT -eq 10 ]; then
+            echo "  ... and more files"
+          fi
+          
           # Check if fuzzer already created merged.profdata
           if [ -f "./output/merged.profdata" ]; then
             echo "✅ Using existing merged.profdata from fuzzer"
+            # DEBUG: Show what's in the merged profdata
+            echo "=== DEBUG: Contents of merged.profdata ==="
+            llvm-profdata show ./output/merged.profdata 2>/dev/null | head -50 || echo "Could not show profdata"
           else
             # Fallback: merge profraw files if they exist
-            PROFRAW_COUNT=$(find ./profraw -name "*.profraw" -type f 2>/dev/null | wc -l)
-            echo "Found $PROFRAW_COUNT profraw files"
+            echo "No merged.profdata from fuzzer, attempting manual merge..."
             
             if [ "$PROFRAW_COUNT" -gt 0 ]; then
-              echo "Merging profraw files..."
+              echo "Merging $PROFRAW_COUNT profraw files..."
               llvm-profdata merge -sparse -o ./output/merged.profdata ./profraw/*.profraw || true
             fi
           fi

@@ -798,10 +798,16 @@ class CoverageGuidedFuzzer:
             env['__AFL_SHM_ID'] = shm_id
             # PGO profiling - use %p (pid) and %m (merge pool) for unique files per cvc5 invocation
             # typefuzz runs cvc5 multiple times, each needs its own profraw file
+            # Use %c for continuous mode - writes profile data continuously (survives crashes/kills)
             profraw_pattern = self.profraw_dir / f"worker_{worker_id}_%p_%m.profraw"
             env['LLVM_PROFILE_FILE'] = str(profraw_pattern)
             # Disable ASAN leak detection
             env['ASAN_OPTIONS'] = 'abort_on_error=0:detect_leaks=0'
+            
+            # DEBUG: Count profraw files before running test
+            profraw_before = len(list(self.profraw_dir.glob("*.profraw")))
+            if self.stats.get('tests_processed', 0) < 5:  # Only log first few tests
+                print(f"[WORKER {worker_id}] [PGO DEBUG] LLVM_PROFILE_FILE={profraw_pattern}, profraw_files_before={profraw_before}")
             
             if per_test_timeout and per_test_timeout > 0:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=per_test_timeout, env=env)
@@ -814,6 +820,15 @@ class CoverageGuidedFuzzer:
             
             # Collect mutant files from scratch folder
             mutant_files = list(scratch_folder.glob("*.smt2")) + list(scratch_folder.glob("*.smt"))
+            
+            # DEBUG: Count profraw files after running test
+            profraw_after = len(list(self.profraw_dir.glob("*.profraw")))
+            profraw_new = profraw_after - profraw_before
+            if profraw_new > 0 or self.stats.get('tests_processed', 0) < 5:
+                # List new profraw files for debugging
+                new_files = list(self.profraw_dir.glob(f"worker_{worker_id}_*.profraw"))
+                sizes = [(f.name, f.stat().st_size) for f in new_files[-3:]]  # Last 3
+                print(f"[WORKER {worker_id}] [PGO DEBUG] profraw_after={profraw_after} (new:{profraw_new}), recent_files={sizes}")
             
             return (exit_code, bug_files, runtime, mutant_files)
             
@@ -1287,6 +1302,11 @@ class CoverageGuidedFuzzer:
         accumulated_profdata = self.output_dir / "accumulated.profdata"
         temp_profdata = self.output_dir / "temp_merge.profdata"
         
+        # DEBUG: Show profraw file details before merge
+        total_size = sum(f.stat().st_size for f in profraw_files)
+        nonzero_files = [f for f in profraw_files if f.stat().st_size > 0]
+        print(f"[PGO DEBUG] Periodic merge: {len(profraw_files)} files, {len(nonzero_files)} non-empty, total size: {total_size / 1024:.1f}KB")
+        
         try:
             # Build merge command
             cmd = ["llvm-profdata", "merge", "-sparse", "-o", str(temp_profdata)]
@@ -1294,6 +1314,7 @@ class CoverageGuidedFuzzer:
             # Include existing accumulated profdata if it exists
             if accumulated_profdata.exists():
                 cmd.append(str(accumulated_profdata))
+                print(f"[PGO DEBUG] Including existing accumulated.profdata ({accumulated_profdata.stat().st_size / 1024:.1f}KB)")
             
             cmd.extend([str(f) for f in profraw_files])
             
@@ -1303,6 +1324,10 @@ class CoverageGuidedFuzzer:
                 if accumulated_profdata.exists():
                     accumulated_profdata.unlink()
                 temp_profdata.rename(accumulated_profdata)
+                
+                # DEBUG: Show result size
+                merged_size = accumulated_profdata.stat().st_size
+                print(f"[PGO DEBUG] Merge successful: accumulated.profdata is now {merged_size / 1024:.1f}KB")
                 
                 # Delete merged profraw files to save disk space
                 for f in profraw_files:
@@ -1324,6 +1349,24 @@ class CoverageGuidedFuzzer:
         profraw_files = list(self.profraw_dir.glob("*.profraw"))
         accumulated_profdata = self.output_dir / "accumulated.profdata"
         
+        # DEBUG: Show detailed state
+        print(f"[PGO DEBUG] Final merge state:")
+        print(f"[PGO DEBUG]   profraw_dir: {self.profraw_dir}")
+        print(f"[PGO DEBUG]   profraw files: {len(profraw_files)}")
+        if profraw_files:
+            total_size = sum(f.stat().st_size for f in profraw_files)
+            nonzero = [f for f in profraw_files if f.stat().st_size > 0]
+            print(f"[PGO DEBUG]   profraw total size: {total_size / 1024:.1f}KB, non-empty: {len(nonzero)}")
+            for f in profraw_files[:5]:  # Show first 5
+                print(f"[PGO DEBUG]     - {f.name}: {f.stat().st_size}B")
+            if len(profraw_files) > 5:
+                print(f"[PGO DEBUG]     ... and {len(profraw_files) - 5} more")
+        
+        if accumulated_profdata.exists():
+            print(f"[PGO DEBUG]   accumulated.profdata exists: {accumulated_profdata.stat().st_size / 1024:.1f}KB")
+        else:
+            print(f"[PGO DEBUG]   accumulated.profdata: does not exist")
+        
         if not profraw_files and not accumulated_profdata.exists():
             print("[INFO] No profraw files to merge")
             return
@@ -1343,7 +1386,24 @@ class CoverageGuidedFuzzer:
             
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
-                print(f"[INFO] Merged profdata saved to: {profdata_output}")
+                merged_size = profdata_output.stat().st_size
+                print(f"[INFO] Merged profdata saved to: {profdata_output} ({merged_size / 1024:.1f}KB)")
+                
+                # DEBUG: Try to show summary of merged profdata
+                try:
+                    show_result = subprocess.run(
+                        ["llvm-profdata", "show", str(profdata_output)],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if show_result.returncode == 0:
+                        # Extract key lines from output
+                        lines = show_result.stdout.split('\n')[:20]
+                        print(f"[PGO DEBUG] merged.profdata summary (first 20 lines):")
+                        for line in lines:
+                            if line.strip():
+                                print(f"[PGO DEBUG]   {line}")
+                except Exception as e:
+                    print(f"[PGO DEBUG] Could not show profdata summary: {e}")
             else:
                 print(f"[WARN] Failed to merge profdata: {result.stderr}", file=sys.stderr)
         except Exception as e:
