@@ -1,4 +1,6 @@
 # Repositories cloned for analysis
-./cvc5/
-./z3/
-./z3test/
+cvc5/
+z3/
+z3test/
+AFLplusplus/
+yinyang/
