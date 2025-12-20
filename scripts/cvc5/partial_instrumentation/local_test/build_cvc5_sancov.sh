@@ -71,7 +71,7 @@ log "Phase 4: Configuring instrumentation flags"
 export CC=clang
 export CXX=clang++
 
-SANCOV_FLAGS="-fsanitize-coverage=trace-pc-guard -fno-sanitize-coverage-link-runtime"
+SANCOV_FLAGS="-fsanitize-coverage=trace-pc-guard"
 PGO_FLAGS="-fprofile-instr-generate -fcoverage-mapping"
 
 # Add allowlists if provided
