@@ -35,11 +35,19 @@ if [ ! -d "$CVC5_DIR" ]; then
 fi
 cd "$CVC5_DIR"
 
-if [ -n "$COMMIT_HASH" ]; then
-    git fetch origin
-    git checkout "$COMMIT_HASH"
+# Only do git operations if .git exists (workflow may have already checked out and removed .git)
+if [ -d ".git" ]; then
+    if [ -n "$COMMIT_HASH" ]; then
+        git fetch origin
+        git checkout "$COMMIT_HASH"
+    fi
+    echo "  Commit: $(git rev-parse --short HEAD)"
+else
+    echo "  Source already prepared (no .git directory)"
+    if [ -n "$COMMIT_HASH" ]; then
+        echo "  Expected commit: $COMMIT_HASH"
+    fi
 fi
-echo "  Commit: $(git rev-parse --short HEAD)"
 
 # Phase 2: Setup Python venv (needed for CVC5 build)
 log "Phase 2: Setting up Python environment"
@@ -90,12 +98,20 @@ PGO_FLAGS="-fprofile-instr-generate -fcoverage-mapping"
 # Add allowlists if provided
 if [ -n "$SANCOV_ALLOWLIST" ] && [ -f "$SANCOV_ALLOWLIST" ]; then
     SANCOV_FLAGS="$SANCOV_FLAGS -fsanitize-coverage-allowlist=$SANCOV_ALLOWLIST"
-    echo "  Sancov allowlist: $SANCOV_ALLOWLIST ($(grep -c '^fun:' "$SANCOV_ALLOWLIST" 2>/dev/null || echo 0) functions)"
+    SANCOV_COUNT=$(grep -c '^fun:' "$SANCOV_ALLOWLIST" 2>/dev/null || echo 0)
+    echo "  Sancov allowlist: $SANCOV_ALLOWLIST ($SANCOV_COUNT functions)"
+    echo "  --- Sancov allowlist contents ---"
+    cat "$SANCOV_ALLOWLIST"
+    echo "  ---------------------------------"
 fi
 
 if [ -n "$PGO_ALLOWLIST" ] && [ -f "$PGO_ALLOWLIST" ]; then
     PGO_FLAGS="$PGO_FLAGS -fprofile-list=$PGO_ALLOWLIST"
-    echo "  PGO allowlist: $PGO_ALLOWLIST ($(grep -c '^fun:' "$PGO_ALLOWLIST" 2>/dev/null || echo 0) functions)"
+    PGO_COUNT=$(grep -c '^fun:' "$PGO_ALLOWLIST" 2>/dev/null || echo 0)
+    echo "  PGO allowlist: $PGO_ALLOWLIST ($PGO_COUNT functions)"
+    echo "  --- PGO allowlist contents ---"
+    cat "$PGO_ALLOWLIST"
+    echo "  ------------------------------"
 fi
 
 # Let CVC5's production profile handle optimization flags
