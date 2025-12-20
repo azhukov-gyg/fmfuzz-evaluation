@@ -115,9 +115,10 @@ if [ -n "$PGO_ALLOWLIST" ] && [ -f "$PGO_ALLOWLIST" ]; then
 fi
 
 # Let CVC5's production profile handle optimization flags
-# We only add our instrumentation flags
-export CFLAGS="$SANCOV_FLAGS $PGO_FLAGS"
-export CXXFLAGS="$SANCOV_FLAGS $PGO_FLAGS"
+# We only add our instrumentation flags + -fno-inline to prevent inlining
+# (inlined functions bypass coverage guards, causing 0 edges hit)
+export CFLAGS="$SANCOV_FLAGS $PGO_FLAGS -fno-inline"
+export CXXFLAGS="$SANCOV_FLAGS $PGO_FLAGS -fno-inline"
 export LDFLAGS="-fprofile-instr-generate"
 
 echo "  CFLAGS: $CFLAGS"
