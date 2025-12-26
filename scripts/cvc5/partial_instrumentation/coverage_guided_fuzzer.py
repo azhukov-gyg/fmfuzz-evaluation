@@ -53,8 +53,10 @@ class CoverageGuidedFuzzer:
         tests_root: str,
         bugs_folder: str = "bugs",
         num_workers: int = 4,
-        iterations: int = 1,  # For coverage-guided: 1 iteration per test
+        iterations: int = 20,  # Batched iterations for efficiency (amortize process startup)
         modulo: int = 2,
+        max_pending_mutants: int = 10000,  # Disk space protection
+        min_disk_space_mb: int = 500,  # Minimum free disk space to continue
         seed: int = 42,
         time_remaining: Optional[int] = None,
         job_start_time: Optional[float] = None,
@@ -74,6 +76,8 @@ class CoverageGuidedFuzzer:
         self.job_id = job_id
         self.start_time = time.time()
         self.output_dir = Path(output_dir)
+        self.max_pending_mutants = max_pending_mutants
+        self.min_disk_space_mb = min_disk_space_mb
         
         try:
             self.cpu_count = psutil.cpu_count()
@@ -108,11 +112,13 @@ class CoverageGuidedFuzzer:
         # Multiprocessing primitives - use Queue instead of Manager.list for better performance
         self.manager = multiprocessing.Manager()
         
-        # Priority queue: use multiprocessing.Queue (much faster than Manager.list)
-        # Note: Queue doesn't support priority ordering, so we process in FIFO order
-        # This is acceptable since runtime differences are small compared to IPC overhead
-        self._work_queue = Queue()
-        self._queue_size = multiprocessing.Value('i', 0)  # Track size separately
+        # Two-tier priority queues: HIGH (new coverage) and LOW (existing coverage)
+        # Workers drain HIGH queue first, then LOW queue
+        # This provides priority without expensive heap operations
+        self._high_priority_queue = Queue()  # NEW coverage mutants
+        self._low_priority_queue = Queue()   # EXISTING coverage mutants (and initial seeds)
+        self._high_queue_size = multiprocessing.Value('i', 0)
+        self._low_queue_size = multiprocessing.Value('i', 0)
         
         self.bugs_lock = multiprocessing.Lock()
         self.shutdown_event = multiprocessing.Event()
@@ -139,6 +145,9 @@ class CoverageGuidedFuzzer:
         self.stats_tests_removed_timeout = multiprocessing.Value('i', 0)
         self.stats_mutants_created = multiprocessing.Value('i', 0)
         self.stats_mutants_with_new_coverage = multiprocessing.Value('i', 0)
+        self.stats_mutants_with_existing_coverage = multiprocessing.Value('i', 0)
+        self.stats_mutants_discarded_no_coverage = multiprocessing.Value('i', 0)
+        self.stats_mutants_discarded_disk_space = multiprocessing.Value('i', 0)
         self.stats_total_new_edges = multiprocessing.Value('i', 0)
         self.stats_generations_completed = multiprocessing.Value('i', 0)
         
@@ -168,25 +177,36 @@ class CoverageGuidedFuzzer:
             raise ValueError(f"cvc5 not found at: {self.cvc5_path}")
     
     # -------------------------------------------------------------------------
-    # Work Queue (FIFO - fast multiprocessing.Queue)
+    # Two-Tier Priority Queue (HIGH = new coverage, LOW = existing coverage)
     # -------------------------------------------------------------------------
     
-    def _queue_push(self, item: tuple):
-        """Push item to work queue. Item is (runtime, generation, path)."""
-        self._work_queue.put(item)
-        with self._queue_size.get_lock():
-            self._queue_size.value += 1
+    def _queue_push(self, item: tuple, high_priority: bool = False):
+        """Push item to work queue. Item is (priority, generation, path)."""
+        if high_priority:
+            self._high_priority_queue.put(item)
+            with self._high_queue_size.get_lock():
+                self._high_queue_size.value += 1
+        else:
+            self._low_priority_queue.put(item)
+            with self._low_queue_size.get_lock():
+                self._low_queue_size.value += 1
     
-    def _queue_push_batch(self, items: list):
+    def _queue_push_batch(self, items: list, high_priority: bool = False):
         """Push multiple items efficiently."""
-        for item in items:
-            self._work_queue.put(item)
-        with self._queue_size.get_lock():
-            self._queue_size.value += len(items)
+        if high_priority:
+            for item in items:
+                self._high_priority_queue.put(item)
+            with self._high_queue_size.get_lock():
+                self._high_queue_size.value += len(items)
+        else:
+            for item in items:
+                self._low_priority_queue.put(item)
+            with self._low_queue_size.get_lock():
+                self._low_queue_size.value += len(items)
     
     def _queue_push_initial(self, test_name: str):
-        """Push initial test with default priority."""
-        self._queue_push((0.0, 0, test_name))
+        """Push initial test (low priority - seeds go to low queue)."""
+        self._queue_push((0.0, 0, test_name), high_priority=False)
     
     def _queue_push_initial_batch(self, test_names: list):
         """Push multiple initial tests efficiently, filtering out excluded tests."""
@@ -197,7 +217,7 @@ class CoverageGuidedFuzzer:
         
         items = [(0.0, 0, name) for name in filtered_tests]
         queue_size_before = self._get_queue_size()
-        self._queue_push_batch(items)
+        self._queue_push_batch(items, high_priority=False)
         
         if skipped_count > 0:
             print(f"[QUEUE] Loaded {len(items)} initial tests, skipped {skipped_count} excluded (queue: {queue_size_before} -> {self._get_queue_size()})")
@@ -209,22 +229,40 @@ class CoverageGuidedFuzzer:
         sys.stdout.flush()
     
     def _queue_pop(self, timeout: float = 1.0) -> Optional[tuple]:
-        """Pop item from queue. Returns None if timeout."""
+        """Pop item from queue. HIGH priority queue is drained first."""
+        # Try high priority queue first (non-blocking)
         try:
-            item = self._work_queue.get(timeout=timeout)
-            with self._queue_size.get_lock():
-                self._queue_size.value -= 1
+            item = self._high_priority_queue.get_nowait()
+            with self._high_queue_size.get_lock():
+                self._high_queue_size.value -= 1
+            return item
+        except:
+            pass
+        
+        # Fall back to low priority queue (with timeout)
+        try:
+            item = self._low_priority_queue.get(timeout=timeout)
+            with self._low_queue_size.get_lock():
+                self._low_queue_size.value -= 1
             return item
         except:
             return None
     
     def _queue_empty(self) -> bool:
-        """Check if queue is empty."""
-        return self._queue_size.value <= 0
+        """Check if both queues are empty."""
+        return self._high_queue_size.value <= 0 and self._low_queue_size.value <= 0
     
     def _get_queue_size(self) -> int:
-        """Get queue size."""
-        return self._queue_size.value
+        """Get total queue size (both queues)."""
+        return self._high_queue_size.value + self._low_queue_size.value
+    
+    def _get_high_queue_size(self) -> int:
+        """Get high priority queue size."""
+        return self._high_queue_size.value
+    
+    def _get_low_queue_size(self) -> int:
+        """Get low priority queue size."""
+        return self._low_queue_size.value
     
     # -------------------------------------------------------------------------
     # Stats helpers (atomic operations on Value objects)
@@ -241,6 +279,72 @@ class CoverageGuidedFuzzer:
         if attr:
             with attr.get_lock():
                 attr.value += delta
+    
+    # -------------------------------------------------------------------------
+    # Disk Space Management (TOP PRIORITY)
+    # -------------------------------------------------------------------------
+    
+    def _get_free_disk_space_mb(self) -> float:
+        """Get free disk space in MB for the output directory."""
+        try:
+            stat = os.statvfs(self.output_dir)
+            free_bytes = stat.f_bavail * stat.f_frsize
+            return free_bytes / (1024 * 1024)
+        except Exception:
+            return float('inf')  # Assume enough space if can't check
+    
+    def _count_pending_mutants(self) -> int:
+        """Count number of pending mutant files."""
+        try:
+            return len(list(self.pending_mutants_dir.glob("*.smt2"))) + \
+                   len(list(self.pending_mutants_dir.glob("*.smt")))
+        except Exception:
+            return 0
+    
+    def _can_queue_mutants(self, count: int = 1) -> bool:
+        """Check if we can safely queue more mutants (disk space + count limits)."""
+        # Check pending mutants limit
+        current_pending = self._count_pending_mutants()
+        if current_pending + count > self.max_pending_mutants:
+            return False
+        
+        # Check disk space
+        free_mb = self._get_free_disk_space_mb()
+        if free_mb < self.min_disk_space_mb:
+            return False
+        
+        return True
+    
+    def _cleanup_old_pending_mutants(self, max_to_keep: int = None):
+        """Remove oldest pending mutants if over limit."""
+        if max_to_keep is None:
+            max_to_keep = self.max_pending_mutants
+        
+        try:
+            mutant_files = list(self.pending_mutants_dir.glob("*.smt2")) + \
+                          list(self.pending_mutants_dir.glob("*.smt"))
+            
+            if len(mutant_files) <= max_to_keep:
+                return 0
+            
+            # Sort by modification time (oldest first)
+            mutant_files.sort(key=lambda f: f.stat().st_mtime)
+            
+            to_remove = len(mutant_files) - max_to_keep
+            removed = 0
+            for f in mutant_files[:to_remove]:
+                try:
+                    f.unlink()
+                    removed += 1
+                except Exception:
+                    pass
+            
+            if removed > 0:
+                print(f"[DISK] Cleaned up {removed} old pending mutants")
+            return removed
+        except Exception as e:
+            print(f"[DISK] Error cleaning pending mutants: {e}", file=sys.stderr)
+            return 0
     
     def _compute_time_remaining(self, job_start_time: float, stop_buffer_minutes: int) -> int:
         GITHUB_TIMEOUT = 21600
@@ -636,14 +740,20 @@ class CoverageGuidedFuzzer:
         print(f"[STATUS] ═══════════════════════════════════════════════════════")
         print(f"[STATUS] Time: {elapsed:.0f}s elapsed, {remaining:.0f}s remaining ({elapsed/60:.1f}m / {(elapsed+remaining)/60:.1f}m)")
         print(f"[STATUS] Resources: CPU {cpu_avg:.1f}%, Mem {mem_used_gb:.1f}GB used / {mem_avail_gb:.1f}GB avail [{resource_status}]")
-        print(f"[STATUS] Queue: {queue_size} items pending")
+        print(f"[STATUS] Queue: {queue_size} total ({self._get_high_queue_size()} HIGH, {self._get_low_queue_size()} LOW)")
         print(f"[STATUS] Workers: {len(active_workers)} active, {len(idle_workers)} idle")
         
         for w_id, test in active_workers:
             print(f"[STATUS]   Worker {w_id}: {test}")
         
+        # Disk space info
+        free_mb = self._get_free_disk_space_mb()
+        pending_mutants = self._count_pending_mutants()
+        
         print(f"[STATUS] Coverage: {total_edges} total edges, {self._get_stat('total_new_edges')} new this run")
-        print(f"[STATUS] Mutants: {self._get_stat('mutants_created')} created, {self._get_stat('mutants_with_new_coverage')} with new coverage")
+        print(f"[STATUS] Mutants: {self._get_stat('mutants_created')} created | {self._get_stat('mutants_with_new_coverage')} new cov | {self._get_stat('mutants_with_existing_coverage')} exist cov")
+        print(f"[STATUS] Discarded: {self._get_stat('mutants_discarded_no_coverage')} no-cov | {self._get_stat('mutants_discarded_disk_space')} disk-limit")
+        print(f"[STATUS] Disk: {free_mb:.0f}MB free, {pending_mutants} pending mutants (max: {self.max_pending_mutants})")
         print(f"[STATUS] Tests: {self._get_stat('tests_processed')} processed, {len(self.excluded_tests)} excluded ({self._get_stat('tests_removed_unsupported')} unsupported, {self._get_stat('tests_removed_timeout')} timeout)")
         print(f"[STATUS] Generations: {self._get_stat('generations_completed')} completed")
         print(f"[STATUS] Bugs: {self._get_stat('bugs_found')} found")
@@ -1069,36 +1179,84 @@ class CoverageGuidedFuzzer:
                     total_edges_after = total_edges_before + new_edges
                     print(f"[WORKER {worker_id}] [COV] Test: {test_name} | gen:{generation} | hit:{edges_hit} | new:{new_edges} | total:{total_edges_after}")
                     
+                    # Decide what to do with mutants based on coverage
+                    # Priority formula: base_priority + runtime
+                    #   - NEW coverage: base=0, so priority = runtime (fast tests first)
+                    #   - EXISTING coverage: base=1000, so priority = 1000 + runtime (always after NEW)
+                    # This preserves runtime-based ordering within each coverage category
                     if has_new:
                         self._inc_stat('total_new_edges', new_edges)
+                        priority = runtime  # Fast tests with new coverage first
+                        coverage_type = "NEW"
                         print(f"[WORKER {worker_id}] ✨ New coverage found: {new_edges} edges (total now: {total_edges_after})")
-                        
-                        mutants_to_queue = []
-                        print(f"[WORKER {worker_id}] [MUTANT] Processing {len(mutant_files)} mutant(s) from {test_name} (gen {generation})")
-                        for mutant_file in mutant_files:
-                            try:
-                                pending_name = f"gen{generation+1}_w{worker_id}_{mutant_file.name}"
-                                pending_path = self.pending_mutants_dir / pending_name
-                                shutil.move(str(mutant_file), str(pending_path))
-                                mutants_to_queue.append((runtime, generation + 1, pending_path))
-                                self._inc_stat('mutants_created')
-                            except Exception as e:
-                                print(f"[WORKER {worker_id}] Warning: Failed to move mutant {mutant_file}: {e}", file=sys.stderr)
-                        
-                        if mutants_to_queue:
-                            self._inc_stat('mutants_with_new_coverage')
-                            queue_size_before = self._get_queue_size()
-                            for mutant_item in mutants_to_queue:
-                                self._queue_push(mutant_item)
-                            print(f"[WORKER {worker_id}] [QUEUE] Added {len(mutants_to_queue)} mutant(s) to queue (queue size: {queue_size_before} -> {self._get_queue_size()})")
+                    elif edges_hit > 0:
+                        priority = 1000.0 + runtime  # Existing coverage, but still prefer fast tests
+                        coverage_type = "EXISTING"
+                        print(f"[WORKER {worker_id}] Coverage hit (existing): {edges_hit} edges")
                     else:
+                        # No coverage at all - discard mutants
                         if mutant_files:
-                            print(f"[WORKER {worker_id}] [MUTANT] No new coverage, discarding {len(mutant_files)} mutant(s)")
+                            print(f"[WORKER {worker_id}] [MUTANT] No coverage at all, discarding {len(mutant_files)} mutant(s)")
+                            self._inc_stat('mutants_discarded_no_coverage', len(mutant_files))
                         for mutant_file in mutant_files:
                             try:
                                 mutant_file.unlink()
                             except Exception:
                                 pass
+                        # Skip to next test
+                        coverage_type = None
+                    
+                    # Process mutants if they hit any coverage
+                    if coverage_type is not None and mutant_files:
+                        # Check disk space before queuing (TOP PRIORITY)
+                        can_queue = self._can_queue_mutants(len(mutant_files))
+                        
+                        if not can_queue:
+                            # Disk space or pending limit exceeded
+                            free_mb = self._get_free_disk_space_mb()
+                            pending = self._count_pending_mutants()
+                            
+                            if coverage_type == "NEW":
+                                # For new coverage, try cleanup first
+                                self._cleanup_old_pending_mutants(self.max_pending_mutants // 2)
+                                can_queue = self._can_queue_mutants(len(mutant_files))
+                            
+                            if not can_queue:
+                                print(f"[WORKER {worker_id}] [DISK] Cannot queue mutants: free={free_mb:.0f}MB, pending={pending}, discarding {len(mutant_files)}")
+                                self._inc_stat('mutants_discarded_disk_space', len(mutant_files))
+                                for mutant_file in mutant_files:
+                                    try:
+                                        mutant_file.unlink()
+                                    except Exception:
+                                        pass
+                                coverage_type = None  # Skip queuing
+                        
+                        if coverage_type is not None:
+                            mutants_to_queue = []
+                            print(f"[WORKER {worker_id}] [MUTANT] Processing {len(mutant_files)} mutant(s) from {test_name} ({coverage_type} coverage, priority={priority})")
+                            
+                            for mutant_file in mutant_files:
+                                try:
+                                    pending_name = f"gen{generation+1}_w{worker_id}_{mutant_file.name}"
+                                    pending_path = self.pending_mutants_dir / pending_name
+                                    shutil.move(str(mutant_file), str(pending_path))
+                                    mutants_to_queue.append((priority, generation + 1, pending_path))
+                                    self._inc_stat('mutants_created')
+                                except Exception as e:
+                                    print(f"[WORKER {worker_id}] Warning: Failed to move mutant {mutant_file}: {e}", file=sys.stderr)
+                            
+                            if mutants_to_queue:
+                                is_high_priority = (coverage_type == "NEW")
+                                if is_high_priority:
+                                    self._inc_stat('mutants_with_new_coverage')
+                                else:
+                                    self._inc_stat('mutants_with_existing_coverage')
+                                
+                                queue_size_before = self._get_queue_size()
+                                high_before = self._get_high_queue_size()
+                                for mutant_item in mutants_to_queue:
+                                    self._queue_push(mutant_item, high_priority=is_high_priority)
+                                print(f"[WORKER {worker_id}] [QUEUE] Added {len(mutants_to_queue)} mutant(s) ({coverage_type}) to {'HIGH' if is_high_priority else 'LOW'} queue (total: {queue_size_before} -> {self._get_queue_size()}, high: {high_before} -> {self._get_high_queue_size()})")
                     
                     # Delete executed mutant if it's from pending folder
                     test_path_obj = test_path if isinstance(test_path, Path) else Path(test_path)
@@ -1154,6 +1312,8 @@ class CoverageGuidedFuzzer:
         print(f"Workers: {self.num_workers}")
         print(f"Solvers: z3={self.z3_cmd}, cvc5={self.cvc5_path}")
         print(f"Output directory: {self.output_dir}")
+        print(f"Disk limits: max_pending={self.max_pending_mutants}, min_free={self.min_disk_space_mb}MB")
+        print(f"Free disk space: {self._get_free_disk_space_mb():.0f}MB")
         print()
         
         # Initialize priority queue with initial tests (runtime=0 for initial tests)
@@ -1284,8 +1444,16 @@ class CoverageGuidedFuzzer:
         print(f"  Total edges covered: {total_edges}")
         print(f"  Total new edges found: {self._get_stat('total_new_edges')}")
         print(f"  Mutants with new coverage: {self._get_stat('mutants_with_new_coverage')}")
+        print(f"  Mutants with existing coverage: {self._get_stat('mutants_with_existing_coverage')}")
         print(f"  Mutants created: {self._get_stat('mutants_created')}")
         print(f"  Generations completed: {self._get_stat('generations_completed')}")
+        
+        print()
+        print("Mutant Management:")
+        print(f"  Discarded (no coverage): {self._get_stat('mutants_discarded_no_coverage')}")
+        print(f"  Discarded (disk space): {self._get_stat('mutants_discarded_disk_space')}")
+        print(f"  Final pending mutants: {self._count_pending_mutants()}")
+        print(f"  Final free disk space: {self._get_free_disk_space_mb():.0f}MB")
         
         print()
         print("Fuzzing Statistics:")
@@ -1306,7 +1474,10 @@ class CoverageGuidedFuzzer:
                 'total_edges': total_edges,
                 'total_new_edges': self._get_stat('total_new_edges'),
                 'mutants_with_new_coverage': self._get_stat('mutants_with_new_coverage'),
+                'mutants_with_existing_coverage': self._get_stat('mutants_with_existing_coverage'),
                 'mutants_created': self._get_stat('mutants_created'),
+                'mutants_discarded_no_coverage': self._get_stat('mutants_discarded_no_coverage'),
+                'mutants_discarded_disk_space': self._get_stat('mutants_discarded_disk_space'),
                 'generations_completed': self._get_stat('generations_completed'),
                 'tests_processed': self._get_stat('tests_processed'),
                 'bugs_found': self._get_stat('bugs_found'),
@@ -1474,14 +1645,26 @@ def main():
     parser.add_argument(
         "--iterations",
         type=int,
-        default=1,
-        help="Number of iterations per test (default: 1 for coverage-guided)",
+        default=20,
+        help="Number of iterations per test (default: 20 for batched efficiency)",
     )
     parser.add_argument(
         "--modulo",
         type=int,
         default=2,
         help="Modulo parameter for typefuzz -m flag (default: 2)",
+    )
+    parser.add_argument(
+        "--max-pending-mutants",
+        type=int,
+        default=10000,
+        help="Maximum pending mutants to prevent disk exhaustion (default: 10000)",
+    )
+    parser.add_argument(
+        "--min-disk-space-mb",
+        type=int,
+        default=500,
+        help="Minimum free disk space in MB before stopping mutant queueing (default: 500)",
     )
     parser.add_argument(
         "--seed",
@@ -1571,6 +1754,8 @@ def main():
             job_id=args.job_id,
             profraw_dir=args.profraw_dir,
             output_dir=args.output_dir,
+            max_pending_mutants=args.max_pending_mutants,
+            min_disk_space_mb=args.min_disk_space_mb,
         )
         
         fuzzer.run()
