@@ -298,7 +298,7 @@ export LLVM_PROFILE_FILE="${PROFILE_DIR}/test-%p.profraw"
 
 # Create shared memory for edge coverage
 SHM_PATH="/dev/shm/afl_shm_${__AFL_SHM_ID}"
-dd if=/dev/zero of="$SHM_PATH" bs=65536 count=1 2>/dev/null
+dd if=/dev/zero of="$SHM_PATH" bs=1024 count=1 2>/dev/null
 
 echo ""
 echo "Running tests..."
@@ -315,8 +315,8 @@ if [ -f "$SHM_PATH" ]; then
     EDGES=$(python3 -c "
 import mmap
 with open('$SHM_PATH', 'rb') as f:
-    data = f.read(65536)
-    edges = sum(1 for i in range(65536) for b in range(8) if data[i] & (1 << b))
+    data = f.read(1024)
+    edges = sum(1 for i in range(1024) for b in range(8) if data[i] & (1 << b))
     print(edges)
 ")
     echo "Edges covered: $EDGES"

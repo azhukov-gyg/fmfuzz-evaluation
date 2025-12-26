@@ -16,8 +16,8 @@
 #include <cstdlib>
 #include <cstdio>
 
-// AFL++-style 64KB bitmap for edge coverage
-constexpr size_t BITMAP_SIZE = 65536;
+// AFL-style bitmap for edge coverage (1KB)
+constexpr size_t BITMAP_SIZE = 1024;
 
 // Global state
 static uint8_t* g_bitmap = nullptr;

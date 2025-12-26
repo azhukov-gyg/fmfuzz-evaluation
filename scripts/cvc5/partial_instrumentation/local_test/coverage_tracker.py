@@ -22,8 +22,8 @@ from typing import List, Dict, Set, Tuple
 from datetime import datetime
 
 
-# Bitmap size (AFL++ style)
-BITMAP_SIZE = 65536
+# Bitmap size (optimized)
+BITMAP_SIZE = 1024
 
 
 class CoverageTracker:
