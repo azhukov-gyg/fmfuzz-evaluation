@@ -53,7 +53,7 @@ class CoverageGuidedFuzzer:
         tests_root: str,
         bugs_folder: str = "bugs",
         num_workers: int = 4,
-        iterations: int = 20,  # Batched iterations for efficiency (amortize process startup)
+        iterations: int = 5,
         modulo: int = 2,
         max_pending_mutants: int = 10000,  # Disk space protection
         min_disk_space_mb: int = 500,  # Minimum free disk space to continue
@@ -66,6 +66,7 @@ class CoverageGuidedFuzzer:
         profraw_dir: str = "./profraw",
         profdata_merge_interval: int = 100,
         output_dir: str = "./output",
+        total_instrumented_edges: int = 0,  # From coverage agent
     ):
         self.tests = tests
         self.tests_root = Path(tests_root)
@@ -78,6 +79,7 @@ class CoverageGuidedFuzzer:
         self.output_dir = Path(output_dir)
         self.max_pending_mutants = max_pending_mutants
         self.min_disk_space_mb = min_disk_space_mb
+        self.total_instrumented_edges = total_instrumented_edges
         
         try:
             self.cpu_count = psutil.cpu_count()
@@ -1469,10 +1471,13 @@ class CoverageGuidedFuzzer:
         
         # Save coverage statistics to output file
         stats_output = self.output_dir / "coverage_stats.json"
+        coverage_pct = (total_edges / self.total_instrumented_edges * 100) if self.total_instrumented_edges > 0 else 0
         with open(stats_output, 'w') as f:
             json.dump({
-                'total_edges': total_edges,
-                'total_new_edges': self._get_stat('total_new_edges'),
+                'total_instrumented_edges': self.total_instrumented_edges,
+                'edges_covered': total_edges,
+                'coverage_percentage': round(coverage_pct, 2),
+                'new_edges_discovered': self._get_stat('total_new_edges'),
                 'mutants_with_new_coverage': self._get_stat('mutants_with_new_coverage'),
                 'mutants_with_existing_coverage': self._get_stat('mutants_with_existing_coverage'),
                 'mutants_created': self._get_stat('mutants_created'),
@@ -1645,8 +1650,8 @@ def main():
     parser.add_argument(
         "--iterations",
         type=int,
-        default=20,
-        help="Number of iterations per test (default: 20 for batched efficiency)",
+        default=5,
+        help="Number of iterations per test (default: 5)",
     )
     parser.add_argument(
         "--modulo",
@@ -1710,6 +1715,12 @@ def main():
         default=60.0,
         help="Fuzzing duration in minutes (default: 60.0)",
     )
+    parser.add_argument(
+        "--total-edges",
+        type=int,
+        default=0,
+        help="Total instrumented edges (from coverage agent, 0 = unknown)",
+    )
     
     args = parser.parse_args()
     
@@ -1756,6 +1767,7 @@ def main():
             output_dir=args.output_dir,
             max_pending_mutants=args.max_pending_mutants,
             min_disk_space_mb=args.min_disk_space_mb,
+            total_instrumented_edges=args.total_edges,
         )
         
         fuzzer.run()

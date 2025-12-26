@@ -22,6 +22,7 @@ constexpr size_t BITMAP_SIZE = 1024;
 // Global state
 static uint8_t* g_bitmap = nullptr;
 static int g_shm_fd = -1;
+static uint32_t g_total_edges = 0;  // Total instrumented edges
 
 // Initialize shared memory bitmap
 __attribute__((no_sanitize("coverage")))
@@ -56,6 +57,9 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t* start, uint32_t* stop) {
     for (uint32_t* x = start; x < stop; x++) {
         *x = ++guard_id;
     }
+    
+    // Update total edges count
+    g_total_edges = guard_id;
 
     if (!g_bitmap) {
         // Try AFL++ shared memory first
@@ -93,23 +97,17 @@ static void init_coverage_agent() {
             char shm_name[64];
             snprintf(shm_name, sizeof(shm_name), "/afl_shm_%s", shm_id);
             init_shm(shm_name);
-            // Debug: verify our coverage agent is being used (not LLVM's runtime)
-            if (getenv("COVERAGE_AGENT_DEBUG")) {
-                fprintf(stderr, "[coverage_agent] Initialized SHM: %s (bitmap=%p)\n", 
-                        shm_name, (void*)g_bitmap);
-            }
         } else {
             const char* shm_name = getenv("COVERAGE_SHM_NAME");
             if (shm_name) {
                 init_shm(shm_name);
-                if (getenv("COVERAGE_AGENT_DEBUG")) {
-                    fprintf(stderr, "[coverage_agent] Initialized custom SHM: %s (bitmap=%p)\n",
-                            shm_name, (void*)g_bitmap);
-                }
-            } else if (getenv("COVERAGE_AGENT_DEBUG")) {
-                fprintf(stderr, "[coverage_agent] No SHM configured (__AFL_SHM_ID or COVERAGE_SHM_NAME not set)\n");
             }
         }
+    }
+    
+    // Debug output (set COVERAGE_AGENT_DEBUG=1 to see total edges)
+    if (getenv("COVERAGE_AGENT_DEBUG")) {
+        fprintf(stderr, "[coverage_agent] total_edges=%u\n", g_total_edges);
     }
 }
 

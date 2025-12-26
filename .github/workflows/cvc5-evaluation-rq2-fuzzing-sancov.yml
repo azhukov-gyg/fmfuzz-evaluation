@@ -368,6 +368,7 @@ jobs:
           ls -la cvc5/build/bin/cvc5
       
       - name: Verify instrumentation
+        id: verify-instrumentation
         run: |
           echo "=== Verifying instrumentation ==="
           SANCOV_SYM=$(nm cvc5/build/bin/cvc5 2>/dev/null | grep -c "__sanitizer_cov" || echo "0")
@@ -375,8 +376,12 @@ jobs:
           echo "Sancov symbols: $SANCOV_SYM"
           echo "PGO symbols: $PGO_SYM"
           
-          # Quick test
-          cvc5/build/bin/cvc5 --version
+          # Count total instrumented edges from coverage agent debug output
+          echo "=== Counting total instrumented edges ==="
+          TOTAL_EDGES=$(COVERAGE_AGENT_DEBUG=1 cvc5/build/bin/cvc5 --version 2>&1 | grep -oP 'total_edges=\K\d+' || echo "0")
+          echo "Total instrumented edges: $TOTAL_EDGES"
+          echo "total_edges=${TOTAL_EDGES}" >> $GITHUB_OUTPUT
+          
           echo "✅ Binary works"
       
       - name: Verify solvers
@@ -388,19 +393,22 @@ jobs:
         working-directory: cvc5
         run: |
           FUZZING_DURATION="${{ inputs.fuzzing_duration_minutes || 60 }}"
+          TOTAL_EDGES="${{ steps.verify-instrumentation.outputs.total_edges }}"
           
           mkdir -p output profraw bugs
           
           echo "=== Starting coverage-guided fuzzing ==="
           echo "Duration: ${FUZZING_DURATION} minutes"
           echo "Workers: 4"
+          echo "Total instrumented edges: ~${TOTAL_EDGES}"
           
           python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/coverage_guided_fuzzer.py \
             --tests-file ../${{ steps.extract-tests.outputs.tests_file }} \
             --job-id '${{ matrix.job_id }}' \
             --tests-root 'test/regress/cli' \
             --fuzzing-duration-minutes ${FUZZING_DURATION} \
-            --iterations 20 \
+            --iterations 5 \
+            --total-edges ${TOTAL_EDGES} \
             --cvc5-path ./build/bin/cvc5 \
             --workers 4 \
             --bugs-folder ./bugs \
@@ -408,7 +416,6 @@ jobs:
             --profraw-dir ./profraw || true
           
           echo "=== Fuzzing complete ==="
-          echo "Coverage stats:"
           cat ./output/coverage_stats.json || echo "No coverage stats"
       
       - name: Extract function counts from PGO data
