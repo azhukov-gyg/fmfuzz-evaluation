@@ -945,6 +945,9 @@ class CoverageGuidedFuzzer:
                 shutil.copy(mutant_path, bug_path)
                 bug_files.append(bug_path)
         
+        # Explicit cleanup to prevent ANTLR memory leak
+        del mutator
+        
         return (0, bug_files, time.time() - start_time, mutant_files)
     
     def _run_typefuzz(
@@ -1104,6 +1107,10 @@ class CoverageGuidedFuzzer:
         """
         print(f"[WORKER {worker_id}] Started")
         
+        # Counter for periodic GC
+        tests_since_gc = 0
+        GC_INTERVAL = 50  # Force GC every N tests
+        
         # Create per-worker folders
         scratch_folder = self.output_dir / f"scratch_{worker_id}"
         log_folder = self.output_dir / f"logs_{worker_id}"
@@ -1197,6 +1204,12 @@ class CoverageGuidedFuzzer:
                     # Handle exit code
                     action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
                     self._inc_stat('tests_processed')
+                    
+                    # Periodic garbage collection to prevent memory bloat
+                    tests_since_gc += 1
+                    if tests_since_gc >= GC_INTERVAL:
+                        gc.collect()
+                        tests_since_gc = 0
                     
                     # Track excluded seed tests (unsupported/timeout) to avoid re-adding on refill
                     if action == 'remove' and generation == 0:
