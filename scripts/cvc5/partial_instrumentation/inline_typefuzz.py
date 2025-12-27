@@ -57,12 +57,10 @@ class InlineTypeFuzz:
             return False
     
     def mutate(self) -> Tuple[Optional[str], bool]:
-        """Generate one mutant. Returns (formula_str, success)."""
+        """Generate one mutant. Mutations are cumulative (like yinyang)."""
         if not self._mutator:
             return None, False
         try:
-            formula_copy = copy.deepcopy(self._formula)
-            self._mutator.formula = formula_copy
             mutant, success, _ = self._mutator.mutate()
             if success:
                 return self._header + str(mutant), True
