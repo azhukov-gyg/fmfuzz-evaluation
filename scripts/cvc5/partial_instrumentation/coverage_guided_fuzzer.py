@@ -49,9 +49,10 @@ class CoverageGuidedFuzzer:
         'memory_critical_available_gb': 0.5,
         'check_interval': 2,
         'pause_duration': 10,
-        'max_process_memory_mb': 2048,
-        'max_process_memory_mb_warning': 1536,
+        'max_process_memory_mb': 4096,
+        'max_process_memory_mb_warning': 3072,
         'z3_memory_limit_mb': 2048,
+        'max_tests_per_worker': 200,  # Restart worker after N tests to prevent memory leaks
     }
     
     def __init__(
@@ -1107,9 +1108,11 @@ class CoverageGuidedFuzzer:
         """
         print(f"[WORKER {worker_id}] Started")
         
-        # Counter for periodic GC
+        # Counter for periodic GC and worker restart
+        tests_processed_this_worker = 0
         tests_since_gc = 0
-        GC_INTERVAL = 50  # Force GC every N tests
+        GC_INTERVAL = 50
+        MAX_TESTS = self.RESOURCE_CONFIG['max_tests_per_worker']
         
         # Create per-worker folders
         scratch_folder = self.output_dir / f"scratch_{worker_id}"
@@ -1207,9 +1210,15 @@ class CoverageGuidedFuzzer:
                     
                     # Periodic garbage collection to prevent memory bloat
                     tests_since_gc += 1
+                    tests_processed_this_worker += 1
                     if tests_since_gc >= GC_INTERVAL:
                         gc.collect()
                         tests_since_gc = 0
+                    
+                    # Exit worker after MAX_TESTS to prevent memory leaks
+                    if tests_processed_this_worker >= MAX_TESTS:
+                        print(f"[WORKER {worker_id}] Restarting after {MAX_TESTS} tests (memory leak prevention)")
+                        break
                     
                     # Track excluded seed tests (unsupported/timeout) to avoid re-adding on refill
                     if action == 'remove' and generation == 0:
@@ -1437,7 +1446,22 @@ class CoverageGuidedFuzzer:
             last_status_log = time.time()
             status_log_interval = 30  # Log status every 30 seconds
             
-            while any(w.is_alive() for w in workers):
+            while not self.shutdown_event.is_set():
+                # Restart dead workers (they exit after MAX_TESTS to prevent memory leaks)
+                for i, worker in enumerate(workers):
+                    if not worker.is_alive():
+                        worker_id = i + 1
+                        worker.join()  # Clean up
+                        new_worker = multiprocessing.Process(
+                            target=self._worker_process,
+                            args=(worker_id, global_coverage_map, coverage_map_lock)
+                        )
+                        new_worker.start()
+                        workers[i] = new_worker
+                        print(f"[INFO] Restarted worker {worker_id}")
+                
+                if not any(w.is_alive() for w in workers):
+                    break
                 if end_time and time.time() >= end_time:
                     print("⏰ Timeout reached, stopping workers...")
                     self.shutdown_event.set()
