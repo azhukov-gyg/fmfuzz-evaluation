@@ -111,7 +111,10 @@ def generate_sancov_allowlist(
         "# Sancov Allowlist - Auto-generated",
         "# Format: -fsanitize-coverage-allowlist=<this_file>",
         "#",
-        "# Functions to instrument (no src:* to avoid over-instrumentation)",
+        "# Source filter (required for fun: patterns to work)",
+        "src:*",
+        "",
+        "# Functions to instrument",
     ]
     
     # Add function entries
