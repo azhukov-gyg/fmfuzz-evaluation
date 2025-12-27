@@ -111,14 +111,8 @@ def generate_sancov_allowlist(
         "# Sancov Allowlist - Auto-generated",
         "# Format: -fsanitize-coverage-allowlist=<this_file>",
         "#",
-        "# Source filter (required!)",
+        "# Functions to instrument (no src:* to avoid over-instrumentation)",
     ]
-    
-    # Use src:* to allow all source files
-    # The fun: entries will limit which functions are instrumented
-    lines.append("src:*")
-    lines.append("")
-    lines.append("# Functions to instrument")
     
     # Add function entries
     for name in sorted(mangled_names):

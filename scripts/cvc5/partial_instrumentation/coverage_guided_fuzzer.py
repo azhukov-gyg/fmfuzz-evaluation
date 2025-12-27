@@ -23,6 +23,13 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Optional inline typefuzz
+try:
+    from inline_typefuzz import InlineTypeFuzz
+    INLINE_AVAILABLE = True
+except ImportError:
+    INLINE_AVAILABLE = False
+
 
 # AFL-style coverage map size (1KB bitmap)
 AFL_MAP_SIZE = 1024
@@ -53,7 +60,7 @@ class CoverageGuidedFuzzer:
         tests_root: str,
         bugs_folder: str = "bugs",
         num_workers: int = 4,
-        iterations: int = 5,
+        iterations: int = 1,
         modulo: int = 2,
         max_pending_mutants: int = 10000,  # Disk space protection
         min_disk_space_mb: int = 500,  # Minimum free disk space to continue
@@ -67,6 +74,7 @@ class CoverageGuidedFuzzer:
         profdata_merge_interval: int = 100,
         output_dir: str = "./output",
         total_instrumented_edges: int = 0,  # From coverage agent
+        use_inline_mode: bool = False,
     ):
         self.tests = tests
         self.tests_root = Path(tests_root)
@@ -80,6 +88,7 @@ class CoverageGuidedFuzzer:
         self.max_pending_mutants = max_pending_mutants
         self.min_disk_space_mb = min_disk_space_mb
         self.total_instrumented_edges = total_instrumented_edges
+        self.use_inline_mode = use_inline_mode and INLINE_AVAILABLE
         
         try:
             self.cpu_count = psutil.cpu_count()
@@ -890,6 +899,54 @@ class CoverageGuidedFuzzer:
             return []
         return list(folder.glob("*.smt2")) + list(folder.glob("*.smt"))
     
+    def _run_inline_typefuzz(
+        self,
+        test_path: Path,
+        worker_id: int,
+        scratch_folder: Path,
+        bugs_folder: Path,
+        shm_id: str,
+        timeout: int = 120,
+    ) -> Tuple[int, List[Path], float, List[Path]]:
+        """Run typefuzz inline (no subprocess). Returns (exit_code, bug_files, runtime, mutant_files)."""
+        if not test_path.exists():
+            return (1, [], 0.0, [])
+        
+        scratch_folder.mkdir(parents=True, exist_ok=True)
+        bugs_folder.mkdir(parents=True, exist_ok=True)
+        
+        start_time = time.time()
+        bug_files, mutant_files = [], []
+        
+        mutator = InlineTypeFuzz(test_path)
+        if not mutator.parse():
+            return (0, [], time.time() - start_time, [])
+        
+        env = os.environ.copy()
+        env['__AFL_SHM_ID'] = shm_id
+        env['LLVM_PROFILE_FILE'] = str(self.profraw_dir / f"worker_{worker_id}_%p_%m.profraw")
+        env['ASAN_OPTIONS'] = 'abort_on_error=0:detect_leaks=0'
+        
+        z3_cmd, cvc5_cmd = self._get_solver_clis(test_path).split(";")
+        
+        for i in range(self.iterations):
+            formula_str, success = mutator.mutate()
+            if not success:
+                continue
+            
+            mutant_path = scratch_folder / f"mutant_{worker_id}_{i}.smt2"
+            with open(mutant_path, 'w') as f:
+                f.write(formula_str)
+            mutant_files.append(mutant_path)
+            
+            is_bug, bug_type = mutator.run_solvers(mutant_path, z3_cmd, cvc5_cmd, timeout, env)
+            if is_bug:
+                bug_path = bugs_folder / f"bug_{worker_id}_{i}.smt2"
+                shutil.copy(mutant_path, bug_path)
+                bug_files.append(bug_path)
+        
+        return (0, bug_files, time.time() - start_time, mutant_files)
+    
     def _run_typefuzz(
         self,
         test_path: Path,
@@ -1122,18 +1179,20 @@ class CoverageGuidedFuzzer:
                     shm.write(b'\x00' * AFL_MAP_SIZE)
                     shm.seek(0)
                     
-                    # Run typefuzz
+                    # Run typefuzz (inline or subprocess)
                     time_remaining = self._get_time_remaining()
-                    exit_code, bug_files, runtime, mutant_files = self._run_typefuzz(
-                        test_path if isinstance(test_path, Path) else Path(test_path),
-                        worker_id,
-                        scratch_folder,
-                        log_folder,
-                        bugs_folder,
-                        shm_id,
-                        per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
-                        keep_mutants=True,
-                    )
+                    test_path_obj = test_path if isinstance(test_path, Path) else Path(test_path)
+                    
+                    if self.use_inline_mode:
+                        exit_code, bug_files, runtime, mutant_files = self._run_inline_typefuzz(
+                            test_path_obj, worker_id, scratch_folder, bugs_folder, shm_id,
+                        )
+                    else:
+                        exit_code, bug_files, runtime, mutant_files = self._run_typefuzz(
+                            test_path_obj, worker_id, scratch_folder, log_folder, bugs_folder, shm_id,
+                            per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
+                            keep_mutants=True,
+                        )
                     
                     # Handle exit code
                     action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
@@ -1721,6 +1780,11 @@ def main():
         default=0,
         help="Total instrumented edges (from coverage agent, 0 = unknown)",
     )
+    parser.add_argument(
+        "--inline",
+        action="store_true",
+        help="Use inline typefuzz (faster, no subprocess)",
+    )
     
     args = parser.parse_args()
     
@@ -1768,6 +1832,7 @@ def main():
             max_pending_mutants=args.max_pending_mutants,
             min_disk_space_mb=args.min_disk_space_mb,
             total_instrumented_edges=args.total_edges,
+            use_inline_mode=args.inline,
         )
         
         fuzzer.run()

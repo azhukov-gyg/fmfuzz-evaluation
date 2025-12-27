@@ -407,7 +407,7 @@ jobs:
             --job-id '${{ matrix.job_id }}' \
             --tests-root 'test/regress/cli' \
             --fuzzing-duration-minutes ${FUZZING_DURATION} \
-            --iterations 5 \
+            --iterations 1 \
             --total-edges ${TOTAL_EDGES} \
             --cvc5-path ./build/bin/cvc5 \
             --workers 4 \
