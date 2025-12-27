@@ -1447,21 +1447,7 @@ class CoverageGuidedFuzzer:
             status_log_interval = 30  # Log status every 30 seconds
             
             while not self.shutdown_event.is_set():
-                # Restart dead workers (they exit after MAX_TESTS to prevent memory leaks)
-                for i, worker in enumerate(workers):
-                    if not worker.is_alive():
-                        worker_id = i + 1
-                        worker.join()  # Clean up
-                        new_worker = multiprocessing.Process(
-                            target=self._worker_process,
-                            args=(worker_id, global_coverage_map, coverage_map_lock)
-                        )
-                        new_worker.start()
-                        workers[i] = new_worker
-                        print(f"[INFO] Restarted worker {worker_id}")
-                
-                if not any(w.is_alive() for w in workers):
-                    break
+                # Check timeout first
                 if end_time and time.time() >= end_time:
                     print("⏰ Timeout reached, stopping workers...")
                     self.shutdown_event.set()
@@ -1488,6 +1474,19 @@ class CoverageGuidedFuzzer:
                         self._inc_stat('generations_completed')
                     
                     last_refill_check = current_time
+                
+                # Restart dead workers (they exit after MAX_TESTS to prevent memory leaks)
+                for i, worker in enumerate(workers):
+                    if not worker.is_alive():
+                        worker_id = i + 1
+                        worker.join()
+                        new_worker = multiprocessing.Process(
+                            target=self._worker_process,
+                            args=(worker_id, global_coverage_map, coverage_map_lock)
+                        )
+                        new_worker.start()
+                        workers[i] = new_worker
+                        print(f"[INFO] Restarted worker {worker_id}")
                 
                 time.sleep(0.5)
         
