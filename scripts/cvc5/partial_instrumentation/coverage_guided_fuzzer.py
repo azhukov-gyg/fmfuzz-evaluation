@@ -466,6 +466,8 @@ class CoverageGuidedFuzzer:
             
             killed_count = 0
             for pid in tracked_pids:
+                if pid == main_pid:
+                    continue  # Never kill the main fuzzer process
                 try:
                     proc = psutil.Process(pid)
                     rss_mb = proc.memory_info().rss / (1024 * 1024)
