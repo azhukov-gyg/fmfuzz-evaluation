@@ -1435,7 +1435,7 @@ class CoverageGuidedFuzzer:
         
         # Signal handlers
         def signal_handler(signum, frame):
-            print("\n⏰ Shutdown signal received, stopping workers...")
+            print(f"\n⏰ Shutdown signal received (signal {signum}), stopping workers...")
             self.shutdown_event.set()
         
         signal.signal(signal.SIGTERM, signal_handler)
@@ -1449,7 +1449,7 @@ class CoverageGuidedFuzzer:
             status_log_interval = 30  # Log status every 30 seconds
             
             while not self.shutdown_event.is_set():
-                # Check timeout first
+                # Check timeout
                 if end_time and time.time() >= end_time:
                     print("⏰ Timeout reached, stopping workers...")
                     self.shutdown_event.set()
@@ -1481,6 +1481,7 @@ class CoverageGuidedFuzzer:
                 for i, worker in enumerate(workers):
                     if not worker.is_alive():
                         worker_id = i + 1
+                        print(f"[DEBUG] Worker {worker_id} dead, restarting...")
                         worker.join()
                         new_worker = multiprocessing.Process(
                             target=self._worker_process,
@@ -1495,6 +1496,13 @@ class CoverageGuidedFuzzer:
         except KeyboardInterrupt:
             print("\n⏰ Interrupted, stopping workers...")
             self.shutdown_event.set()
+        except Exception as e:
+            print(f"\n❌ Main loop exception: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            self.shutdown_event.set()
+        
+        print(f"[DEBUG] Main loop exited. shutdown_event={self.shutdown_event.is_set()}, time_remaining={self._get_time_remaining():.1f}s")
         
         # Wait for workers to finish
         for worker in workers:
