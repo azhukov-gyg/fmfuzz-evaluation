@@ -755,7 +755,17 @@ class CoverageGuidedFuzzer:
         print(f"[STATUS] Time: {elapsed:.0f}s elapsed, {remaining:.0f}s remaining ({elapsed/60:.1f}m / {(elapsed+remaining)/60:.1f}m)")
         print(f"[STATUS] Resources: CPU {cpu_avg:.1f}%, Mem {mem_used_gb:.1f}GB used / {mem_avail_gb:.1f}GB avail [{resource_status}]")
         print(f"[STATUS] Queue: {queue_size} total ({self._get_high_queue_size()} HIGH, {self._get_low_queue_size()} LOW)")
-        print(f"[STATUS] Workers: {len(active_workers)} active, {len(idle_workers)} idle")
+        # Check actual process alive status
+        workers_alive = 0
+        workers_dead = 0
+        if hasattr(self, 'workers'):
+            for w in self.workers:
+                if w.is_alive():
+                    workers_alive += 1
+                else:
+                    workers_dead += 1
+        
+        print(f"[STATUS] Workers: {len(active_workers)} active, {len(idle_workers)} idle (alive: {workers_alive}, dead: {workers_dead})")
         
         for w_id, test in active_workers:
             print(f"[STATUS]   Worker {w_id}: {test}")
@@ -1444,8 +1454,7 @@ class CoverageGuidedFuzzer:
         # Handle common termination signals
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
-        # Ignore SIGCHLD to prevent child process signals from affecting main loop
-        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        # Note: Don't ignore SIGCHLD - it breaks is_alive() detection
         
         # Main loop: monitor workers and refill queue when needed
         try:
@@ -1485,17 +1494,18 @@ class CoverageGuidedFuzzer:
                 
                 # Restart dead workers (they exit after MAX_TESTS to prevent memory leaks)
                 for i, worker in enumerate(workers):
-                    if not worker.is_alive():
+                    alive = worker.is_alive()
+                    if not alive:
                         worker_id = i + 1
-                        print(f"[DEBUG] Worker {worker_id} dead, restarting...")
-                        worker.join()
+                        print(f"[INFO] Worker {worker_id} (pid={worker.pid}) is dead, restarting...", flush=True)
+                        worker.join(timeout=1)
                         new_worker = multiprocessing.Process(
                             target=self._worker_process,
                             args=(worker_id, global_coverage_map, coverage_map_lock)
                         )
                         new_worker.start()
                         workers[i] = new_worker
-                        print(f"[INFO] Restarted worker {worker_id}")
+                        print(f"[INFO] Restarted worker {worker_id} (new pid={new_worker.pid})", flush=True)
                 
                 time.sleep(0.5)
         
