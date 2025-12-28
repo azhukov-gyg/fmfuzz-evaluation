@@ -402,13 +402,14 @@ jobs:
           echo "Workers: 4"
           echo "Total instrumented edges: ~${TOTAL_EDGES}"
           
-          # TEST: Run WITHOUT --inline to check if signal issue is inline-specific
-          python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/coverage_guided_fuzzer.py \
+          # Use setsid to isolate fuzzer from shell signals (fixes inline mode SIGINT issue)
+          setsid python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/coverage_guided_fuzzer.py \
             --tests-file ../${{ steps.extract-tests.outputs.tests_file }} \
             --job-id '${{ matrix.job_id }}' \
             --tests-root 'test/regress/cli' \
             --fuzzing-duration-minutes ${FUZZING_DURATION} \
             --iterations 1 \
+            --inline \
             --total-edges ${TOTAL_EDGES} \
             --cvc5-path ./build/bin/cvc5 \
             --workers 4 \
