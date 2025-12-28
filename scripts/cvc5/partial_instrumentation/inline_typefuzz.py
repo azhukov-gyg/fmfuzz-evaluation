@@ -103,7 +103,7 @@ class InlineTypeFuzz:
             try:
                 r = subprocess.run(cmd.split() + [str(mutant_path)], 
                                    capture_output=True, text=True, timeout=timeout, 
-                                   env=env, shell=False)
+                                   env=env, shell=False, start_new_session=True)
                 stdout, stderr, exitcode = r.stdout, r.stderr, r.returncode
             except subprocess.TimeoutExpired as te:
                 # Match yinyang: timeout = exitcode 137

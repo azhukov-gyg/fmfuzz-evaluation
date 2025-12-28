@@ -1451,10 +1451,9 @@ class CoverageGuidedFuzzer:
             sys.stderr.flush()
             self.shutdown_event.set()
         
-        # Handle common termination signals
+        # Handle termination signals
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
-        # Note: Don't ignore SIGCHLD - it breaks is_alive() detection
         
         # Main loop: monitor workers and refill queue when needed
         try:
