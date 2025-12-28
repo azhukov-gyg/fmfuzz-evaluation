@@ -1435,11 +1435,17 @@ class CoverageGuidedFuzzer:
         
         # Signal handlers
         def signal_handler(signum, frame):
-            print(f"\n⏰ Shutdown signal received (signal {signum}), stopping workers...")
+            sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+            print(f"\n⏰ Signal {sig_name} ({signum}) received, stopping workers...", flush=True)
+            sys.stdout.flush()
+            sys.stderr.flush()
             self.shutdown_event.set()
         
+        # Handle common termination signals
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
+        # Ignore SIGCHLD to prevent child process signals from affecting main loop
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
         
         # Main loop: monitor workers and refill queue when needed
         try:
@@ -1502,7 +1508,21 @@ class CoverageGuidedFuzzer:
             traceback.print_exc(file=sys.stderr)
             self.shutdown_event.set()
         
-        print(f"[DEBUG] Main loop exited. shutdown_event={self.shutdown_event.is_set()}, time_remaining={self._get_time_remaining():.1f}s")
+        # Detailed exit diagnostics
+        print(f"\n{'='*60}", flush=True)
+        print(f"[DEBUG] MAIN LOOP EXIT DIAGNOSTICS", flush=True)
+        print(f"[DEBUG]   shutdown_event: {self.shutdown_event.is_set()}", flush=True)
+        print(f"[DEBUG]   time_remaining: {self._get_time_remaining():.1f}s", flush=True)
+        print(f"[DEBUG]   queue_size: {self._get_queue_size()} (high: {self._get_high_queue_size()}, low: {self._low_queue_size.value})", flush=True)
+        print(f"[DEBUG]   tests_processed: {self._get_stat('tests_processed')}", flush=True)
+        print(f"[DEBUG]   bugs_found: {self._get_stat('bugs_found')}", flush=True)
+        print(f"[DEBUG]   workers_alive: {sum(1 for w in workers if w.is_alive())}/{len(workers)}", flush=True)
+        for i, w in enumerate(workers):
+            status = self.worker_status.get(i+1, 'unknown')
+            print(f"[DEBUG]   worker_{i+1}: alive={w.is_alive()}, pid={w.pid}, status={status}", flush=True)
+        print(f"{'='*60}", flush=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
         
         # Wait for workers to finish
         for worker in workers:
