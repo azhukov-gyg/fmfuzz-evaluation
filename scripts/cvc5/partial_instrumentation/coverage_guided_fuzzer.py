@@ -1028,9 +1028,9 @@ class CoverageGuidedFuzzer:
                 print(f"[WORKER {worker_id}] [PGO DEBUG] LLVM_PROFILE_FILE={profraw_pattern}, profraw_files_before={profraw_before}")
             
             if per_test_timeout and per_test_timeout > 0:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=per_test_timeout, env=env)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=per_test_timeout, env=env, start_new_session=True)
             else:
-                result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+                result = subprocess.run(cmd, capture_output=True, text=True, env=env, start_new_session=True)
             
             exit_code = result.returncode
             runtime = time.time() - start_time
