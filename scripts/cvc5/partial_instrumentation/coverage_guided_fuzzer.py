@@ -1640,7 +1640,7 @@ class CoverageGuidedFuzzer:
         
         try:
             # Build merge command
-            cmd = ["llvm-profdata", "merge", "-sparse", "-o", str(temp_profdata)]
+            cmd = ["llvm-profdata-18", "merge", "-sparse", "-o", str(temp_profdata)]
             
             # Include existing accumulated profdata if it exists
             if accumulated_profdata.exists():
@@ -1712,7 +1712,7 @@ class CoverageGuidedFuzzer:
         profdata_output = self.output_dir / "merged.profdata"
         
         try:
-            cmd = ["llvm-profdata", "merge", "-sparse", "-o", str(profdata_output)]
+            cmd = ["llvm-profdata-18", "merge", "-sparse", "-o", str(profdata_output)]
             cmd.extend(files_to_merge)
             
             result = subprocess.run(cmd, capture_output=True, text=True)
@@ -1723,7 +1723,7 @@ class CoverageGuidedFuzzer:
                 # DEBUG: Try to show summary of merged profdata
                 try:
                     show_result = subprocess.run(
-                        ["llvm-profdata", "show", str(profdata_output)],
+                        ["llvm-profdata-18", "show", str(profdata_output)],
                         capture_output=True, text=True, timeout=10
                     )
                     if show_result.returncode == 0:
