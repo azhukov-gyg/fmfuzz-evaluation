@@ -1399,6 +1399,20 @@ class CoverageGuidedFuzzer:
             print(f"No tests provided{' for job ' + self.job_id if self.job_id else ''}")
             return
         
+        # Verify llvm-profdata-18 is available for PGO merging
+        try:
+            result = subprocess.run(["llvm-profdata-18", "--version"], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                version_line = result.stdout.split('\n')[0] if result.stdout else "unknown"
+                print(f"[PGO] Using: {version_line}")
+            else:
+                print("[WARN] llvm-profdata-18 found but --version failed", file=sys.stderr)
+        except FileNotFoundError:
+            print("[WARN] llvm-profdata-18 not found! PGO profraw merge will fail.", file=sys.stderr)
+            print("[WARN] Install LLVM 18 or ensure llvm-profdata-18 is in PATH", file=sys.stderr)
+        except Exception as e:
+            print(f"[WARN] Could not verify llvm-profdata-18: {e}", file=sys.stderr)
+        
         print(f"Running coverage-guided fuzzer on {len(self.tests)} test(s){' for job ' + self.job_id if self.job_id else ''}")
         print(f"Tests root: {self.tests_root}")
         print(f"Timeout: {self.time_remaining}s ({self.time_remaining // 60} minutes)" if self.time_remaining else "No timeout")
@@ -1638,6 +1652,21 @@ class CoverageGuidedFuzzer:
         nonzero_files = [f for f in profraw_files if f.stat().st_size > 0]
         print(f"[PGO DEBUG] Periodic merge: {len(profraw_files)} files, {len(nonzero_files)} non-empty, total size: {total_size / 1024:.1f}KB")
         
+        # Get function count BEFORE merge (if accumulated exists)
+        before_count = 0
+        if accumulated_profdata.exists():
+            try:
+                show_result = subprocess.run(
+                    ["llvm-profdata-18", "show", str(accumulated_profdata)],
+                    capture_output=True, text=True, timeout=10
+                )
+                for line in show_result.stdout.splitlines():
+                    if "Maximum function count:" in line:
+                        before_count = int(line.split(":")[-1].strip())
+                        break
+            except Exception:
+                pass
+        
         try:
             # Build merge command
             cmd = ["llvm-profdata-18", "merge", "-sparse", "-o", str(temp_profdata)]
@@ -1645,7 +1674,7 @@ class CoverageGuidedFuzzer:
             # Include existing accumulated profdata if it exists
             if accumulated_profdata.exists():
                 cmd.append(str(accumulated_profdata))
-                print(f"[PGO DEBUG] Including existing accumulated.profdata ({accumulated_profdata.stat().st_size / 1024:.1f}KB)")
+                print(f"[PGO DEBUG] Including existing accumulated.profdata ({accumulated_profdata.stat().st_size / 1024:.1f}KB, max_count={before_count})")
             
             cmd.extend([str(f) for f in profraw_files])
             
@@ -1656,9 +1685,22 @@ class CoverageGuidedFuzzer:
                     accumulated_profdata.unlink()
                 temp_profdata.rename(accumulated_profdata)
                 
-                # DEBUG: Show result size
+                # DEBUG: Show result size and function count AFTER merge
                 merged_size = accumulated_profdata.stat().st_size
-                print(f"[PGO DEBUG] Merge successful: accumulated.profdata is now {merged_size / 1024:.1f}KB")
+                after_count = 0
+                try:
+                    show_result = subprocess.run(
+                        ["llvm-profdata-18", "show", str(accumulated_profdata)],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    for line in show_result.stdout.splitlines():
+                        if "Maximum function count:" in line:
+                            after_count = int(line.split(":")[-1].strip())
+                            break
+                except Exception:
+                    pass
+                
+                print(f"[PGO DEBUG] Merge successful: {merged_size / 1024:.1f}KB, max_count: {before_count} -> {after_count} (+{after_count - before_count})")
                 
                 # Delete merged profraw files to save disk space
                 for f in profraw_files:
@@ -1669,9 +1711,13 @@ class CoverageGuidedFuzzer:
                 
                 print(f"[INFO] Periodic merge: merged {len(profraw_files)} profraw files, disk space recovered")
             else:
-                print(f"[WARN] Periodic profraw merge failed: {result.stderr}", file=sys.stderr)
+                print(f"[WARN] Periodic profraw merge failed (exit {result.returncode}): {result.stderr}", file=sys.stderr)
+                if result.stdout:
+                    print(f"[WARN] stdout: {result.stdout[:500]}", file=sys.stderr)
         except subprocess.TimeoutExpired:
             print("[WARN] Periodic profraw merge timed out", file=sys.stderr)
+        except FileNotFoundError:
+            print("[WARN] llvm-profdata-18 not found! Install LLVM 18 or check PATH", file=sys.stderr)
         except Exception as e:
             print(f"[WARN] Error in periodic profraw merge: {e}", file=sys.stderr)
     
@@ -1694,7 +1740,21 @@ class CoverageGuidedFuzzer:
                 print(f"[PGO DEBUG]     ... and {len(profraw_files) - 5} more")
         
         if accumulated_profdata.exists():
-            print(f"[PGO DEBUG]   accumulated.profdata exists: {accumulated_profdata.stat().st_size / 1024:.1f}KB")
+            acc_size = accumulated_profdata.stat().st_size / 1024
+            # Get function count from accumulated
+            acc_count = 0
+            try:
+                show_result = subprocess.run(
+                    ["llvm-profdata-18", "show", str(accumulated_profdata)],
+                    capture_output=True, text=True, timeout=10
+                )
+                for line in show_result.stdout.splitlines():
+                    if "Maximum function count:" in line:
+                        acc_count = int(line.split(":")[-1].strip())
+                        break
+            except Exception:
+                pass
+            print(f"[PGO DEBUG]   accumulated.profdata exists: {acc_size:.1f}KB, max_count={acc_count}")
         else:
             print(f"[PGO DEBUG]   accumulated.profdata: does not exist")
         
