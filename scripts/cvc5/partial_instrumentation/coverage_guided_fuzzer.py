@@ -120,17 +120,45 @@ class CoverageGuidedFuzzer:
         self._validate_solvers()
         self.bugs_folder.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Multiprocessing primitives - use Queue instead of Manager.list for better performance
         self.manager = multiprocessing.Manager()
         
-        # Two-tier priority queues: HIGH (new coverage) and LOW (existing coverage)
-        # Workers drain HIGH queue first, then LOW queue
-        # This provides priority without expensive heap operations
-        self._high_priority_queue = Queue()  # NEW coverage mutants
-        self._low_priority_queue = Queue()   # EXISTING coverage mutants (and initial seeds)
-        self._high_queue_size = multiprocessing.Value('i', 0)
-        self._low_queue_size = multiprocessing.Value('i', 0)
+        # ---------------------------------------------------------------------
+        # AFL++-style "cycle 0" seed phase:
+        # - Execute each initial seed ONCE to generate gen1 mutants.
+        # - Do NOT execute any mutants until all seeds have been processed.
+        # This avoids FIFO interleaving where early slow mutants can starve
+        # remaining seeds and makes gen1 scheduling deterministic.
+        # ---------------------------------------------------------------------
+        self.seed_phase_done = multiprocessing.Event()
+        self.seeds_remaining = multiprocessing.Value('i', len(self.tests))
+        # Buffer of gen1 mutants produced during the initial seed-only phase.
+        # Queue item format: (runtime, new_cov_rank, has_cov_rank, generation, seq, path_str)
+        self._seed_phase_mutants = self.manager.list()
+        self._seed_phase_lock = multiprocessing.Lock()
+        self._seed_phase_flushed = False
+
+        # Global mutant buffer: workers append here; main loop flushes in sorted order.
+        # Queue item format: (runtime, new_cov_rank, has_cov_rank, generation, seq, path_str)
+        self._mutant_buffer = self.manager.list()
+        self._mutant_buffer_lock = multiprocessing.Lock()
+
+        # Monotonic sequence for total ordering (prevents tuple compare from falling back to Path objects).
+        self._queue_seq = multiprocessing.Value('L', 0)
+        self._queue_seq_lock = multiprocessing.Lock()
+        
+        # Single work queue.
+        #
+        # IMPORTANT: ordering is achieved by only enqueuing items in sorted order
+        # (during seed-phase flush and periodic mutant-buffer flush).
+        #
+        # Sort key requirement:
+        #   - runtime (ascending)
+        #   - new coverage first (new_cov_rank: 0=new, 1=existing)
+        #   - has coverage at all (has_cov_rank: 0=has coverage, 1=no coverage)
+        self._work_queue = Queue()
+        self._queue_size = multiprocessing.Value('i', 0)
         
         self.bugs_lock = multiprocessing.Lock()
         self.shutdown_event = multiprocessing.Event()
@@ -189,36 +217,28 @@ class CoverageGuidedFuzzer:
             raise ValueError(f"cvc5 not found at: {self.cvc5_path}")
     
     # -------------------------------------------------------------------------
-    # Two-Tier Priority Queue (HIGH = new coverage, LOW = existing coverage)
+    # Work queue helpers (sorted FIFO enqueue via periodic buffer flush)
     # -------------------------------------------------------------------------
     
     def _queue_push(self, item: tuple, high_priority: bool = False):
-        """Push item to work queue. Item is (priority, generation, path)."""
-        if high_priority:
-            self._high_priority_queue.put(item)
-            with self._high_queue_size.get_lock():
-                self._high_queue_size.value += 1
-        else:
-            self._low_priority_queue.put(item)
-            with self._low_queue_size.get_lock():
-                self._low_queue_size.value += 1
+        """Push item to work queue. Item is a sortable tuple."""
+        # high_priority is kept for backward-compatibility with older call sites.
+        self._work_queue.put(item)
+        with self._queue_size.get_lock():
+            self._queue_size.value += 1
     
     def _queue_push_batch(self, items: list, high_priority: bool = False):
         """Push multiple items efficiently."""
-        if high_priority:
-            for item in items:
-                self._high_priority_queue.put(item)
-            with self._high_queue_size.get_lock():
-                self._high_queue_size.value += len(items)
-        else:
-            for item in items:
-                self._low_priority_queue.put(item)
-            with self._low_queue_size.get_lock():
-                self._low_queue_size.value += len(items)
+        # high_priority is kept for backward-compatibility with older call sites.
+        for item in items:
+            self._work_queue.put(item)
+        with self._queue_size.get_lock():
+            self._queue_size.value += len(items)
     
     def _queue_push_initial(self, test_name: str):
         """Push initial test (low priority - seeds go to low queue)."""
-        self._queue_push((0.0, 0, test_name), high_priority=False)
+        # Queue item format: (runtime, new_cov_rank, has_cov_rank, generation, seq, path_str)
+        self._queue_push((0.0, 2, 2, 0, self._next_seq(), test_name), high_priority=False)
     
     def _queue_push_initial_batch(self, test_names: list):
         """Push multiple initial tests efficiently, filtering out excluded tests."""
@@ -227,7 +247,7 @@ class CoverageGuidedFuzzer:
         filtered_tests = [name for name in test_names if name not in excluded_set]
         skipped_count = len(test_names) - len(filtered_tests)
         
-        items = [(0.0, 0, name) for name in filtered_tests]
+        items = [(0.0, 2, 2, 0, self._next_seq(), name) for name in filtered_tests]
         queue_size_before = self._get_queue_size()
         self._queue_push_batch(items, high_priority=False)
         
@@ -240,41 +260,76 @@ class CoverageGuidedFuzzer:
             print(f"[QUEUE] [DEBUG] Excluded list has {len(excluded_list)} items: {excluded_list[:3]}...")
         sys.stdout.flush()
     
+    def _seed_phase_buffer_mutants(self, mutant_items: list):
+        """Buffer gen1 mutant queue items during seed phase; flushed once seeds are done."""
+        if not mutant_items:
+            return
+        with self._seed_phase_lock:
+            for item in mutant_items:
+                self._seed_phase_mutants.append(item)
+
+    def _flush_seed_phase_mutants(self):
+        """Flush buffered gen1 mutants after seed phase completes, sorted by priority."""
+        with self._seed_phase_lock:
+            buffered = list(self._seed_phase_mutants)
+            if buffered:
+                # Clear shared list
+                self._seed_phase_mutants[:] = []
+        if not buffered:
+            return
+        buffered.sort()
+        self._queue_push_batch(buffered, high_priority=False)
+
+    def _buffer_mutants(self, mutant_items: list):
+        """Buffer mutant queue items to be flushed in sorted order by main loop."""
+        if not mutant_items:
+            return
+        with self._mutant_buffer_lock:
+            for item in mutant_items:
+                self._mutant_buffer.append(item)
+
+    def _flush_mutant_buffer(self):
+        """Flush buffered mutants, sorted by priority (ascending)."""
+        with self._mutant_buffer_lock:
+            buffered = list(self._mutant_buffer)
+            if buffered:
+                self._mutant_buffer[:] = []
+        if not buffered:
+            return
+        buffered.sort()
+        self._queue_push_batch(buffered, high_priority=False)
+
     def _queue_pop(self, timeout: float = 1.0) -> Optional[tuple]:
-        """Pop item from queue. HIGH priority queue is drained first."""
-        # Try high priority queue first (non-blocking)
+        """Pop item from queue."""
         try:
-            item = self._high_priority_queue.get_nowait()
-            with self._high_queue_size.get_lock():
-                self._high_queue_size.value -= 1
-            return item
-        except:
-            pass
-        
-        # Fall back to low priority queue (with timeout)
-        try:
-            item = self._low_priority_queue.get(timeout=timeout)
-            with self._low_queue_size.get_lock():
-                self._low_queue_size.value -= 1
+            item = self._work_queue.get(timeout=timeout)
+            with self._queue_size.get_lock():
+                self._queue_size.value -= 1
             return item
         except:
             return None
     
     def _queue_empty(self) -> bool:
-        """Check if both queues are empty."""
-        return self._high_queue_size.value <= 0 and self._low_queue_size.value <= 0
+        """Check if queue is empty."""
+        return self._queue_size.value <= 0
     
     def _get_queue_size(self) -> int:
-        """Get total queue size (both queues)."""
-        return self._high_queue_size.value + self._low_queue_size.value
+        """Get total queue size."""
+        return self._queue_size.value
     
     def _get_high_queue_size(self) -> int:
-        """Get high priority queue size."""
-        return self._high_queue_size.value
+        """Back-compat for logging (no longer used)."""
+        return 0
     
     def _get_low_queue_size(self) -> int:
-        """Get low priority queue size."""
-        return self._low_queue_size.value
+        """Back-compat for logging."""
+        return self._queue_size.value
+
+    def _next_seq(self) -> int:
+        """Monotonic sequence number used for total ordering in queue items."""
+        with self._queue_seq_lock:
+            self._queue_seq.value += 1
+            return int(self._queue_seq.value)
     
     # -------------------------------------------------------------------------
     # Stats helpers (atomic operations on Value objects)
@@ -1178,12 +1233,18 @@ class CoverageGuidedFuzzer:
                         time.sleep(self.RESOURCE_CONFIG['pause_duration'])
                         continue
                     
-                    # Parse test item: (runtime, generation, test_path)
-                    runtime_priority, generation, test_path = test_item
+                    # Parse test item:
+                    # (runtime, new_cov_rank, has_cov_rank, generation, seq, test_path_str)
+                    runtime_priority, new_cov_rank, has_cov_rank, generation, seq, test_path = test_item
                     
-                    # Handle string paths (initial tests) vs Path objects (mutants)
+                    # Handle string paths:
+                    # - Seeds (generation==0): relative to tests_root
+                    # - Mutants (generation>0): stored as full path string
                     if isinstance(test_path, str):
-                        test_path = self.tests_root / test_path
+                        if generation == 0:
+                            test_path = self.tests_root / test_path
+                        else:
+                            test_path = Path(test_path)
                     
                     test_name = test_path.name if isinstance(test_path, Path) else Path(test_path).name
                     is_mutant = generation > 0
@@ -1219,6 +1280,18 @@ class CoverageGuidedFuzzer:
                     # Handle exit code
                     action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
                     self._inc_stat('tests_processed')
+
+                    # AFL++-style seed phase accounting: once every initial seed
+                    # has been executed once, allow mutants to be enqueued.
+                    if generation == 0 and not self.seed_phase_done.is_set():
+                        remaining = None
+                        with self.seeds_remaining.get_lock():
+                            if self.seeds_remaining.value > 0:
+                                self.seeds_remaining.value -= 1
+                            remaining = self.seeds_remaining.value
+                        if remaining == 0:
+                            self.seed_phase_done.set()
+                            print(f"[INFO] Seed phase complete: all initial seeds executed once. Flushing gen1 mutants...", flush=True)
                     
                     # Periodic garbage collection to prevent memory bloat
                     tests_since_gc += 1
@@ -1274,18 +1347,23 @@ class CoverageGuidedFuzzer:
                     total_edges_after = total_edges_before + new_edges
                     print(f"[WORKER {worker_id}] [COV] Test: {test_name} | gen:{generation} | hit:{edges_hit} | new:{new_edges} | total:{total_edges_after}")
                     
-                    # Decide what to do with mutants based on coverage
-                    # Priority formula: base_priority + runtime
-                    #   - NEW coverage: base=0, so priority = runtime (fast tests first)
-                    #   - EXISTING coverage: base=1000, so priority = 1000 + runtime (always after NEW)
-                    # This preserves runtime-based ordering within each coverage category
+                    # Decide what to do with mutants based on coverage.
+                    # Sorting requirement:
+                    #   1) runtime (ascending)
+                    #   2) whether parent produced NEW coverage (new before existing)
+                    #   3) whether parent produced any coverage at all (coverage before none)
+                    # Note: we do not enqueue mutants when edges_hit == 0 (no coverage).
                     if has_new:
                         self._inc_stat('total_new_edges', new_edges)
-                        priority = runtime  # Fast tests with new coverage first
+                        runtime_sort = runtime
+                        new_cov_rank = 0
+                        has_cov_rank = 0
                         coverage_type = "NEW"
                         print(f"[WORKER {worker_id}] ✨ New coverage found: {new_edges} edges (total now: {total_edges_after})")
                     elif edges_hit > 0:
-                        priority = 1000.0 + runtime  # Existing coverage, but still prefer fast tests
+                        runtime_sort = runtime
+                        new_cov_rank = 1
+                        has_cov_rank = 0
                         coverage_type = "EXISTING"
                         print(f"[WORKER {worker_id}] Coverage hit (existing): {edges_hit} edges")
                     else:
@@ -1328,30 +1406,37 @@ class CoverageGuidedFuzzer:
                         
                         if coverage_type is not None:
                             mutants_to_queue = []
-                            print(f"[WORKER {worker_id}] [MUTANT] Processing {len(mutant_files)} mutant(s) from {test_name} ({coverage_type} coverage, priority={priority})")
+                            print(f"[WORKER {worker_id}] [MUTANT] Processing {len(mutant_files)} mutant(s) from {test_name} ({coverage_type} coverage, runtime={runtime_sort:.3f}s)")
                             
                             for mutant_file in mutant_files:
                                 try:
                                     pending_name = f"gen{generation+1}_w{worker_id}_{mutant_file.name}"
                                     pending_path = self.pending_mutants_dir / pending_name
                                     shutil.move(str(mutant_file), str(pending_path))
-                                    mutants_to_queue.append((priority, generation + 1, pending_path))
+                                    # Queue item: (runtime, new_cov_rank, has_cov_rank, generation, seq, path_str)
+                                    mutants_to_queue.append(
+                                        (runtime_sort, new_cov_rank, has_cov_rank, generation + 1, self._next_seq(), str(pending_path))
+                                    )
                                     self._inc_stat('mutants_created')
                                 except Exception as e:
                                     print(f"[WORKER {worker_id}] Warning: Failed to move mutant {mutant_file}: {e}", file=sys.stderr)
                             
                             if mutants_to_queue:
-                                is_high_priority = (coverage_type == "NEW")
-                                if is_high_priority:
+                                if coverage_type == "NEW":
                                     self._inc_stat('mutants_with_new_coverage')
                                 else:
                                     self._inc_stat('mutants_with_existing_coverage')
-                                
-                                queue_size_before = self._get_queue_size()
-                                high_before = self._get_high_queue_size()
-                                for mutant_item in mutants_to_queue:
-                                    self._queue_push(mutant_item, high_priority=is_high_priority)
-                                print(f"[WORKER {worker_id}] [QUEUE] Added {len(mutants_to_queue)} mutant(s) ({coverage_type}) to {'HIGH' if is_high_priority else 'LOW'} queue (total: {queue_size_before} -> {self._get_queue_size()}, high: {high_before} -> {self._get_high_queue_size()})")
+
+                                # Sort by (runtime, new_cov_rank, has_cov_rank, generation, seq, path).
+                                mutants_to_queue.sort()
+
+                                # Seed phase: buffer gen1 mutants and only enqueue after all seeds are done.
+                                if generation == 0 and not self.seed_phase_done.is_set():
+                                    self._seed_phase_buffer_mutants(mutants_to_queue)
+                                else:
+                                    # Buffer and let main loop flush in sorted order across ALL workers.
+                                    self._buffer_mutants(mutants_to_queue)
+                                    print(f"[WORKER {worker_id}] [QUEUE] Buffered {len(mutants_to_queue)} mutant(s) ({coverage_type}) for sorted flush")
                     
                     # Delete executed mutant if it's from pending folder
                     test_path_obj = test_path if isinstance(test_path, Path) else Path(test_path)
@@ -1496,8 +1581,17 @@ class CoverageGuidedFuzzer:
                 if current_time - last_refill_check >= 2.0:
                     idle_workers = sum(1 for w_id in range(1, self.num_workers + 1) 
                                       if self.worker_status.get(w_id) is None)
-                    
-                    if self._queue_empty() and idle_workers > 0:
+
+                    # Flush buffered mutants frequently so workers see sorted work.
+                    self._flush_mutant_buffer()
+
+                    # After the initial seed-only phase completes, flush buffered gen1 mutants once.
+                    if (not self._seed_phase_flushed) and self.seed_phase_done.is_set():
+                        self._flush_seed_phase_mutants()
+                        self._seed_phase_flushed = True
+
+                    # IMPORTANT: during seed phase, do NOT refill seeds (we want exactly one pass).
+                    if self.seed_phase_done.is_set() and self._queue_empty() and idle_workers > 0:
                         gen = self._get_stat('generations_completed') + 1
                         print(f"[INFO] Queue empty with {idle_workers} idle worker(s), refilling (generation {gen})...")
                         self._queue_push_initial_batch(self.tests)
@@ -1536,7 +1630,7 @@ class CoverageGuidedFuzzer:
         print(f"[DEBUG] MAIN LOOP EXIT DIAGNOSTICS", flush=True)
         print(f"[DEBUG]   shutdown_event: {self.shutdown_event.is_set()}", flush=True)
         print(f"[DEBUG]   time_remaining: {self._get_time_remaining():.1f}s", flush=True)
-        print(f"[DEBUG]   queue_size: {self._get_queue_size()} (high: {self._get_high_queue_size()}, low: {self._low_queue_size.value})", flush=True)
+        print(f"[DEBUG]   queue_size: {self._get_queue_size()} (high: {self._get_high_queue_size()}, low: {self._get_low_queue_size()})", flush=True)
         print(f"[DEBUG]   tests_processed: {self._get_stat('tests_processed')}", flush=True)
         print(f"[DEBUG]   bugs_found: {self._get_stat('bugs_found')}", flush=True)
         print(f"[DEBUG]   workers_alive: {sum(1 for w in workers if w.is_alive())}/{len(workers)}", flush=True)
