@@ -220,25 +220,23 @@ class CoverageGuidedFuzzer:
     # Work queue helpers (sorted FIFO enqueue via periodic buffer flush)
     # -------------------------------------------------------------------------
     
-    def _queue_push(self, item: tuple, high_priority: bool = False):
+    def _queue_push(self, item: tuple):
         """Push item to work queue. Item is a sortable tuple."""
-        # high_priority is kept for backward-compatibility with older call sites.
         self._work_queue.put(item)
         with self._queue_size.get_lock():
             self._queue_size.value += 1
     
-    def _queue_push_batch(self, items: list, high_priority: bool = False):
+    def _queue_push_batch(self, items: list):
         """Push multiple items efficiently."""
-        # high_priority is kept for backward-compatibility with older call sites.
         for item in items:
             self._work_queue.put(item)
         with self._queue_size.get_lock():
             self._queue_size.value += len(items)
     
     def _queue_push_initial(self, test_name: str):
-        """Push initial test (low priority - seeds go to low queue)."""
+        """Push initial test (seed)."""
         # Queue item format: (runtime, new_cov_rank, has_cov_rank, generation, seq, path_str)
-        self._queue_push((0.0, 2, 2, 0, self._next_seq(), test_name), high_priority=False)
+        self._queue_push((0.0, 2, 2, 0, self._next_seq(), test_name))
     
     def _queue_push_initial_batch(self, test_names: list):
         """Push multiple initial tests efficiently, filtering out excluded tests."""
@@ -249,7 +247,7 @@ class CoverageGuidedFuzzer:
         
         items = [(0.0, 2, 2, 0, self._next_seq(), name) for name in filtered_tests]
         queue_size_before = self._get_queue_size()
-        self._queue_push_batch(items, high_priority=False)
+        self._queue_push_batch(items)
         
         if skipped_count > 0:
             print(f"[QUEUE] Loaded {len(items)} initial tests, skipped {skipped_count} excluded (queue: {queue_size_before} -> {self._get_queue_size()})")
@@ -278,7 +276,7 @@ class CoverageGuidedFuzzer:
         if not buffered:
             return
         buffered.sort()
-        self._queue_push_batch(buffered, high_priority=False)
+        self._queue_push_batch(buffered)
 
     def _buffer_mutants(self, mutant_items: list):
         """Buffer mutant queue items to be flushed in sorted order by main loop."""
@@ -297,7 +295,7 @@ class CoverageGuidedFuzzer:
         if not buffered:
             return
         buffered.sort()
-        self._queue_push_batch(buffered, high_priority=False)
+        self._queue_push_batch(buffered)
 
     def _queue_pop(self, timeout: float = 1.0) -> Optional[tuple]:
         """Pop item from queue."""
@@ -317,13 +315,7 @@ class CoverageGuidedFuzzer:
         """Get total queue size."""
         return self._queue_size.value
     
-    def _get_high_queue_size(self) -> int:
-        """Back-compat for logging (no longer used)."""
-        return 0
-    
-    def _get_low_queue_size(self) -> int:
-        """Back-compat for logging."""
-        return self._queue_size.value
+    # (removed HIGH/LOW queue helpers; there is only one work queue now)
 
     def _next_seq(self) -> int:
         """Monotonic sequence number used for total ordering in queue items."""
@@ -809,7 +801,7 @@ class CoverageGuidedFuzzer:
         print(f"[STATUS] ═══════════════════════════════════════════════════════")
         print(f"[STATUS] Time: {elapsed:.0f}s elapsed, {remaining:.0f}s remaining ({elapsed/60:.1f}m / {(elapsed+remaining)/60:.1f}m)")
         print(f"[STATUS] Resources: CPU {cpu_avg:.1f}%, Mem {mem_used_gb:.1f}GB used / {mem_avail_gb:.1f}GB avail [{resource_status}]")
-        print(f"[STATUS] Queue: {queue_size} total ({self._get_high_queue_size()} HIGH, {self._get_low_queue_size()} LOW)")
+        print(f"[STATUS] Queue: {queue_size} total")
         # Check actual process alive status
         workers_alive = 0
         workers_dead = 0
@@ -1511,7 +1503,7 @@ class CoverageGuidedFuzzer:
         print()
         
         # Initialize priority queue with initial tests (runtime=0 for initial tests)
-        print(f"[INFO] Loading {len(self.tests)} initial tests into priority queue...")
+        print(f"[INFO] Loading {len(self.tests)} initial tests into work queue...")
         self._queue_push_initial_batch(self.tests)
         
         # SHARED global_coverage_map across all workers (0xFF = unseen, 0x00 = seen)
@@ -1520,7 +1512,7 @@ class CoverageGuidedFuzzer:
         global_coverage_map = multiprocessing.Array('B', [0xff] * AFL_MAP_SIZE)
         coverage_map_lock = multiprocessing.Lock()  # Protects coverage map updates
         
-        # Start workers (no result_queue needed - workers push directly to priority queue)
+        # Start workers (workers buffer mutants; main loop flushes them in sorted order)
         workers = []
         for worker_id in range(1, self.num_workers + 1):
             worker = multiprocessing.Process(
@@ -1592,6 +1584,11 @@ class CoverageGuidedFuzzer:
 
                     # IMPORTANT: during seed phase, do NOT refill seeds (we want exactly one pass).
                     if self.seed_phase_done.is_set() and self._queue_empty() and idle_workers > 0:
+                        # Simple logic: if queue is empty after our regular buffer flush, reload seeds.
+                        if not self._queue_empty():
+                            last_refill_check = current_time
+                            continue
+
                         gen = self._get_stat('generations_completed') + 1
                         print(f"[INFO] Queue empty with {idle_workers} idle worker(s), refilling (generation {gen})...")
                         self._queue_push_initial_batch(self.tests)
@@ -1630,7 +1627,7 @@ class CoverageGuidedFuzzer:
         print(f"[DEBUG] MAIN LOOP EXIT DIAGNOSTICS", flush=True)
         print(f"[DEBUG]   shutdown_event: {self.shutdown_event.is_set()}", flush=True)
         print(f"[DEBUG]   time_remaining: {self._get_time_remaining():.1f}s", flush=True)
-        print(f"[DEBUG]   queue_size: {self._get_queue_size()} (high: {self._get_high_queue_size()}, low: {self._get_low_queue_size()})", flush=True)
+        print(f"[DEBUG]   queue_size: {self._get_queue_size()}", flush=True)
         print(f"[DEBUG]   tests_processed: {self._get_stat('tests_processed')}", flush=True)
         print(f"[DEBUG]   bugs_found: {self._get_stat('bugs_found')}", flush=True)
         print(f"[DEBUG]   workers_alive: {sum(1 for w in workers if w.is_alive())}/{len(workers)}", flush=True)
