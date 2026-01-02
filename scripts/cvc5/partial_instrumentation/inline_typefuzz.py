@@ -2,6 +2,8 @@
 
 import copy
 import re
+import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -101,24 +103,38 @@ class InlineTypeFuzz:
         
         for cmd in [z3_cmd, cvc5_cmd]:
             try:
-                r = subprocess.run(cmd.split() + [str(mutant_path)], 
-                                   capture_output=True, text=True, timeout=timeout, 
+                # Use shlex to correctly handle quoted flags, matching shell tokenization.
+                argv = shlex.split(cmd) + [str(mutant_path)]
+                r = subprocess.run(argv,
+                                   capture_output=True, text=True, timeout=timeout,
                                    env=env, shell=False, start_new_session=True)
                 stdout, stderr, exitcode = r.stdout, r.stderr, r.returncode
             except subprocess.TimeoutExpired as te:
                 # Match yinyang: timeout = exitcode 137
-                stdout = te.stdout.decode() if te.stdout else ""
-                stderr = te.stderr.decode() if te.stderr else ""
+                # With text=True, TimeoutExpired.{stdout,stderr} are strings, not bytes.
+                def _to_str(x) -> str:
+                    if not x:
+                        return ""
+                    if isinstance(x, bytes):
+                        return x.decode(errors="replace")
+                    return str(x)
+                stdout = _to_str(getattr(te, "stdout", None))
+                stderr = _to_str(getattr(te, "stderr", None))
                 exitcode = 137
-            except Exception:
+                print(f"[INLINE_TYPEFUZZ_DEBUG] timeout {timeout}s: {argv[0]} ({mutant_path.name})")
+            except Exception as e:
+                # Don't silently hide failures: this is a common root cause of missing PGO data.
+                print(f"[INLINE_TYPEFUZZ_DEBUG] solver invocation error: cmd={cmd!r}, mutant={mutant_path.name}, err={type(e).__name__}: {e}")
                 continue
             
             # Check crash_list patterns
             if self._in_list(stdout, stderr, crash_list):
+                print(f"[INLINE_TYPEFUZZ_DEBUG] crash_list matched for {argv[0]} (skipping remaining solvers)")
                 return True, "crash"
             
             # Check ignore_list - skip this solver
             if self._in_list(stdout, stderr, ignore_list):
+                print(f"[INLINE_TYPEFUZZ_DEBUG] ignore_list matched for {argv[0]} (continuing)")
                 continue
             
             # Check segfault
@@ -127,16 +143,19 @@ class InlineTypeFuzz:
             
             # Check timeout
             if exitcode == 137:
+                print(f"[INLINE_TYPEFUZZ_DEBUG] exitcode=137 (timeout): {argv[0]} (continuing)")
                 continue
             
             # Get all results (for incremental benchmarks)
             results = self._grep_results(stdout)
             if not results:
+                print(f"[INLINE_TYPEFUZZ_DEBUG] no sat/unsat/unknown results from {argv[0]} (continuing)")
                 continue
             
             # Filter out unknown-only results for oracle setting
             non_unknown = [r for r in results if r != "unknown"]
             if not non_unknown:
+                print(f"[INLINE_TYPEFUZZ_DEBUG] unknown-only results from {argv[0]} (continuing)")
                 continue
             
             # Differential testing: first valid result = oracle
