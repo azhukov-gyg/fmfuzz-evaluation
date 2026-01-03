@@ -994,7 +994,9 @@ class CoverageGuidedFuzzer:
         
         env = os.environ.copy()
         env['__AFL_SHM_ID'] = shm_id
-        env['LLVM_PROFILE_FILE'] = str(self.profraw_dir / f"worker_{worker_id}_%p_%m.profraw")
+        # Use LLVM "continuous" profile mode (%c) so we still get data even when
+        # cvc5 is killed on timeout/resource pressure (SIGKILL prevents normal flush).
+        env['LLVM_PROFILE_FILE'] = str((self.profraw_dir / f"worker_{worker_id}_%p_%c.profraw").resolve())
         env['ASAN_OPTIONS'] = 'abort_on_error=0:detect_leaks=0'
         
         z3_cmd, cvc5_cmd = self._get_solver_clis(test_path).split(";")
@@ -1170,10 +1172,10 @@ class CoverageGuidedFuzzer:
             env = os.environ.copy()
             # Set shared memory ID for coverage agent (afl_shm_{ID})
             env['__AFL_SHM_ID'] = shm_id
-            # PGO profiling - use %p (pid) and %m (merge pool) for unique files per cvc5 invocation
-            # typefuzz runs cvc5 multiple times, each needs its own profraw file
-            # Use %c for continuous mode - writes profile data continuously (survives crashes/kills)
-            profraw_pattern = self.profraw_dir / f"worker_{worker_id}_%p_%m.profraw"
+            # PGO profiling:
+            # - %p: pid (avoid collisions)
+            # - %c: continuous mode (survives timeouts/kills better)
+            profraw_pattern = (self.profraw_dir / f"worker_{worker_id}_%p_%c.profraw").resolve()
             env['LLVM_PROFILE_FILE'] = str(profraw_pattern)
             # Disable ASAN leak detection
             env['ASAN_OPTIONS'] = 'abort_on_error=0:detect_leaks=0'

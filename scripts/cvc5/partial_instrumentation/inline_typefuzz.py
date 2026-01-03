@@ -3,6 +3,7 @@
 import copy
 import re
 import os
+import signal
 import shlex
 import subprocess
 import sys
@@ -105,23 +106,44 @@ class InlineTypeFuzz:
             try:
                 # Use shlex to correctly handle quoted flags, matching shell tokenization.
                 argv = shlex.split(cmd) + [str(mutant_path)]
-                r = subprocess.run(argv,
-                                   capture_output=True, text=True, timeout=timeout,
-                                   env=env, shell=False, start_new_session=True)
-                stdout, stderr, exitcode = r.stdout, r.stderr, r.returncode
-            except subprocess.TimeoutExpired as te:
-                # Match yinyang: timeout = exitcode 137
-                # With text=True, TimeoutExpired.{stdout,stderr} are strings, not bytes.
-                def _to_str(x) -> str:
-                    if not x:
-                        return ""
-                    if isinstance(x, bytes):
-                        return x.decode(errors="replace")
-                    return str(x)
-                stdout = _to_str(getattr(te, "stdout", None))
-                stderr = _to_str(getattr(te, "stderr", None))
-                exitcode = 137
-                print(f"[INLINE_TYPEFUZZ_DEBUG] timeout {timeout}s: {argv[0]} ({mutant_path.name})")
+                # IMPORTANT: subprocess.run(timeout=...) only kills the direct child.
+                # If the solver spawns subprocesses, they can be leaked. Also, SIGKILL
+                # prevents LLVM profile flush. We therefore manage the process group
+                # explicitly and try SIGTERM first.
+                p = subprocess.Popen(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                    shell=False,
+                    start_new_session=True,  # new session == new process group
+                )
+                try:
+                    stdout, stderr = p.communicate(timeout=timeout)
+                    exitcode = p.returncode
+                except subprocess.TimeoutExpired:
+                    print(f"[INLINE_TYPEFUZZ_DEBUG] timeout {timeout}s: {argv[0]} ({mutant_path.name})")
+                    stdout, stderr = "", ""
+                    exitcode = 137
+                    # Graceful stop first (lets profilers flush if supported).
+                    try:
+                        os.killpg(p.pid, signal.SIGTERM)
+                    except Exception:
+                        pass
+                    try:
+                        stdout, stderr = p.communicate(timeout=2)
+                        exitcode = p.returncode if p.returncode is not None else 137
+                    except Exception:
+                        # Hard kill fallback.
+                        try:
+                            os.killpg(p.pid, signal.SIGKILL)
+                        except Exception:
+                            pass
+                        try:
+                            p.communicate(timeout=2)
+                        except Exception:
+                            pass
             except Exception as e:
                 # Don't silently hide failures: this is a common root cause of missing PGO data.
                 print(f"[INLINE_TYPEFUZZ_DEBUG] solver invocation error: cmd={cmd!r}, mutant={mutant_path.name}, err={type(e).__name__}: {e}")
