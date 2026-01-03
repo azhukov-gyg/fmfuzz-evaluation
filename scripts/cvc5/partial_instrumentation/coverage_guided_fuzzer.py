@@ -134,13 +134,13 @@ class CoverageGuidedFuzzer:
         self.seed_phase_done = multiprocessing.Event()
         self.seeds_remaining = multiprocessing.Value('i', len(self.tests))
         # Buffer of gen1 mutants produced during the initial seed-only phase.
-        # Queue item format: (runtime, new_cov_rank, has_cov_rank, generation, seq, path_str)
+        # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
         self._seed_phase_mutants = self.manager.list()
         self._seed_phase_lock = multiprocessing.Lock()
         self._seed_phase_flushed = False
 
         # Global mutant buffer: workers append here; main loop flushes in sorted order.
-        # Queue item format: (runtime, new_cov_rank, has_cov_rank, generation, seq, path_str)
+        # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
         self._mutant_buffer = self.manager.list()
         self._mutant_buffer_lock = multiprocessing.Lock()
 
@@ -156,7 +156,6 @@ class CoverageGuidedFuzzer:
         # Sort key requirement:
         #   - runtime (ascending)
         #   - new coverage first (new_cov_rank: 0=new, 1=existing)
-        #   - has coverage at all (has_cov_rank: 0=has coverage, 1=no coverage)
         self._work_queue = Queue()
         self._queue_size = multiprocessing.Value('i', 0)
         
@@ -235,8 +234,8 @@ class CoverageGuidedFuzzer:
     
     def _queue_push_initial(self, test_name: str):
         """Push initial test (seed)."""
-        # Queue item format: (runtime, new_cov_rank, has_cov_rank, generation, seq, path_str)
-        self._queue_push((0.0, 2, 2, 0, self._next_seq(), test_name))
+        # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
+        self._queue_push((0.0, 2, 0, self._next_seq(), test_name))
     
     def _queue_push_initial_batch(self, test_names: list):
         """Push multiple initial tests efficiently, filtering out excluded tests."""
@@ -245,7 +244,8 @@ class CoverageGuidedFuzzer:
         filtered_tests = [name for name in test_names if name not in excluded_set]
         skipped_count = len(test_names) - len(filtered_tests)
         
-        items = [(0.0, 2, 2, 0, self._next_seq(), name) for name in filtered_tests]
+        # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
+        items = [(0.0, 2, 0, self._next_seq(), name) for name in filtered_tests]
         queue_size_before = self._get_queue_size()
         self._queue_push_batch(items)
         
@@ -965,10 +965,20 @@ class CoverageGuidedFuzzer:
         worker_id: int,
         scratch_folder: Path,
         bugs_folder: Path,
+        generation: int,
         shm_id: str,
+        shm,
+        global_coverage_map: multiprocessing.Array,
+        coverage_map_lock: multiprocessing.Lock,
         timeout: int = 120,
     ) -> Tuple[int, List[Path], float, List[Path]]:
-        """Run typefuzz inline (no subprocess). Returns (exit_code, bug_files, runtime, mutant_files)."""
+        """
+        Run typefuzz inline (no subprocess).
+        IMPORTANT: for iterations>1, we must measure coverage per mutant execution.
+        This function therefore clears/reads the AFL shm bitmap for each mutant,
+        and queues each mutant immediately based on its own coverage outcome.
+        Returns (exit_code, bug_files, runtime_seconds_total, []).
+        """
         if not test_path.exists():
             return (1, [], 0.0, [])
         
@@ -976,7 +986,7 @@ class CoverageGuidedFuzzer:
         bugs_folder.mkdir(parents=True, exist_ok=True)
         
         start_time = time.time()
-        bug_files, mutant_files = [], []
+        bug_files = []
         
         mutator = InlineTypeFuzz(test_path)
         if not mutator.parse():
@@ -988,27 +998,126 @@ class CoverageGuidedFuzzer:
         env['ASAN_OPTIONS'] = 'abort_on_error=0:detect_leaks=0'
         
         z3_cmd, cvc5_cmd = self._get_solver_clis(test_path).split(";")
+
+        # Per-test summary (avoid logging per-iteration unless it matters).
+        produced = 0
+        queued_new = 0
+        queued_existing = 0
+        discarded_no_cov = 0
+        new_edges_total = 0
+        runtime_sum = 0.0
         
         for i in range(self.iterations):
             formula_str, success = mutator.mutate()
             if not success:
                 continue
-            
+
+            produced += 1
+
             mutant_path = scratch_folder / f"mutant_{worker_id}_{i}.smt2"
             with open(mutant_path, 'w') as f:
                 f.write(formula_str)
-            mutant_files.append(mutant_path)
-            
+
+            # Per-mutant coverage: clear shm before running solvers.
+            try:
+                shm.seek(0)
+                shm.write(b'\x00' * AFL_MAP_SIZE)
+                shm.seek(0)
+            except Exception:
+                # If shm can't be cleared, we'll still attempt to run, but coverage will be unreliable.
+                pass
+
+            t0 = time.time()
             is_bug, bug_type = mutator.run_solvers(mutant_path, z3_cmd, cvc5_cmd, timeout, env)
+            t1 = time.time()
+            runtime_i = t1 - t0
+            runtime_sum += runtime_i
+
+            # Read coverage from shared memory (trace_bits) for this mutant execution.
+            try:
+                shm.seek(0)
+                trace_bits = shm.read(AFL_MAP_SIZE)
+            except Exception:
+                trace_bits = b""
+
+            edges_hit = sum(1 for b in trace_bits if b != 0) if trace_bits else 0
+
+            # Bug file handling: always preserve the triggering mutant.
             if is_bug:
                 bug_path = bugs_folder / f"bug_{worker_id}_{i}.smt2"
-                shutil.copy(mutant_path, bug_path)
-                bug_files.append(bug_path)
+                try:
+                    shutil.copy(mutant_path, bug_path)
+                    bug_files.append(bug_path)
+                except Exception:
+                    pass
+
+            if edges_hit == 0:
+                discarded_no_cov += 1
+                self._inc_stat('mutants_discarded_no_coverage', 1)
+                try:
+                    mutant_path.unlink()
+                except Exception:
+                    pass
+                continue
+
+            # Determine "new edges" for this mutant, and update global map atomically.
+            new_edges = 0
+            with coverage_map_lock:
+                coverage_bytes = bytes(global_coverage_map[:])
+                for idx in range(AFL_MAP_SIZE):
+                    if trace_bits and trace_bits[idx] and coverage_bytes[idx] == 0xff:
+                        global_coverage_map[idx] = 0x00
+                        new_edges += 1
+
+            if new_edges > 0:
+                queued_new += 1
+                new_edges_total += new_edges
+                self._inc_stat('total_new_edges', new_edges)
+                coverage_type = "NEW"
+                new_cov_rank = 0
+                self._inc_stat('mutants_with_new_coverage', 1)
+            else:
+                queued_existing += 1
+                coverage_type = "EXISTING"
+                new_cov_rank = 1
+                self._inc_stat('mutants_with_existing_coverage', 1)
+
+            # Move mutant into pending_mutants and enqueue (buffer) it.
+            try:
+                pending_name = f"gen{generation+1}_w{worker_id}_{mutant_path.name}"
+                pending_path = self.pending_mutants_dir / pending_name
+                shutil.move(str(mutant_path), str(pending_path))
+                self._inc_stat('mutants_created', 1)
+            except Exception as e:
+                print(f"[WORKER {worker_id}] Warning: Failed to move mutant {mutant_path}: {e}", file=sys.stderr)
+                continue
+
+            # Queue item: (runtime, new_cov_rank, generation, seq, path_str)
+            item = (runtime_i, new_cov_rank, generation + 1, self._next_seq(), str(pending_path))
+
+            # During seed phase: buffer gen1 mutants, flush after all seeds executed once.
+            if generation == 0 and not self.seed_phase_done.is_set():
+                self._seed_phase_buffer_mutants([item])
+            else:
+                self._buffer_mutants([item])
+
+            # Only log per-mutant when it actually found new coverage or triggered a bug.
+            if new_edges > 0 or is_bug:
+                print(f"[WORKER {worker_id}] [COV] {test_path.name} iter={i} gen:{generation} hit:{edges_hit} new:{new_edges} ({coverage_type}) runtime:{runtime_i:.2f}s")
         
         # Explicit cleanup to prevent ANTLR memory leak
         del mutator
-        
-        return (0, bug_files, time.time() - start_time, mutant_files)
+
+        # Compact per-test summary (keeps logs readable even at iterations=250).
+        print(
+            f"[WORKER {worker_id}] [INLINE SUMMARY] {test_path.name} gen:{generation} "
+            f"produced:{produced} queued_new:{queued_new} queued_existing:{queued_existing} "
+            f"discarded_no_cov:{discarded_no_cov} new_edges_total:{new_edges_total} "
+            f"solver_time_total:{runtime_sum:.1f}s",
+            flush=True,
+        )
+
+        return (0, bug_files, time.time() - start_time, [])
     
     def _run_typefuzz(
         self,
@@ -1226,8 +1335,8 @@ class CoverageGuidedFuzzer:
                         continue
                     
                     # Parse test item:
-                    # (runtime, new_cov_rank, has_cov_rank, generation, seq, test_path_str)
-                    runtime_priority, new_cov_rank, has_cov_rank, generation, seq, test_path = test_item
+                    # (runtime, new_cov_rank, generation, seq, test_path_str)
+                    runtime_priority, new_cov_rank, generation, seq, test_path = test_item
                     
                     # Handle string paths:
                     # - Seeds (generation==0): relative to tests_root
@@ -1260,7 +1369,8 @@ class CoverageGuidedFuzzer:
                     
                     if self.use_inline_mode:
                         exit_code, bug_files, runtime, mutant_files = self._run_inline_typefuzz(
-                            test_path_obj, worker_id, scratch_folder, bugs_folder, shm_id,
+                            test_path_obj, worker_id, scratch_folder, bugs_folder, generation, shm_id,
+                            shm, global_coverage_map, coverage_map_lock,
                         )
                     else:
                         exit_code, bug_files, runtime, mutant_files = self._run_typefuzz(
@@ -1299,7 +1409,9 @@ class CoverageGuidedFuzzer:
                     
                     # Track excluded seed tests (unsupported/timeout) to avoid re-adding on refill
                     if action == 'remove' and generation == 0:
-                        original_test_id = test_item[2]
+                        # Seeds are enqueued as the test name string (relative to tests_root).
+                        # We must store that exact identifier so _queue_push_initial_batch() can filter it.
+                        original_test_id = test_item[4]
                         current_excluded = list(self.excluded_tests)
                         if original_test_id not in current_excluded:
                             self.excluded_tests.append(original_test_id)
@@ -1309,69 +1421,67 @@ class CoverageGuidedFuzzer:
                         print(f"[WORKER {worker_id}] [DEBUG] Not excluding {test_name}: generation={generation}, action={action}")
                         sys.stdout.flush()
                     
-                    # Read coverage from shared memory (trace_bits)
-                    shm.seek(0)
-                    trace_bits = shm.read(AFL_MAP_SIZE)
-                    
-                    # Count edges hit in this execution
-                    edges_hit = sum(1 for b in trace_bits if b != 0)
-                    
-                    # Debug: log if we're getting any coverage at all (first few tests only)
-                    if edges_hit == 0 and self._get_stat('tests_processed') < 5:
-                        nonzero_sample = [(i, trace_bits[i]) for i in range(min(100, len(trace_bits))) if trace_bits[i] != 0]
-                        print(f"[DEBUG] SHM {shm_name}: edges_hit={edges_hit}, sample_nonzero={nonzero_sample[:10]}, __AFL_SHM_ID={shm_id}")
-                    
-                    # Check for new coverage using SHARED global_coverage_map (with lock)
-                    has_new = False
-                    new_edges = 0
-                    total_edges_before = 0
-                    
-                    with coverage_map_lock:
-                        coverage_bytes = bytes(global_coverage_map[:])
-                        total_edges_before = sum(1 for b in coverage_bytes if b == 0x00)
-                        
-                        for i in range(AFL_MAP_SIZE):
-                            if trace_bits[i] and coverage_bytes[i] == 0xff:
-                                global_coverage_map[i] = 0x00
-                                new_edges += 1
-                                has_new = True
-                    
-                    total_edges_after = total_edges_before + new_edges
-                    print(f"[WORKER {worker_id}] [COV] Test: {test_name} | gen:{generation} | hit:{edges_hit} | new:{new_edges} | total:{total_edges_after}")
-                    
-                    # Decide what to do with mutants based on coverage.
-                    # Sorting requirement:
-                    #   1) runtime (ascending)
-                    #   2) whether parent produced NEW coverage (new before existing)
-                    #   3) whether parent produced any coverage at all (coverage before none)
-                    # Note: we do not enqueue mutants when edges_hit == 0 (no coverage).
-                    if has_new:
-                        self._inc_stat('total_new_edges', new_edges)
-                        runtime_sort = runtime
-                        new_cov_rank = 0
-                        has_cov_rank = 0
-                        coverage_type = "NEW"
-                        print(f"[WORKER {worker_id}] ✨ New coverage found: {new_edges} edges (total now: {total_edges_after})")
-                    elif edges_hit > 0:
-                        runtime_sort = runtime
-                        new_cov_rank = 1
-                        has_cov_rank = 0
-                        coverage_type = "EXISTING"
-                        print(f"[WORKER {worker_id}] Coverage hit (existing): {edges_hit} edges")
-                    else:
-                        # No coverage at all - discard mutants
-                        if mutant_files:
-                            print(f"[WORKER {worker_id}] [MUTANT] No coverage at all, discarding {len(mutant_files)} mutant(s)")
-                            self._inc_stat('mutants_discarded_no_coverage', len(mutant_files))
-                        for mutant_file in mutant_files:
-                            try:
-                                mutant_file.unlink()
-                            except Exception:
-                                pass
-                        # Skip to next test
+                    # Inline mode handles coverage per mutant iteration and queues mutants itself.
+                    # For subprocess mode, we still attribute coverage once per test.
+                    if self.use_inline_mode:
                         coverage_type = None
+                    else:
+                        # Read coverage from shared memory (trace_bits)
+                        shm.seek(0)
+                        trace_bits = shm.read(AFL_MAP_SIZE)
+                        
+                        # Count edges hit in this execution
+                        edges_hit = sum(1 for b in trace_bits if b != 0)
+                        
+                        # Debug: log if we're getting any coverage at all (first few tests only)
+                        if edges_hit == 0 and self._get_stat('tests_processed') < 5:
+                            nonzero_sample = [(i, trace_bits[i]) for i in range(min(100, len(trace_bits))) if trace_bits[i] != 0]
+                            print(f"[DEBUG] SHM {shm_name}: edges_hit={edges_hit}, sample_nonzero={nonzero_sample[:10]}, __AFL_SHM_ID={shm_id}")
+                        
+                        # Check for new coverage using SHARED global_coverage_map (with lock)
+                        has_new = False
+                        new_edges = 0
+                        total_edges_before = 0
+                        
+                        with coverage_map_lock:
+                            coverage_bytes = bytes(global_coverage_map[:])
+                            total_edges_before = sum(1 for b in coverage_bytes if b == 0x00)
+                            
+                            for i in range(AFL_MAP_SIZE):
+                                if trace_bits[i] and coverage_bytes[i] == 0xff:
+                                    global_coverage_map[i] = 0x00
+                                    new_edges += 1
+                                    has_new = True
+                        
+                        total_edges_after = total_edges_before + new_edges
+                        print(f"[WORKER {worker_id}] [COV] Test: {test_name} | gen:{generation} | hit:{edges_hit} | new:{new_edges} | total:{total_edges_after}")
+                        
+                        # Decide what to do with mutants based on coverage.
+                        if has_new:
+                            self._inc_stat('total_new_edges', new_edges)
+                            runtime_sort = runtime
+                            new_cov_rank = 0
+                            coverage_type = "NEW"
+                            print(f"[WORKER {worker_id}] ✨ New coverage found: {new_edges} edges (total now: {total_edges_after})")
+                        elif edges_hit > 0:
+                            runtime_sort = runtime
+                            new_cov_rank = 1
+                            coverage_type = "EXISTING"
+                            print(f"[WORKER {worker_id}] Coverage hit (existing): {edges_hit} edges")
+                        else:
+                            # No coverage at all - discard mutants
+                            if mutant_files:
+                                print(f"[WORKER {worker_id}] [MUTANT] No coverage at all, discarding {len(mutant_files)} mutant(s)")
+                                self._inc_stat('mutants_discarded_no_coverage', len(mutant_files))
+                            for mutant_file in mutant_files:
+                                try:
+                                    mutant_file.unlink()
+                                except Exception:
+                                    pass
+                            # Skip to next test
+                            coverage_type = None
                     
-                    # Process mutants if they hit any coverage
+                    # Process mutants if they hit any coverage (subprocess mode only)
                     if coverage_type is not None and mutant_files:
                         # Check disk space before queuing (TOP PRIORITY)
                         can_queue = self._can_queue_mutants(len(mutant_files))
@@ -1405,9 +1515,9 @@ class CoverageGuidedFuzzer:
                                     pending_name = f"gen{generation+1}_w{worker_id}_{mutant_file.name}"
                                     pending_path = self.pending_mutants_dir / pending_name
                                     shutil.move(str(mutant_file), str(pending_path))
-                                    # Queue item: (runtime, new_cov_rank, has_cov_rank, generation, seq, path_str)
+                                    # Queue item: (runtime, new_cov_rank, generation, seq, path_str)
                                     mutants_to_queue.append(
-                                        (runtime_sort, new_cov_rank, has_cov_rank, generation + 1, self._next_seq(), str(pending_path))
+                                        (runtime_sort, new_cov_rank, generation + 1, self._next_seq(), str(pending_path))
                                     )
                                     self._inc_stat('mutants_created')
                                 except Exception as e:
@@ -1419,7 +1529,7 @@ class CoverageGuidedFuzzer:
                                 else:
                                     self._inc_stat('mutants_with_existing_coverage')
 
-                                # Sort by (runtime, new_cov_rank, has_cov_rank, generation, seq, path).
+                                # Sort by (runtime, new_cov_rank, generation, seq, path).
                                 mutants_to_queue.sort()
 
                                 # Seed phase: buffer gen1 mutants and only enqueue after all seeds are done.
