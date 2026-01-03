@@ -1003,6 +1003,13 @@ class CoverageGuidedFuzzer:
         
         z3_cmd, cvc5_cmd = self._get_solver_clis(test_path).split(";")
 
+        # PGO debug: count profraw before/after this test (cheap, gives immediate signal).
+        profraw_before = 0
+        try:
+            profraw_before = len(list(self.profraw_dir.glob("*.profraw")))
+        except Exception:
+            profraw_before = 0
+
         # Per-test summary (avoid logging per-iteration unless it matters).
         produced = 0
         queued_new = 0
@@ -1120,6 +1127,14 @@ class CoverageGuidedFuzzer:
             f"solver_time_total:{runtime_sum:.1f}s",
             flush=True,
         )
+
+        try:
+            profraw_after = len(list(self.profraw_dir.glob("*.profraw")))
+            delta = profraw_after - profraw_before
+            if delta != 0 or self._get_stat('tests_processed') < 5:
+                print(f"[WORKER {worker_id}] [PGO DEBUG] inline profraw_files_before={profraw_before}, after={profraw_after}, new={delta}", flush=True)
+        except Exception:
+            pass
 
         return (0, bug_files, time.time() - start_time, [])
     
@@ -1966,6 +1981,48 @@ class CoverageGuidedFuzzer:
         if not profraw_files and not accumulated_profdata.exists():
             print("[INFO] No profraw files to merge")
             return
+
+        # PGO DEBUG (high signal): sanity-check a single profraw file.
+        # If a single-file merge has 0 functions, then counters are not being recorded
+        # (often because allowlisted functions are never executed).
+        try:
+            sample = None
+            for f in profraw_files:
+                try:
+                    if f.stat().st_size > 0:
+                        sample = f
+                        break
+                except Exception:
+                    continue
+            if sample is not None:
+                single_profdata = self.output_dir / "single_sample.profdata"
+                m = subprocess.run(
+                    ["llvm-profdata-18", "merge", "-sparse", "-o", str(single_profdata), str(sample)],
+                    capture_output=True, text=True, timeout=20
+                )
+                if m.returncode == 0:
+                    show = subprocess.run(
+                        ["llvm-profdata-18", "show", str(single_profdata)],
+                        capture_output=True, text=True, timeout=20
+                    )
+                    total_funcs = None
+                    max_count = None
+                    for line in (show.stdout or "").splitlines():
+                        if "Total functions:" in line:
+                            try:
+                                total_funcs = int(line.split(":")[-1].strip())
+                            except Exception:
+                                pass
+                        if "Maximum function count:" in line:
+                            try:
+                                max_count = int(line.split(":")[-1].strip())
+                            except Exception:
+                                pass
+                    print(f"[PGO DEBUG] Single-profraw sanity: sample={sample.name} size={sample.stat().st_size}B total_functions={total_funcs} max_count={max_count}")
+                else:
+                    print(f"[PGO DEBUG] Single-profraw sanity merge failed: {m.stderr[:300]}", file=sys.stderr)
+        except Exception as e:
+            print(f"[PGO DEBUG] Single-profraw sanity check failed: {type(e).__name__}: {e}", file=sys.stderr)
         
         files_to_merge = []
         if accumulated_profdata.exists():
