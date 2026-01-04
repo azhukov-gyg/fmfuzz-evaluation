@@ -105,14 +105,21 @@ if [ -n "$SANCOV_ALLOWLIST" ] && [ -f "$SANCOV_ALLOWLIST" ]; then
     echo "  ---------------------------------"
 fi
 
-if [ -n "$PGO_ALLOWLIST" ] && [ -f "$PGO_ALLOWLIST" ]; then
-    PGO_FLAGS="$PGO_FLAGS -fprofile-list=$PGO_ALLOWLIST"
-    PGO_COUNT=$(grep -c '^fun:' "$PGO_ALLOWLIST" 2>/dev/null || echo 0)
-    echo "  PGO allowlist: $PGO_ALLOWLIST ($PGO_COUNT functions)"
-    echo "  --- PGO allowlist contents ---"
-    cat "$PGO_ALLOWLIST"
-    echo "  ------------------------------"
-fi
+# NOTE: PGO allowlist support is intentionally DISABLED for now.
+# We keep the plumbing (arg + file) so it's easy to re-enable by uncommenting
+# the block below.
+#
+# Why disabled: profiling allowlists are fragile (easy to end up with 0 profiled
+# functions), and for our evaluation we want to profile all functions.
+#
+# if [ -n "$PGO_ALLOWLIST" ] && [ -f "$PGO_ALLOWLIST" ]; then
+#     PGO_FLAGS="$PGO_FLAGS -fprofile-list=$PGO_ALLOWLIST"
+#     PGO_COUNT=$(grep -c '^fun:' "$PGO_ALLOWLIST" 2>/dev/null || echo 0)
+#     echo "  PGO allowlist: $PGO_ALLOWLIST ($PGO_COUNT functions)"
+#     echo "  --- PGO allowlist contents ---"
+#     cat "$PGO_ALLOWLIST"
+#     echo "  ------------------------------"
+# fi
 
 # Let CVC5's production profile handle optimization flags
 # We only add our instrumentation flags + -fno-inline to prevent inlining

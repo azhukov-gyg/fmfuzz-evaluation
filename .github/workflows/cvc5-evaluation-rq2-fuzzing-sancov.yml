@@ -195,10 +195,13 @@ jobs:
               echo "sancov_allowlist=sancov_allowlist.txt" >> $GITHUB_OUTPUT
               echo "✅ Generated sancov allowlist with $(grep -c '^fun:' sancov_allowlist.txt || echo 0) functions"
             fi
-            
+
+            # NOTE: We still generate/upload pgo_allowlist.txt for debugging and
+            # potential future use, but profiling allowlist application is
+            # currently disabled in build_cvc5_instrumented.sh.
             if [ -f "pgo_allowlist.txt" ]; then
               echo "pgo_allowlist=pgo_allowlist.txt" >> $GITHUB_OUTPUT
-              echo "✅ Generated PGO allowlist with $(grep -c '^fun:' pgo_allowlist.txt || echo 0) functions"
+              echo "✅ Generated PGO allowlist with $(grep -c '^fun:' pgo_allowlist.txt || echo 0) functions (currently not applied)"
             fi
           else
             echo "⚠️ changed_functions.json not found"
@@ -352,10 +355,10 @@ jobs:
             SANCOV_ARG="$(pwd)/sancov_allowlist.txt"
             echo "Using sancov allowlist: $(grep -c '^fun:' sancov_allowlist.txt || echo 0) functions"
           fi
-          
+
           if [ -f "pgo_allowlist.txt" ]; then
             PGO_ARG="$(pwd)/pgo_allowlist.txt"
-            echo "Using PGO allowlist: $(grep -c '^fun:' pgo_allowlist.txt || echo 0) functions"
+            echo "Generated PGO allowlist: $(grep -c '^fun:' pgo_allowlist.txt || echo 0) functions (not applied)"
           fi
           
           # Run production build script
