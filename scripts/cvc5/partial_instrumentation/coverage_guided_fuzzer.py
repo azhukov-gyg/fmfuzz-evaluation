@@ -124,13 +124,37 @@ class CoverageGuidedFuzzer:
         # Multiprocessing primitives - use Queue instead of Manager.list for better performance
         self.manager = multiprocessing.Manager()
         
-        # Two-tier priority queues: HIGH (new coverage) and LOW (existing coverage)
-        # Workers drain HIGH queue first, then LOW queue
-        # This provides priority without expensive heap operations
-        self._high_priority_queue = Queue()  # NEW coverage mutants
-        self._low_priority_queue = Queue()   # EXISTING coverage mutants (and initial seeds)
-        self._high_queue_size = multiprocessing.Value('i', 0)
-        self._low_queue_size = multiprocessing.Value('i', 0)
+        # ---------------------------------------------------------------------
+        # AFL++-style "cycle 0" seed phase:
+        # - Execute each initial seed ONCE to generate gen1 mutants.
+        # - Do NOT execute any mutants until all seeds have been processed.
+        # This avoids FIFO interleaving where early slow mutants can starve
+        # remaining seeds and makes gen1 scheduling deterministic.
+        # ---------------------------------------------------------------------
+        self.seed_phase_done = multiprocessing.Event()
+        self.seeds_remaining = multiprocessing.Value('i', len(self.tests))
+        # Buffer of gen1 mutants produced during the initial seed-only phase.
+        self._seed_phase_mutants = self.manager.list()
+        self._seed_phase_lock = multiprocessing.Lock()
+        self._seed_phase_flushed = False
+
+        # Global mutant buffer: workers append here; main loop flushes in sorted order.
+        self._mutant_buffer = self.manager.list()
+        self._mutant_buffer_lock = multiprocessing.Lock()
+
+        # Monotonic sequence for total ordering (prevents tuple compare from falling back to Path objects).
+        self._queue_seq = multiprocessing.Value('L', 0)
+        self._queue_seq_lock = multiprocessing.Lock()
+        
+        # Single work queue (items are enqueued in sorted order during buffer flushes).
+        # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
+        #   - runtime (ascending): fast tests first
+        #   - new_cov_rank: 0=new coverage, 1=existing coverage, 2=seed
+        #   - generation: 0=seed, 1+=mutant
+        #   - seq: monotonic sequence for stable ordering
+        #   - path_str: test path as string
+        self._work_queue = Queue()
+        self._queue_size = multiprocessing.Value('i', 0)
         
         self.bugs_lock = multiprocessing.Lock()
         self.shutdown_event = multiprocessing.Event()
@@ -189,36 +213,26 @@ class CoverageGuidedFuzzer:
             raise ValueError(f"cvc5 not found at: {self.cvc5_path}")
     
     # -------------------------------------------------------------------------
-    # Two-Tier Priority Queue (HIGH = new coverage, LOW = existing coverage)
+    # Work queue helpers (sorted FIFO enqueue via periodic buffer flush)
     # -------------------------------------------------------------------------
     
-    def _queue_push(self, item: tuple, high_priority: bool = False):
-        """Push item to work queue. Item is (priority, generation, path)."""
-        if high_priority:
-            self._high_priority_queue.put(item)
-            with self._high_queue_size.get_lock():
-                self._high_queue_size.value += 1
-        else:
-            self._low_priority_queue.put(item)
-            with self._low_queue_size.get_lock():
-                self._low_queue_size.value += 1
+    def _queue_push(self, item: tuple):
+        """Push item to work queue. Item is a sortable tuple."""
+        self._work_queue.put(item)
+        with self._queue_size.get_lock():
+            self._queue_size.value += 1
     
-    def _queue_push_batch(self, items: list, high_priority: bool = False):
+    def _queue_push_batch(self, items: list):
         """Push multiple items efficiently."""
-        if high_priority:
-            for item in items:
-                self._high_priority_queue.put(item)
-            with self._high_queue_size.get_lock():
-                self._high_queue_size.value += len(items)
-        else:
-            for item in items:
-                self._low_priority_queue.put(item)
-            with self._low_queue_size.get_lock():
-                self._low_queue_size.value += len(items)
+        for item in items:
+            self._work_queue.put(item)
+        with self._queue_size.get_lock():
+            self._queue_size.value += len(items)
     
     def _queue_push_initial(self, test_name: str):
-        """Push initial test (low priority - seeds go to low queue)."""
-        self._queue_push((0.0, 0, test_name), high_priority=False)
+        """Push initial test (seed)."""
+        # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
+        self._queue_push((0.0, 2, 0, self._next_seq(), test_name))
     
     def _queue_push_initial_batch(self, test_names: list):
         """Push multiple initial tests efficiently, filtering out excluded tests."""
@@ -227,9 +241,10 @@ class CoverageGuidedFuzzer:
         filtered_tests = [name for name in test_names if name not in excluded_set]
         skipped_count = len(test_names) - len(filtered_tests)
         
-        items = [(0.0, 0, name) for name in filtered_tests]
+        # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
+        items = [(0.0, 2, 0, self._next_seq(), name) for name in filtered_tests]
         queue_size_before = self._get_queue_size()
-        self._queue_push_batch(items, high_priority=False)
+        self._queue_push_batch(items)
         
         if skipped_count > 0:
             print(f"[QUEUE] Loaded {len(items)} initial tests, skipped {skipped_count} excluded (queue: {queue_size_before} -> {self._get_queue_size()})")
@@ -239,42 +254,69 @@ class CoverageGuidedFuzzer:
         if len(excluded_list) > 0:
             print(f"[QUEUE] [DEBUG] Excluded list has {len(excluded_list)} items: {excluded_list[:3]}...")
         sys.stdout.flush()
-    
+
+    def _seed_phase_buffer_mutants(self, mutant_items: list):
+        """Buffer gen1 mutant queue items during seed phase; flushed once seeds are done."""
+        if not mutant_items:
+            return
+        with self._seed_phase_lock:
+            for item in mutant_items:
+                self._seed_phase_mutants.append(item)
+
+    def _flush_seed_phase_mutants(self):
+        """Flush buffered gen1 mutants after seed phase completes, sorted by priority."""
+        with self._seed_phase_lock:
+            buffered = list(self._seed_phase_mutants)
+            if buffered:
+                self._seed_phase_mutants[:] = []
+        if not buffered:
+            return
+        buffered.sort()
+        self._queue_push_batch(buffered)
+        print(f"[INFO] Flushed {len(buffered)} gen1 mutants from seed phase buffer")
+
+    def _buffer_mutants(self, mutant_items: list):
+        """Buffer mutant queue items to be flushed in sorted order by main loop."""
+        if not mutant_items:
+            return
+        with self._mutant_buffer_lock:
+            for item in mutant_items:
+                self._mutant_buffer.append(item)
+
+    def _flush_mutant_buffer(self):
+        """Flush buffered mutants, sorted by priority (ascending)."""
+        with self._mutant_buffer_lock:
+            buffered = list(self._mutant_buffer)
+            if buffered:
+                self._mutant_buffer[:] = []
+        if not buffered:
+            return
+        buffered.sort()
+        self._queue_push_batch(buffered)
+
     def _queue_pop(self, timeout: float = 1.0) -> Optional[tuple]:
-        """Pop item from queue. HIGH priority queue is drained first."""
-        # Try high priority queue first (non-blocking)
+        """Pop item from queue."""
         try:
-            item = self._high_priority_queue.get_nowait()
-            with self._high_queue_size.get_lock():
-                self._high_queue_size.value -= 1
-            return item
-        except:
-            pass
-        
-        # Fall back to low priority queue (with timeout)
-        try:
-            item = self._low_priority_queue.get(timeout=timeout)
-            with self._low_queue_size.get_lock():
-                self._low_queue_size.value -= 1
+            item = self._work_queue.get(timeout=timeout)
+            with self._queue_size.get_lock():
+                self._queue_size.value -= 1
             return item
         except:
             return None
     
     def _queue_empty(self) -> bool:
-        """Check if both queues are empty."""
-        return self._high_queue_size.value <= 0 and self._low_queue_size.value <= 0
+        """Check if queue is empty."""
+        return self._queue_size.value <= 0
     
     def _get_queue_size(self) -> int:
-        """Get total queue size (both queues)."""
-        return self._high_queue_size.value + self._low_queue_size.value
-    
-    def _get_high_queue_size(self) -> int:
-        """Get high priority queue size."""
-        return self._high_queue_size.value
-    
-    def _get_low_queue_size(self) -> int:
-        """Get low priority queue size."""
-        return self._low_queue_size.value
+        """Get total queue size."""
+        return self._queue_size.value
+
+    def _next_seq(self) -> int:
+        """Monotonic sequence number used for total ordering in queue items."""
+        with self._queue_seq_lock:
+            self._queue_seq.value += 1
+            return int(self._queue_seq.value)
     
     # -------------------------------------------------------------------------
     # Stats helpers (atomic operations on Value objects)
@@ -754,7 +796,7 @@ class CoverageGuidedFuzzer:
         print(f"[STATUS] ═══════════════════════════════════════════════════════")
         print(f"[STATUS] Time: {elapsed:.0f}s elapsed, {remaining:.0f}s remaining ({elapsed/60:.1f}m / {(elapsed+remaining)/60:.1f}m)")
         print(f"[STATUS] Resources: CPU {cpu_avg:.1f}%, Mem {mem_used_gb:.1f}GB used / {mem_avail_gb:.1f}GB avail [{resource_status}]")
-        print(f"[STATUS] Queue: {queue_size} total ({self._get_high_queue_size()} HIGH, {self._get_low_queue_size()} LOW)")
+        print(f"[STATUS] Queue: {queue_size} total")
         # Check actual process alive status
         workers_alive = 0
         workers_dead = 0
@@ -918,10 +960,20 @@ class CoverageGuidedFuzzer:
         worker_id: int,
         scratch_folder: Path,
         bugs_folder: Path,
+        generation: int,
         shm_id: str,
+        shm,
+        global_coverage_map: multiprocessing.Array,
+        coverage_map_lock: multiprocessing.Lock,
         timeout: int = 120,
     ) -> Tuple[int, List[Path], float, List[Path]]:
-        """Run typefuzz inline (no subprocess). Returns (exit_code, bug_files, runtime, mutant_files)."""
+        """
+        Run typefuzz inline (no subprocess).
+        IMPORTANT: for iterations>1, we measure coverage per mutant execution.
+        This function clears/reads the AFL shm bitmap for each mutant,
+        and queues each mutant immediately based on its own coverage outcome.
+        Returns (exit_code, bug_files, runtime_seconds_total, []).
+        """
         if not test_path.exists():
             return (1, [], 0.0, [])
         
@@ -929,7 +981,7 @@ class CoverageGuidedFuzzer:
         bugs_folder.mkdir(parents=True, exist_ok=True)
         
         start_time = time.time()
-        bug_files, mutant_files = [], []
+        bug_files = []
         
         mutator = InlineTypeFuzz(test_path)
         if not mutator.parse():
@@ -941,27 +993,117 @@ class CoverageGuidedFuzzer:
         env['ASAN_OPTIONS'] = 'abort_on_error=0:detect_leaks=0'
         
         z3_cmd, cvc5_cmd = self._get_solver_clis(test_path).split(";")
+
+        # Per-test summary (avoid logging per-iteration unless it matters).
+        produced = 0
+        queued_new = 0
+        queued_existing = 0
+        discarded_no_cov = 0
+        new_edges_total = 0
         
         for i in range(self.iterations):
             formula_str, success = mutator.mutate()
             if not success:
                 continue
-            
+
+            produced += 1
+
             mutant_path = scratch_folder / f"mutant_{worker_id}_{i}.smt2"
             with open(mutant_path, 'w') as f:
                 f.write(formula_str)
-            mutant_files.append(mutant_path)
-            
+
+            # Per-mutant coverage: clear shm before running solvers.
+            try:
+                shm.seek(0)
+                shm.write(b'\x00' * AFL_MAP_SIZE)
+                shm.seek(0)
+            except Exception:
+                pass
+
+            t0 = time.time()
             is_bug, bug_type = mutator.run_solvers(mutant_path, z3_cmd, cvc5_cmd, timeout, env)
+            t1 = time.time()
+            runtime_i = t1 - t0
+
             if is_bug:
                 bug_path = bugs_folder / f"bug_{worker_id}_{i}.smt2"
                 shutil.copy(mutant_path, bug_path)
                 bug_files.append(bug_path)
+                self._inc_stat('bugs_found')
+
+            # Read coverage from shared memory (trace_bits) for this mutant execution.
+            try:
+                shm.seek(0)
+                trace_bits = shm.read(AFL_MAP_SIZE)
+            except Exception:
+                trace_bits = b'\x00' * AFL_MAP_SIZE
+
+            edges_hit = sum(1 for b in trace_bits if b != 0)
+
+            # Check for new coverage using SHARED global_coverage_map (with lock)
+            has_new = False
+            new_edges = 0
+
+            with coverage_map_lock:
+                coverage_bytes = bytes(global_coverage_map[:])
+                for j in range(AFL_MAP_SIZE):
+                    if trace_bits[j] and coverage_bytes[j] == 0xff:
+                        global_coverage_map[j] = 0x00
+                        new_edges += 1
+                        has_new = True
+
+            if has_new:
+                self._inc_stat('total_new_edges', new_edges)
+                new_edges_total += new_edges
+
+            # Decide coverage outcome and queue the mutant
+            if has_new:
+                cov_rank = 0  # NEW coverage gets priority
+                queued_new += 1
+            elif edges_hit > 0:
+                cov_rank = 1  # EXISTING coverage
+                queued_existing += 1
+            else:
+                # No coverage at all - discard
+                discarded_no_cov += 1
+                self._inc_stat('mutants_discarded_no_coverage')
+                try:
+                    mutant_path.unlink()
+                except Exception:
+                    pass
+                continue
+
+            # Queue the mutant: (runtime, new_cov_rank, generation, seq, path_str)
+            pending_name = f"gen{generation+1}_w{worker_id}_iter{i}_{mutant_path.name}"
+            pending_path = self.pending_mutants_dir / pending_name
+            try:
+                shutil.move(str(mutant_path), str(pending_path))
+            except Exception:
+                continue
+
+            self._inc_stat('mutants_created')
+            if cov_rank == 0:
+                self._inc_stat('mutants_with_new_coverage')
+            else:
+                self._inc_stat('mutants_with_existing_coverage')
+
+            mutant_item = (runtime_i, cov_rank, generation + 1, self._next_seq(), str(pending_path))
+
+            # Buffer mutants: seed phase or regular buffer
+            if generation == 0 and not self.seed_phase_done.is_set():
+                self._seed_phase_buffer_mutants([mutant_item])
+            else:
+                self._buffer_mutants([mutant_item])
         
         # Explicit cleanup to prevent ANTLR memory leak
         del mutator
+
+        # Log summary for this test
+        if produced > 0:
+            print(f"[WORKER {worker_id}] [INLINE] {test_path.name}: produced={produced}, new={queued_new} (+{new_edges_total} edges), existing={queued_existing}, discarded={discarded_no_cov}")
         
-        return (0, bug_files, time.time() - start_time, mutant_files)
+        # Return empty mutant_files since mutants are already queued individually
+        return (0, bug_files, time.time() - start_time, [])
     
     def _run_typefuzz(
         self,
@@ -1178,12 +1320,17 @@ class CoverageGuidedFuzzer:
                         time.sleep(self.RESOURCE_CONFIG['pause_duration'])
                         continue
                     
-                    # Parse test item: (runtime, generation, test_path)
-                    runtime_priority, generation, test_path = test_item
+                    # Parse test item: (runtime, new_cov_rank, generation, seq, test_path_str)
+                    runtime_priority, new_cov_rank, generation, seq, test_path = test_item
                     
-                    # Handle string paths (initial tests) vs Path objects (mutants)
+                    # Handle string paths:
+                    # - Seeds (generation==0): relative to tests_root
+                    # - Mutants (generation>0): stored as full path string
                     if isinstance(test_path, str):
-                        test_path = self.tests_root / test_path
+                        if generation == 0:
+                            test_path = self.tests_root / test_path
+                        else:
+                            test_path = Path(test_path)
                     
                     test_name = test_path.name if isinstance(test_path, Path) else Path(test_path).name
                     is_mutant = generation > 0
@@ -1191,7 +1338,7 @@ class CoverageGuidedFuzzer:
                     # Log test pickup
                     queue_size = self._get_queue_size()
                     test_type = f"mutant(gen:{generation})" if is_mutant else "seed"
-                    print(f"[WORKER {worker_id}] [PICK] {test_type} {test_name} (priority:{runtime_priority:.2f}, queue:{queue_size})")
+                    print(f"[WORKER {worker_id}] [PICK] {test_type} {test_name} (runtime:{runtime_priority:.2f}, queue:{queue_size})")
                     
                     # Mark worker as busy
                     self.worker_status[worker_id] = test_name
@@ -1206,8 +1353,10 @@ class CoverageGuidedFuzzer:
                     test_path_obj = test_path if isinstance(test_path, Path) else Path(test_path)
                     
                     if self.use_inline_mode:
+                        # Inline mode handles coverage per-mutant and queues directly
                         exit_code, bug_files, runtime, mutant_files = self._run_inline_typefuzz(
-                            test_path_obj, worker_id, scratch_folder, bugs_folder, shm_id,
+                            test_path_obj, worker_id, scratch_folder, bugs_folder,
+                            generation, shm_id, shm, global_coverage_map, coverage_map_lock,
                         )
                     else:
                         exit_code, bug_files, runtime, mutant_files = self._run_typefuzz(
@@ -1219,6 +1368,18 @@ class CoverageGuidedFuzzer:
                     # Handle exit code
                     action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
                     self._inc_stat('tests_processed')
+
+                    # AFL++-style seed phase accounting: once every initial seed
+                    # has been executed once, allow mutants to be enqueued.
+                    if generation == 0 and not self.seed_phase_done.is_set():
+                        remaining = None
+                        with self.seeds_remaining.get_lock():
+                            if self.seeds_remaining.value > 0:
+                                self.seeds_remaining.value -= 1
+                            remaining = self.seeds_remaining.value
+                        if remaining == 0:
+                            self.seed_phase_done.set()
+                            print(f"[INFO] Seed phase complete: all initial seeds executed once. Flushing gen1 mutants...", flush=True)
                     
                     # Periodic garbage collection to prevent memory bloat
                     tests_since_gc += 1
@@ -1234,7 +1395,7 @@ class CoverageGuidedFuzzer:
                     
                     # Track excluded seed tests (unsupported/timeout) to avoid re-adding on refill
                     if action == 'remove' and generation == 0:
-                        original_test_id = test_item[2]
+                        original_test_id = test_item[4]  # path_str is at index 4 in new format
                         current_excluded = list(self.excluded_tests)
                         if original_test_id not in current_excluded:
                             self.excluded_tests.append(original_test_id)
@@ -1244,114 +1405,126 @@ class CoverageGuidedFuzzer:
                         print(f"[WORKER {worker_id}] [DEBUG] Not excluding {test_name}: generation={generation}, action={action}")
                         sys.stdout.flush()
                     
-                    # Read coverage from shared memory (trace_bits)
-                    shm.seek(0)
-                    trace_bits = shm.read(AFL_MAP_SIZE)
-                    
-                    # Count edges hit in this execution
-                    edges_hit = sum(1 for b in trace_bits if b != 0)
-                    
-                    # Debug: log if we're getting any coverage at all (first few tests only)
-                    if edges_hit == 0 and self._get_stat('tests_processed') < 5:
-                        nonzero_sample = [(i, trace_bits[i]) for i in range(min(100, len(trace_bits))) if trace_bits[i] != 0]
-                        print(f"[DEBUG] SHM {shm_name}: edges_hit={edges_hit}, sample_nonzero={nonzero_sample[:10]}, __AFL_SHM_ID={shm_id}")
-                    
-                    # Check for new coverage using SHARED global_coverage_map (with lock)
-                    has_new = False
-                    new_edges = 0
-                    total_edges_before = 0
-                    
-                    with coverage_map_lock:
-                        coverage_bytes = bytes(global_coverage_map[:])
-                        total_edges_before = sum(1 for b in coverage_bytes if b == 0x00)
+                    # Coverage tracking and mutant processing
+                    # NOTE: Inline mode handles its own per-mutant coverage tracking
+                    if not self.use_inline_mode:
+                        # Read coverage from shared memory (trace_bits)
+                        shm.seek(0)
+                        trace_bits = shm.read(AFL_MAP_SIZE)
                         
-                        for i in range(AFL_MAP_SIZE):
-                            if trace_bits[i] and coverage_bytes[i] == 0xff:
-                                global_coverage_map[i] = 0x00
-                                new_edges += 1
-                                has_new = True
-                    
-                    total_edges_after = total_edges_before + new_edges
-                    print(f"[WORKER {worker_id}] [COV] Test: {test_name} | gen:{generation} | hit:{edges_hit} | new:{new_edges} | total:{total_edges_after}")
-                    
-                    # Decide what to do with mutants based on coverage
-                    # Priority formula: base_priority + runtime
-                    #   - NEW coverage: base=0, so priority = runtime (fast tests first)
-                    #   - EXISTING coverage: base=1000, so priority = 1000 + runtime (always after NEW)
-                    # This preserves runtime-based ordering within each coverage category
-                    if has_new:
-                        self._inc_stat('total_new_edges', new_edges)
-                        priority = runtime  # Fast tests with new coverage first
-                        coverage_type = "NEW"
-                        print(f"[WORKER {worker_id}] ✨ New coverage found: {new_edges} edges (total now: {total_edges_after})")
-                    elif edges_hit > 0:
-                        priority = 1000.0 + runtime  # Existing coverage, but still prefer fast tests
-                        coverage_type = "EXISTING"
-                        print(f"[WORKER {worker_id}] Coverage hit (existing): {edges_hit} edges")
-                    else:
-                        # No coverage at all - discard mutants
-                        if mutant_files:
-                            print(f"[WORKER {worker_id}] [MUTANT] No coverage at all, discarding {len(mutant_files)} mutant(s)")
-                            self._inc_stat('mutants_discarded_no_coverage', len(mutant_files))
-                        for mutant_file in mutant_files:
-                            try:
-                                mutant_file.unlink()
-                            except Exception:
-                                pass
-                        # Skip to next test
-                        coverage_type = None
-                    
-                    # Process mutants if they hit any coverage
-                    if coverage_type is not None and mutant_files:
-                        # Check disk space before queuing (TOP PRIORITY)
-                        can_queue = self._can_queue_mutants(len(mutant_files))
+                        # Count edges hit in this execution
+                        edges_hit = sum(1 for b in trace_bits if b != 0)
                         
-                        if not can_queue:
-                            # Disk space or pending limit exceeded
-                            free_mb = self._get_free_disk_space_mb()
-                            pending = self._count_pending_mutants()
-                            
-                            if coverage_type == "NEW":
-                                # For new coverage, try cleanup first
-                                self._cleanup_old_pending_mutants(self.max_pending_mutants // 2)
-                                can_queue = self._can_queue_mutants(len(mutant_files))
-                            
-                            if not can_queue:
-                                print(f"[WORKER {worker_id}] [DISK] Cannot queue mutants: free={free_mb:.0f}MB, pending={pending}, discarding {len(mutant_files)}")
-                                self._inc_stat('mutants_discarded_disk_space', len(mutant_files))
-                                for mutant_file in mutant_files:
-                                    try:
-                                        mutant_file.unlink()
-                                    except Exception:
-                                        pass
-                                coverage_type = None  # Skip queuing
+                        # Debug: log if we're getting any coverage at all (first few tests only)
+                        if edges_hit == 0 and self._get_stat('tests_processed') < 5:
+                            nonzero_sample = [(i, trace_bits[i]) for i in range(min(100, len(trace_bits))) if trace_bits[i] != 0]
+                            print(f"[DEBUG] SHM {shm_name}: edges_hit={edges_hit}, sample_nonzero={nonzero_sample[:10]}, __AFL_SHM_ID={shm_id}")
                         
-                        if coverage_type is not None:
-                            mutants_to_queue = []
-                            print(f"[WORKER {worker_id}] [MUTANT] Processing {len(mutant_files)} mutant(s) from {test_name} ({coverage_type} coverage, priority={priority})")
+                        # Check for new coverage using SHARED global_coverage_map (with lock)
+                        has_new = False
+                        new_edges = 0
+                        total_edges_before = 0
+                        
+                        with coverage_map_lock:
+                            coverage_bytes = bytes(global_coverage_map[:])
+                            total_edges_before = sum(1 for b in coverage_bytes if b == 0x00)
                             
+                            for i in range(AFL_MAP_SIZE):
+                                if trace_bits[i] and coverage_bytes[i] == 0xff:
+                                    global_coverage_map[i] = 0x00
+                                    new_edges += 1
+                                    has_new = True
+                        
+                        total_edges_after = total_edges_before + new_edges
+                        print(f"[WORKER {worker_id}] [COV] Test: {test_name} | gen:{generation} | hit:{edges_hit} | new:{new_edges} | total:{total_edges_after}")
+                        
+                        # Decide what to do with mutants based on coverage.
+                        # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
+                        #   - runtime (ascending): fast tests first
+                        #   - new_cov_rank: 0=new coverage, 1=existing coverage
+                        if has_new:
+                            self._inc_stat('total_new_edges', new_edges)
+                            runtime_sort = runtime
+                            cov_rank = 0  # NEW coverage gets priority
+                            coverage_type = "NEW"
+                            print(f"[WORKER {worker_id}] ✨ New coverage found: {new_edges} edges (total now: {total_edges_after})")
+                        elif edges_hit > 0:
+                            runtime_sort = runtime
+                            cov_rank = 1  # EXISTING coverage
+                            coverage_type = "EXISTING"
+                            print(f"[WORKER {worker_id}] Coverage hit (existing): {edges_hit} edges")
+                        else:
+                            # No coverage at all - discard mutants
+                            if mutant_files:
+                                print(f"[WORKER {worker_id}] [MUTANT] No coverage at all, discarding {len(mutant_files)} mutant(s)")
+                                self._inc_stat('mutants_discarded_no_coverage', len(mutant_files))
                             for mutant_file in mutant_files:
                                 try:
-                                    pending_name = f"gen{generation+1}_w{worker_id}_{mutant_file.name}"
-                                    pending_path = self.pending_mutants_dir / pending_name
-                                    shutil.move(str(mutant_file), str(pending_path))
-                                    mutants_to_queue.append((priority, generation + 1, pending_path))
-                                    self._inc_stat('mutants_created')
-                                except Exception as e:
-                                    print(f"[WORKER {worker_id}] Warning: Failed to move mutant {mutant_file}: {e}", file=sys.stderr)
+                                    mutant_file.unlink()
+                                except Exception:
+                                    pass
+                            # Skip to next test
+                            coverage_type = None
+                        
+                        # Process mutants if they hit any coverage
+                        if coverage_type is not None and mutant_files:
+                            # Check disk space before queuing (TOP PRIORITY)
+                            can_queue = self._can_queue_mutants(len(mutant_files))
                             
-                            if mutants_to_queue:
-                                is_high_priority = (coverage_type == "NEW")
-                                if is_high_priority:
-                                    self._inc_stat('mutants_with_new_coverage')
-                                else:
-                                    self._inc_stat('mutants_with_existing_coverage')
+                            if not can_queue:
+                                # Disk space or pending limit exceeded
+                                free_mb = self._get_free_disk_space_mb()
+                                pending = self._count_pending_mutants()
                                 
-                                queue_size_before = self._get_queue_size()
-                                high_before = self._get_high_queue_size()
-                                for mutant_item in mutants_to_queue:
-                                    self._queue_push(mutant_item, high_priority=is_high_priority)
-                                print(f"[WORKER {worker_id}] [QUEUE] Added {len(mutants_to_queue)} mutant(s) ({coverage_type}) to {'HIGH' if is_high_priority else 'LOW'} queue (total: {queue_size_before} -> {self._get_queue_size()}, high: {high_before} -> {self._get_high_queue_size()})")
+                                if coverage_type == "NEW":
+                                    # For new coverage, try cleanup first
+                                    self._cleanup_old_pending_mutants(self.max_pending_mutants // 2)
+                                    can_queue = self._can_queue_mutants(len(mutant_files))
+                                
+                                if not can_queue:
+                                    print(f"[WORKER {worker_id}] [DISK] Cannot queue mutants: free={free_mb:.0f}MB, pending={pending}, discarding {len(mutant_files)}")
+                                    self._inc_stat('mutants_discarded_disk_space', len(mutant_files))
+                                    for mutant_file in mutant_files:
+                                        try:
+                                            mutant_file.unlink()
+                                        except Exception:
+                                            pass
+                                    coverage_type = None  # Skip queuing
+                            
+                            if coverage_type is not None:
+                                mutants_to_queue = []
+                                print(f"[WORKER {worker_id}] [MUTANT] Processing {len(mutant_files)} mutant(s) from {test_name} ({coverage_type} coverage, runtime={runtime_sort:.3f}s)")
+                                
+                                for mutant_file in mutant_files:
+                                    try:
+                                        pending_name = f"gen{generation+1}_w{worker_id}_{mutant_file.name}"
+                                        pending_path = self.pending_mutants_dir / pending_name
+                                        shutil.move(str(mutant_file), str(pending_path))
+                                        # Queue item: (runtime, new_cov_rank, generation, seq, path_str)
+                                        mutants_to_queue.append(
+                                            (runtime_sort, cov_rank, generation + 1, self._next_seq(), str(pending_path))
+                                        )
+                                        self._inc_stat('mutants_created')
+                                    except Exception as e:
+                                        print(f"[WORKER {worker_id}] Warning: Failed to move mutant {mutant_file}: {e}", file=sys.stderr)
+                                
+                                if mutants_to_queue:
+                                    if coverage_type == "NEW":
+                                        self._inc_stat('mutants_with_new_coverage')
+                                    else:
+                                        self._inc_stat('mutants_with_existing_coverage')
+
+                                    # Sort by (runtime, new_cov_rank, generation, seq, path).
+                                    mutants_to_queue.sort()
+
+                                    # Seed phase: buffer gen1 mutants and only enqueue after all seeds are done.
+                                    if generation == 0 and not self.seed_phase_done.is_set():
+                                        self._seed_phase_buffer_mutants(mutants_to_queue)
+                                        print(f"[WORKER {worker_id}] [QUEUE] Buffered {len(mutants_to_queue)} gen1 mutant(s) ({coverage_type}) for seed-phase flush")
+                                    else:
+                                        # Buffer and let main loop flush in sorted order across ALL workers.
+                                        self._buffer_mutants(mutants_to_queue)
+                                        print(f"[WORKER {worker_id}] [QUEUE] Buffered {len(mutants_to_queue)} mutant(s) ({coverage_type}) for sorted flush")
                     
                     # Delete executed mutant if it's from pending folder
                     test_path_obj = test_path if isinstance(test_path, Path) else Path(test_path)
@@ -1482,8 +1655,17 @@ class CoverageGuidedFuzzer:
                 if current_time - last_refill_check >= 2.0:
                     idle_workers = sum(1 for w_id in range(1, self.num_workers + 1) 
                                       if self.worker_status.get(w_id) is None)
-                    
-                    if self._queue_empty() and idle_workers > 0:
+
+                    # Flush buffered mutants frequently so workers see sorted work.
+                    self._flush_mutant_buffer()
+
+                    # After the initial seed-only phase completes, flush buffered gen1 mutants once.
+                    if (not self._seed_phase_flushed) and self.seed_phase_done.is_set():
+                        self._flush_seed_phase_mutants()
+                        self._seed_phase_flushed = True
+
+                    # IMPORTANT: during seed phase, do NOT refill seeds (we want exactly one pass).
+                    if self.seed_phase_done.is_set() and self._queue_empty() and idle_workers > 0:
                         gen = self._get_stat('generations_completed') + 1
                         print(f"[INFO] Queue empty with {idle_workers} idle worker(s), refilling (generation {gen})...")
                         self._queue_push_initial_batch(self.tests)
@@ -1522,7 +1704,7 @@ class CoverageGuidedFuzzer:
         print(f"[DEBUG] MAIN LOOP EXIT DIAGNOSTICS", flush=True)
         print(f"[DEBUG]   shutdown_event: {self.shutdown_event.is_set()}", flush=True)
         print(f"[DEBUG]   time_remaining: {self._get_time_remaining():.1f}s", flush=True)
-        print(f"[DEBUG]   queue_size: {self._get_queue_size()} (high: {self._get_high_queue_size()}, low: {self._low_queue_size.value})", flush=True)
+        print(f"[DEBUG]   queue_size: {self._get_queue_size()}", flush=True)
         print(f"[DEBUG]   tests_processed: {self._get_stat('tests_processed')}", flush=True)
         print(f"[DEBUG]   bugs_found: {self._get_stat('bugs_found')}", flush=True)
         print(f"[DEBUG]   workers_alive: {sum(1 for w in workers if w.is_alive())}/{len(workers)}", flush=True)

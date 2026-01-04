@@ -17,6 +17,7 @@ from yinyang.src.parsing.Typechecker import typecheck
 from yinyang.src.mutators.GenTypeAwareMutation.GenTypeAwareMutation import GenTypeAwareMutation
 from yinyang.src.mutators.GenTypeAwareMutation.Util import get_unique_subterms
 from yinyang.config.Config import crash_list, ignore_list
+from yinyang.src.base.Utils import random_string
 
 
 class InlineTypeFuzz:
@@ -28,6 +29,9 @@ class InlineTypeFuzz:
         self._formula = None
         self._mutator = None
         self._header = ""
+        # Used to emulate yinyang's global RNG consumption patterns so that
+        # mutation streams match `typefuzz --seed N` more closely.
+        self._yinyang_fuzzer_name = None
     
     def parse(self) -> bool:
         """Parse and typecheck seed. Returns True on success."""
@@ -52,6 +56,10 @@ class InlineTypeFuzz:
                 def __init__(self, cfg): self.config = str(cfg)
             
             self._mutator = GenTypeAwareMutation(self._formula, Args(self.config_path), unique_expr)
+            # yinyang's Fuzzer.__init__ consumes RNG once via random_string() to create a fuzzer name.
+            # When comparing with subprocess `typefuzz --seed N` (fresh process per test), this
+            # affects the subsequent mutation RNG stream because yinyang uses the global `random`.
+            self._yinyang_fuzzer_name = random_string()
             return True
         except Exception:
             return False
@@ -63,6 +71,10 @@ class InlineTypeFuzz:
         try:
             mutant, success, _ = self._mutator.mutate()
             if success:
+                # yinyang consumes RNG once per successful iteration when creating the scratch filename
+                # (see Fuzzer.create_testbook -> random_string()). This call keeps the global RNG
+                # stream aligned with subprocess typefuzz runs.
+                _ = random_string()
                 return self._header + str(mutant), True
             return None, False
         except Exception:

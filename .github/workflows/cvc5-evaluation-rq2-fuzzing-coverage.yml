@@ -407,6 +407,7 @@ jobs:
             --tests-root 'test/regress/cli' \
             --fuzzing-duration-minutes ${FUZZING_DURATION} \
             --iterations 250 \
+            --seed 42 \
             --cvc5-path ./build/bin/cvc5 \
             --build-dir ./build || true
           
