@@ -539,14 +539,21 @@ jobs:
       
       - name: Merge statistics
         run: |
-          # Use dedicated merge script
-          python3 ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/merge_coverage_stats.py \
-            results-artifacts \
-            --commit '${{ matrix.commit }}' \
-            --output 'merged_statistics_${{ matrix.commit }}.json' || {
-              echo "⚠️ No results found for commit ${{ matrix.commit }}"
-              exit 0
-            }
+          # Keep output format consistent with Variant1:
+          # - total_functions / functions_triggered / functions_not_triggered
+          # - functions[] with {function_id, triggered, total_executions, jobs_triggered}
+          STATS_FILES=$(find results-artifacts -name "function_counts_${{ matrix.commit }}_*.json" -type f | sort)
+          if [ -z "$STATS_FILES" ]; then
+            echo "⚠️ No function count files found for commit ${{ matrix.commit }}"
+            exit 0
+          fi
+
+          python3 ${{ github.workspace }}/scripts/cvc5/commit_fuzzer/merge_fuzzing_statistics.py \
+            $STATS_FILES \
+            --output merged_statistics_${{ matrix.commit }}.json \
+            --commit-hash ${{ matrix.commit }} \
+            --coverage-map-commit ${{ matrix.commit }} \
+            --changed-functions-json ./changed_functions.json
       
       - name: Configure AWS credentials
         if: ${{ !inputs.dry_run }}
