@@ -266,7 +266,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.collect-matrices.outputs.fuzzing_matrix) }}
-    timeout-minutes: 90  # 60 minutes fuzzing + 30 minutes for build/setup
+    timeout-minutes: 150  # 60 minutes fuzzing + 90 minutes for debug build/setup (debug mode is slower)
     
     steps:
       - name: Checkout
