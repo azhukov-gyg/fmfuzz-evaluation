@@ -1030,6 +1030,14 @@ class CoverageGuidedFuzzer:
                 shutil.copy(mutant_path, bug_path)
                 bug_files.append(bug_path)
                 self._inc_stat('bugs_found')
+                # Match yinyang behavior: stop mutating this seed when bug found
+                # to avoid finding duplicate/similar bugs from same seed
+                print(f"[WORKER {worker_id}] [INLINE] Bug found ({bug_type}) - stopping iteration for {test_path.name}")
+                try:
+                    mutant_path.unlink()
+                except Exception:
+                    pass
+                break
 
             # Read coverage from shared memory (trace_bits) for this mutant execution.
             try:
@@ -1097,6 +1105,11 @@ class CoverageGuidedFuzzer:
         
         # Explicit cleanup to prevent ANTLR memory leak
         del mutator
+
+        # CRITICAL: Merge and cleanup profraw files after each inline test
+        # Each test generates 250 iterations × 2 solvers × ~16MB = ~8GB of profraw files
+        # Without cleanup, disk fills up after just 1-2 tests
+        self._cleanup_worker_profraw(worker_id)
 
         # Log summary for this test
         if produced > 0:
@@ -1190,14 +1203,19 @@ class CoverageGuidedFuzzer:
                 sizes = [(f.name, f.stat().st_size) for f in new_files[-3:]]  # Last 3
                 print(f"[WORKER {worker_id}] [PGO DEBUG] profraw_after={profraw_after} (new:{profraw_new}), recent_files={sizes}")
             
+            # Cleanup profraw files after each test to prevent disk exhaustion
+            self._cleanup_worker_profraw(worker_id)
+            
             return (exit_code, bug_files, runtime, mutant_files)
             
         except subprocess.TimeoutExpired:
             runtime = time.time() - start_time
+            self._cleanup_worker_profraw(worker_id)  # Cleanup even on timeout
             return (124, [], runtime, [])
         except Exception as e:
             print(f"[WORKER {worker_id}] Error running typefuzz: {e}", file=sys.stderr)
             runtime = time.time() - start_time
+            self._cleanup_worker_profraw(worker_id)  # Cleanup even on error
             return (1, [], runtime, [])
     
     def _handle_exit_code(
@@ -1805,6 +1823,79 @@ class CoverageGuidedFuzzer:
                 'runtime_seconds': time.time() - self.start_time,
             }, f, indent=2)
         print(f"[INFO] Coverage statistics saved to: {stats_output}")
+    
+    def _cleanup_worker_profraw(self, worker_id: int):
+        """Merge and cleanup profraw files from a specific worker after each test.
+        
+        This is CRITICAL for inline mode where each test generates hundreds of 
+        profraw files (~16MB each). Without cleanup, disk fills up after 1-2 tests.
+        """
+        # Find profraw files for this worker
+        worker_pattern = f"worker_{worker_id}_*.profraw"
+        worker_profraw_files = list(self.profraw_dir.glob(worker_pattern))
+        
+        if not worker_profraw_files:
+            return  # Nothing to cleanup
+        
+        # Calculate size for logging
+        total_size_mb = sum(f.stat().st_size for f in worker_profraw_files) / (1024 * 1024)
+        
+        accumulated_profdata = self.output_dir / "accumulated.profdata"
+        temp_profdata = self.output_dir / f"temp_merge_w{worker_id}.profdata"
+        
+        try:
+            # Build merge command
+            cmd = ["llvm-profdata", "merge", "-sparse", "-o", str(temp_profdata)]
+            
+            # Include existing accumulated profdata if it exists
+            if accumulated_profdata.exists():
+                cmd.append(str(accumulated_profdata))
+            
+            cmd.extend([str(f) for f in worker_profraw_files])
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                # Replace accumulated with new merged file (atomic-ish)
+                if accumulated_profdata.exists():
+                    accumulated_profdata.unlink()
+                temp_profdata.rename(accumulated_profdata)
+                
+                # Delete merged profraw files to recover disk space
+                deleted_count = 0
+                for f in worker_profraw_files:
+                    try:
+                        f.unlink()
+                        deleted_count += 1
+                    except Exception:
+                        pass
+                
+                print(f"[WORKER {worker_id}] [PGO] Merged {len(worker_profraw_files)} profraw files ({total_size_mb:.1f}MB), deleted {deleted_count}")
+            else:
+                # Merge failed - still try to delete files to save disk space
+                print(f"[WORKER {worker_id}] [PGO WARN] Merge failed: {result.stderr[:200]}", file=sys.stderr)
+                # Delete profraw files anyway to prevent disk exhaustion
+                for f in worker_profraw_files:
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
+                print(f"[WORKER {worker_id}] [PGO] Deleted {len(worker_profraw_files)} profraw files ({total_size_mb:.1f}MB) despite merge failure")
+                
+        except subprocess.TimeoutExpired:
+            print(f"[WORKER {worker_id}] [PGO WARN] Merge timed out, deleting profraw files", file=sys.stderr)
+            for f in worker_profraw_files:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[WORKER {worker_id}] [PGO WARN] Error in profraw cleanup: {e}", file=sys.stderr)
+            # Emergency cleanup - delete files to prevent disk exhaustion
+            for f in worker_profraw_files:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
     
     def _periodic_profraw_merge(self):
         """Periodically merge profraw files to save disk space."""
