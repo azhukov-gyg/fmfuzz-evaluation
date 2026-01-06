@@ -135,9 +135,7 @@ clang++ -c -o "$AGENT_OBJ" "$AGENT_SRC" -O2 -g -std=c++17 -fPIC -fno-sanitize-co
 
 # Configure with production profile and static library
 # --static builds CVC5 as static library (BUILD_SHARED_LIBS=OFF)
-# NOTE: --assertions is critical to trigger proof-related code paths (e.g., EqProof functions)
-# Without it, many assertion-guarded code paths are skipped and function counts will be much lower
-./configure.sh production --assertions --static --auto-download --name="$BUILD_DIR"
+./configure.sh production --static --auto-download --name="$BUILD_DIR"
 cd "$BUILD_DIR"
 
 # Phase 5b: Inject coverage agent via CMake
