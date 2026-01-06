@@ -1026,7 +1026,11 @@ class CoverageGuidedFuzzer:
             runtime_i = t1 - t0
 
             if is_bug:
-                bug_path = bugs_folder / f"bug_{worker_id}_{i}.smt2"
+                # Match typefuzz naming: {bugtype}-{solver}-{seed}-{random}.smt2
+                seed_name = test_path.stem  # e.g., "arith-eq" from "arith-eq.smt2"
+                random_suffix = uuid.uuid4().hex[:8]
+                bug_filename = f"{bug_type}-cvc5-{seed_name}-{random_suffix}.smt2"
+                bug_path = bugs_folder / bug_filename
                 shutil.copy(mutant_path, bug_path)
                 bug_files.append(bug_path)
                 self._inc_stat('bugs_found')
