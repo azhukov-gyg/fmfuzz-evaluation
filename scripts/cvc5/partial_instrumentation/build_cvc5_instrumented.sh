@@ -133,9 +133,12 @@ mkdir -p "$BUILD_DIR"
 # Rebuild coverage agent after rm
 clang++ -c -o "$AGENT_OBJ" "$AGENT_SRC" -O2 -g -std=c++17 -fPIC -fno-sanitize-coverage=trace-pc-guard
 
-# Configure with production profile and static library
+# Configure with debug profile and assertions to match simple fuzzer build
+# This ensures we're comparing apples to apples:
+# - Simple fuzzer uses: debug --assertions --coverage
+# - Coverage-guided now uses: debug --assertions (+ sancov/PGO)
 # --static builds CVC5 as static library (BUILD_SHARED_LIBS=OFF)
-./configure.sh production --static --auto-download --name="$BUILD_DIR"
+./configure.sh debug --assertions --static --auto-download --name="$BUILD_DIR"
 cd "$BUILD_DIR"
 
 # Phase 5b: Inject coverage agent via CMake
