@@ -1332,8 +1332,8 @@ class CoverageGuidedFuzzer:
         env = os.environ.copy()
         env['__AFL_SHM_ID'] = str(shm_id)
         
-        # Use global timeout (default 120s = 2 minutes)
-        timeout = self.timeout if self.timeout else 120
+        # Per-test timeout: 2 minutes (120 seconds)
+        timeout = 120
         
         # Run CVC5 with timeout
         t0 = time.time()
@@ -1711,7 +1711,7 @@ class CoverageGuidedFuzzer:
         
         OPTIMIZATION: Shared memory is created ONCE per worker and reused (cleared between tests).
         """
-        print(f"[WORKER {worker_id}] Started")
+        print(f"[WORKER {worker_id}] Started", flush=True)
         
         # Counter for periodic GC and worker restart
         tests_processed_this_worker = 0
@@ -1849,7 +1849,7 @@ class CoverageGuidedFuzzer:
                         bug_files = []
                         mutant_files = []
                         action = 'keep' if exit_code == 0 else 'remove'
-                        print(f"[WORKER {worker_id}] [CAL] {test_name} (runtime: {runtime:.1f}s)")
+                        print(f"[WORKER {worker_id}] [CAL] {test_name} (runtime: {runtime:.1f}s)", flush=True)
                     else:
                         # Run typefuzz (inline or subprocess) with dynamic iterations
                         time_remaining = self._get_time_remaining()
