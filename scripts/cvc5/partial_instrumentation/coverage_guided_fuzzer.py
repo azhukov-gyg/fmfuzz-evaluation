@@ -76,6 +76,7 @@ class CoverageGuidedFuzzer:
         total_instrumented_edges: int = 0,  # From coverage agent
         use_inline_mode: bool = False,
         hours_budget: float = 1.0,  # Time budget in hours for iteration range calculation
+        per_test_timeout: int = 120,  # Per-test timeout in seconds (2 minutes default)
     ):
         self.tests = tests
         self.tests_root = Path(tests_root)
@@ -90,6 +91,7 @@ class CoverageGuidedFuzzer:
         self.total_instrumented_edges = total_instrumented_edges
         self.use_inline_mode = use_inline_mode and INLINE_AVAILABLE
         self.hours_budget = hours_budget
+        self.per_test_timeout = per_test_timeout
         
         try:
             self.cpu_count = psutil.cpu_count()
@@ -1332,8 +1334,8 @@ class CoverageGuidedFuzzer:
         env = os.environ.copy()
         env['__AFL_SHM_ID'] = str(shm_id)
         
-        # Per-test timeout: 2 minutes (120 seconds)
-        timeout = 120
+        # Use configured per-test timeout
+        timeout = self.per_test_timeout
         
         # Run CVC5 with timeout
         t0 = time.time()
@@ -1585,7 +1587,7 @@ class CoverageGuidedFuzzer:
             "-i", str(num_iterations),
             "-m", str(self.modulo),
             "--seed", str(self.seed),
-            "--timeout", "120",
+            "--timeout", str(self.per_test_timeout),
             "--bugs", str(bugs_folder),
             "--scratch", str(scratch_folder),
             "--logfolder", str(log_folder),
@@ -1859,6 +1861,7 @@ class CoverageGuidedFuzzer:
                             exit_code, bug_files, runtime, mutant_files = self._run_inline_typefuzz(
                                 test_path_obj, worker_id, scratch_folder, bugs_folder,
                                 generation, shm_id, shm, global_coverage_map, coverage_map_lock,
+                                timeout=self.per_test_timeout,
                                 iterations=dynamic_iterations,
                             )
                         else:
@@ -2662,6 +2665,12 @@ def main():
         action="store_true",
         help="Use inline typefuzz (faster, no subprocess)",
     )
+    parser.add_argument(
+        "--per-test-timeout",
+        type=int,
+        default=120,
+        help="Per-test timeout in seconds (default: 120 = 2 minutes)",
+    )
     
     args = parser.parse_args()
     
@@ -2714,6 +2723,7 @@ def main():
             total_instrumented_edges=args.total_edges,
             use_inline_mode=args.inline,
             hours_budget=hours_budget,
+            per_test_timeout=args.per_test_timeout,
         )
         
         fuzzer.run()
