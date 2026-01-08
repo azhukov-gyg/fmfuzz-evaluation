@@ -624,8 +624,10 @@ class CoverageGuidedFuzzer:
             perf_score = self._calculate_perf_score(runtime_ms, edges_hit, 0, test_path_str, path_freq, owned_edges)
             iterations = self._score_to_iterations(perf_score)
             
-            # Set newcomer bonus for seeds (they're new to actual fuzzing)
-            self._set_newcomer(test_path_str, 4)
+            # NOTE: Do NOT set newcomer bonus for seeds.
+            # Seeds are known inputs, not discoveries. Newcomer bonus (N factor)
+            # is only for mutants that find new coverage.
+            # Previously this caused all seeds to get iter=250 due to N=4 boost.
             
             # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
             # Use runtime as sort key so fast seeds are processed first
