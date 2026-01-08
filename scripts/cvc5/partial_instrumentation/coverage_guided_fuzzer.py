@@ -61,7 +61,6 @@ class CoverageGuidedFuzzer:
         tests_root: str,
         bugs_folder: str = "bugs",
         num_workers: int = 4,
-        iterations: int = 1,
         modulo: int = 2,
         max_pending_mutants: int = 10000,  # Disk space protection
         min_disk_space_mb: int = 500,  # Minimum free disk space to continue
@@ -76,11 +75,11 @@ class CoverageGuidedFuzzer:
         output_dir: str = "./output",
         total_instrumented_edges: int = 0,  # From coverage agent
         use_inline_mode: bool = False,
+        hours_budget: float = 1.0,  # Time budget in hours for iteration range calculation
     ):
         self.tests = tests
         self.tests_root = Path(tests_root)
         self.bugs_folder = Path(bugs_folder)
-        self.iterations = iterations
         self.modulo = modulo
         self.seed = seed
         self.job_id = job_id
@@ -90,6 +89,7 @@ class CoverageGuidedFuzzer:
         self.min_disk_space_mb = min_disk_space_mb
         self.total_instrumented_edges = total_instrumented_edges
         self.use_inline_mode = use_inline_mode and INLINE_AVAILABLE
+        self.hours_budget = hours_budget
         
         try:
             self.cpu_count = psutil.cpu_count()
@@ -125,18 +125,26 @@ class CoverageGuidedFuzzer:
         self.manager = multiprocessing.Manager()
         
         # ---------------------------------------------------------------------
-        # AFL++-style "cycle 0" seed phase:
-        # - Execute each initial seed ONCE to generate gen1 mutants.
-        # - Do NOT execute any mutants until all seeds have been processed.
-        # This avoids FIFO interleaving where early slow mutants can starve
-        # remaining seeds and makes gen1 scheduling deterministic.
+        # AFL++-style calibration phase:
+        # 1. First, run each seed ONCE with iterations=1 (no mutations) to
+        #    measure baseline timing and coverage. This establishes avg_runtime
+        #    and avg_coverage for accurate AFL-style scoring.
+        # 2. After calibration, re-queue seeds with proper score-based iterations.
+        # 3. Do NOT execute any mutants until all seeds have been calibrated.
         # ---------------------------------------------------------------------
-        self.seed_phase_done = multiprocessing.Event()
+        self.calibration_done = multiprocessing.Event()
         self.seeds_remaining = multiprocessing.Value('i', len(self.tests))
-        # Buffer of gen1 mutants produced during the initial seed-only phase.
+        # Track calibrated seeds for re-queuing
+        self._calibrated_seeds = self.manager.list()
+        self._calibrated_seeds_lock = multiprocessing.Lock()
+        
+        # Legacy alias for compatibility
+        self.seed_phase_done = self.calibration_done
+        # Buffer of gen1 mutants produced during the initial calibration phase.
         self._seed_phase_mutants = self.manager.list()
         self._seed_phase_lock = multiprocessing.Lock()
         self._seed_phase_flushed = False
+        self._calibration_seeds_requeued = False
 
         # Global mutant buffer: workers append here; main loop flushes in sorted order.
         self._mutant_buffer = self.manager.list()
@@ -205,12 +213,333 @@ class CoverageGuidedFuzzer:
         self.profdata_merge_interval = profdata_merge_interval
         self.profraw_merge_counter = multiprocessing.Value('i', 0)
         
+        # -------------------------------------------------------------------------
+        # AFL-style scoring: tracking for perf_score calculation
+        # -------------------------------------------------------------------------
+        # Simple running averages (like AFL: total/count, no EMA)
+        self.total_runtime_ms = multiprocessing.Value('d', 0.0)
+        self.total_coverage = multiprocessing.Value('d', 0.0)
+        self.sample_count = multiprocessing.Value('i', 0)
+        self.avg_lock = multiprocessing.Lock()
+        
+        # Newcomer tracking: test_path -> bonus value (decremented each time processed)
+        # New tests start with bonus=4 for initial boost
+        self.test_newcomer = self.manager.dict()
+        self.newcomer_lock = multiprocessing.Lock()
+        
+        # Path frequency tracking (AFL's n_fuzz): coverage_hash -> times_seen
+        # Used for F (rarity) factor - rare paths get priority
+        self.path_frequency = self.manager.dict()
+        self.path_frequency_lock = multiprocessing.Lock()
+        self.max_path_frequency = multiprocessing.Value('i', 1)
+        
+        # Test -> path_frequency mapping (for score lookup)
+        self.test_path_freq = self.manager.dict()
+        
+        # Owned edges tracking (AFL's tc_ref): edge_id -> (test_path, best_runtime_ms)
+        # Used for U (unique) factor - tests that own more edges get priority
+        self.edge_owner = self.manager.dict()
+        self.edge_owner_lock = multiprocessing.Lock()
+        # Test -> owned_edges_count mapping (for score lookup)
+        self.test_owned_edges = self.manager.dict()
+        
     def _validate_solvers(self):
         z3_binary = self.z3_cmd.split()[0]
         if not shutil.which(z3_binary):
             raise ValueError(f"z3 not found in PATH")
         if not self.cvc5_path.exists():
             raise ValueError(f"cvc5 not found at: {self.cvc5_path}")
+    
+    # -------------------------------------------------------------------------
+    # AFL-style Scoring System (adapted from AFL++ calculate_score)
+    # -------------------------------------------------------------------------
+    
+    def _get_speed_base(self, runtime_ms: float) -> int:
+        """
+        AFL-style speed-based starting score.
+        Faster tests get higher base score (more iterations).
+        
+        Returns base score in [10, 300].
+        """
+        avg_runtime = self._get_avg_runtime_ms()
+        
+        ratio = runtime_ms / avg_runtime
+        
+        if ratio > 10:    return 10    # Very slow: minimal iterations
+        if ratio > 4:     return 25
+        if ratio > 2:     return 50
+        if ratio > 1.33:  return 75
+        if ratio < 0.25:  return 300   # Very fast: maximum iterations
+        if ratio < 0.33:  return 200
+        if ratio < 0.5:   return 150
+        return 100                      # Average speed
+    
+    def _get_coverage_multiplier(self, edges_hit: int) -> float:
+        """
+        AFL-style coverage factor.
+        Tests hitting more edges get higher multiplier.
+        
+        Returns multiplier in [0.25, 3.0].
+        """
+        avg_cov = self._get_avg_coverage()
+        
+        ratio = edges_hit / avg_cov
+        
+        if ratio > 3.3:   return 3.0    # Much more coverage: big boost
+        if ratio > 2:     return 2.0
+        if ratio > 1.33:  return 1.5
+        if ratio < 0.33:  return 0.25   # Much less coverage: big penalty
+        if ratio < 0.5:   return 0.5
+        if ratio < 0.67:  return 0.75
+        return 1.0                       # Average coverage
+    
+    def _get_newcomer_multiplier(self, test_path: str) -> tuple:
+        """
+        AFL-style newcomer bonus.
+        Newly discovered tests get temporary boost, decremented each processing.
+        
+        Returns (multiplier, should_update_bonus).
+        - multiplier in [1.0, 4.0]
+        """
+        with self.newcomer_lock:
+            bonus = self.test_newcomer.get(test_path, 0)
+            
+            if bonus >= 4:
+                return 4.0, True  # Big boost, will decrement by 4
+            elif bonus > 0:
+                return 2.0, True  # Medium boost, will decrement by 1
+            return 1.0, False     # No boost
+    
+    def _decrement_newcomer(self, test_path: str):
+        """Decrement newcomer bonus after processing."""
+        with self.newcomer_lock:
+            bonus = self.test_newcomer.get(test_path, 0)
+            if bonus >= 4:
+                self.test_newcomer[test_path] = bonus - 4
+            elif bonus > 0:
+                self.test_newcomer[test_path] = bonus - 1
+    
+    def _set_newcomer(self, test_path: str, bonus: int = 4):
+        """Set initial newcomer bonus for a new test."""
+        with self.newcomer_lock:
+            self.test_newcomer[test_path] = bonus
+    
+    def _get_depth_multiplier(self, generation: int) -> float:
+        """
+        AFL-style depth factor.
+        Deeper tests (more mutations from original) get higher multiplier
+        because they represent productive lineages worth exploring further.
+        
+        Returns multiplier in [1, 5].
+        """
+        if generation <= 3:   return 1
+        if generation <= 7:   return 2
+        if generation <= 13:  return 3
+        if generation <= 25:  return 4
+        return 5
+    
+    def _hash_coverage(self, trace_bits: bytes) -> str:
+        """
+        Hash coverage bitmap to identify unique paths (AFL's coverage signature).
+        Uses a simple hash of non-zero positions and their hit counts.
+        """
+        import hashlib
+        # Create a compact representation: positions with hits
+        sig = []
+        for i, b in enumerate(trace_bits):
+            if b:
+                # Bucket hit counts: 1, 2, 3, 4-7, 8-15, 16-31, 32-127, 128+
+                if b == 1: bucket = 0
+                elif b == 2: bucket = 1
+                elif b == 3: bucket = 2
+                elif b <= 7: bucket = 3
+                elif b <= 15: bucket = 4
+                elif b <= 31: bucket = 5
+                elif b <= 127: bucket = 6
+                else: bucket = 7
+                sig.append(f"{i}:{bucket}")
+        
+        sig_str = ",".join(sig)
+        return hashlib.md5(sig_str.encode()).hexdigest()[:16]
+    
+    def _update_path_frequency(self, coverage_hash: str, test_path: str = None) -> int:
+        """
+        Update path frequency counter. Returns current frequency for this path.
+        Optionally stores the frequency for the test path (for later score lookups).
+        """
+        with self.path_frequency_lock:
+            freq = self.path_frequency.get(coverage_hash, 0) + 1
+            self.path_frequency[coverage_hash] = freq
+            
+            # Update max frequency
+            if freq > self.max_path_frequency.value:
+                self.max_path_frequency.value = freq
+            
+            # Store for test path lookup
+            if test_path:
+                self.test_path_freq[test_path] = freq
+            
+            return freq
+    
+    def _get_test_path_frequency(self, test_path: str) -> int:
+        """Get stored path frequency for a test (default 1 if unknown)."""
+        return self.test_path_freq.get(test_path, 1)
+    
+    def _get_rarity_multiplier(self, path_frequency: int) -> float:
+        """
+        AFL-style rarity factor (n_fuzz).
+        Rare paths (seen fewer times) get higher multiplier.
+        
+        Returns multiplier in [0.25, 4.0].
+        """
+        max_freq = max(1, self.max_path_frequency.value)
+        
+        # Ratio of this path's frequency to max frequency
+        ratio = path_frequency / max_freq
+        
+        if ratio <= 0.01:  return 4.0   # Very rare (≤1% of max)
+        if ratio <= 0.05:  return 3.0   # Rare
+        if ratio <= 0.1:   return 2.0   # Uncommon
+        if ratio <= 0.25:  return 1.5   # Below average
+        if ratio <= 0.5:   return 1.0   # Average
+        if ratio <= 0.75:  return 0.75  # Common
+        return 0.5                       # Very common (>75% of max)
+    
+    def _update_edge_ownership(self, trace_bits: bytes, runtime_ms: float, test_path: str):
+        """
+        Update edge ownership tracking (AFL's tc_ref).
+        A test "owns" an edge if it's the fastest test to reach that edge.
+        """
+        with self.edge_owner_lock:
+            owned_count = 0
+            for edge_id, hit_count in enumerate(trace_bits):
+                if hit_count == 0:
+                    continue
+                
+                current_owner = self.edge_owner.get(edge_id)
+                if current_owner is None:
+                    # First test to hit this edge - owns it
+                    self.edge_owner[edge_id] = (test_path, runtime_ms)
+                    owned_count += 1
+                else:
+                    owner_path, owner_runtime = current_owner
+                    if owner_path == test_path:
+                        # Already owns it, update runtime if faster
+                        if runtime_ms < owner_runtime:
+                            self.edge_owner[edge_id] = (test_path, runtime_ms)
+                        owned_count += 1
+                    elif runtime_ms < owner_runtime:
+                        # Steal ownership - this test is faster
+                        # Decrement old owner's count
+                        old_count = self.test_owned_edges.get(owner_path, 0)
+                        if old_count > 0:
+                            self.test_owned_edges[owner_path] = old_count - 1
+                        # Take ownership
+                        self.edge_owner[edge_id] = (test_path, runtime_ms)
+                        owned_count += 1
+            
+            # Update this test's owned edge count
+            self.test_owned_edges[test_path] = owned_count
+    
+    def _get_owned_edges_count(self, test_path: str) -> int:
+        """Get number of edges owned by this test."""
+        return self.test_owned_edges.get(test_path, 0)
+    
+    def _get_owned_edges_multiplier(self, owned_edges: int) -> float:
+        """
+        AFL-style owned edges factor (tc_ref).
+        Tests owning more edges get higher multiplier (they're "favored").
+        
+        Returns multiplier in [0.5, 4.0].
+        """
+        if owned_edges >= 100: return 4.0   # Owns many edges
+        if owned_edges >= 50:  return 3.0
+        if owned_edges >= 20:  return 2.0
+        if owned_edges >= 10:  return 1.5
+        if owned_edges >= 5:   return 1.0   # Average
+        if owned_edges >= 1:   return 0.75
+        return 0.5                           # Owns no edges
+    
+    def _calculate_perf_score(
+        self,
+        runtime_ms: float,
+        edges_hit: int,
+        generation: int,
+        test_path: str,
+        path_frequency: int = 1,
+        owned_edges: int = 0,
+    ) -> float:
+        """
+        Calculate AFL-style performance score.
+        Higher score = more iterations deserved.
+        
+        Score = S(speed) × C(coverage) × N(newcomer) × D(depth) × F(rarity) × U(owned)
+        
+        Factors:
+          S: [10, 300]   - base score from speed (fast=300, slow=10)
+          C: [0.25, 3.0] - coverage relative to average
+          N: [1.0, 4.0]  - newcomer bonus (decays over processing)
+          D: [1, 5]      - depth/generation bonus (deep lineages get more)
+          F: [0.5, 4.0]  - path rarity (rare paths get priority)
+          U: [0.5, 4.0]  - owned edges (favored tests get priority)
+        
+        Theoretical range: [0.6, 288000], but clamped to [10, 1600] for iteration mapping.
+        Typical scores: 
+          - Bad test (slow, common, no edges): 5-15
+          - Average test: 100-300
+          - Good newcomer: 500-2000
+          - Exceptional newcomer: 2000+
+        """
+        S = self._get_speed_base(runtime_ms)
+        C = self._get_coverage_multiplier(edges_hit)
+        N, _ = self._get_newcomer_multiplier(test_path)
+        D = self._get_depth_multiplier(generation)
+        F = self._get_rarity_multiplier(path_frequency)
+        U = self._get_owned_edges_multiplier(owned_edges)
+        
+        return S * C * N * D * F * U
+    
+    def _score_to_iterations(self, score: float) -> int:
+        """
+        Map AFL-style perf_score to iteration count.
+        
+        For ≤1.5h budget: [5, 250] iterations
+        For >1.5h budget: [10, 500] iterations
+        
+        Linear mapping: low score → few iterations, high score → many iterations.
+        """
+        if self.hours_budget <= 1.5:
+            min_iter, max_iter = 5, 250
+        else:
+            min_iter, max_iter = 10, 500
+        
+        # Clamp score to expected range [10, 1600]
+        score = max(10, min(score, 1600))
+        
+        # Linear map: score 10 → min_iter, score 1600 → max_iter
+        normalized = (score - 10) / (1600 - 10)
+        return int(min_iter + normalized * (max_iter - min_iter))
+    
+    def _update_running_averages(self, runtime_ms: float, edges_hit: int):
+        """Update running averages for score calculation (AFL-style: total/count)."""
+        with self.avg_lock:
+            self.total_runtime_ms.value += runtime_ms
+            self.total_coverage.value += edges_hit
+            self.sample_count.value += 1
+    
+    def _get_avg_runtime_ms(self) -> float:
+        """Get average runtime in ms (default 1000 if no samples)."""
+        with self.avg_lock:
+            if self.sample_count.value == 0:
+                return 1000.0
+            return self.total_runtime_ms.value / self.sample_count.value
+    
+    def _get_avg_coverage(self) -> float:
+        """Get average coverage (default 10 if no samples)."""
+        with self.avg_lock:
+            if self.sample_count.value == 0:
+                return 10.0
+            return self.total_coverage.value / self.sample_count.value
     
     # -------------------------------------------------------------------------
     # Work queue helpers (sorted FIFO enqueue via periodic buffer flush)
@@ -274,6 +603,36 @@ class CoverageGuidedFuzzer:
         buffered.sort()
         self._queue_push_batch(buffered)
         print(f"[INFO] Flushed {len(buffered)} gen1 mutants from seed phase buffer")
+
+    def _requeue_calibrated_seeds(self):
+        """Re-queue calibrated seeds with proper AFL-style scoring after calibration."""
+        with self._calibrated_seeds_lock:
+            seeds = list(self._calibrated_seeds)
+            self._calibrated_seeds[:] = []
+        
+        if not seeds:
+            return
+        
+        items_to_queue = []
+        for runtime, edges_hit, test_path_str in seeds:
+            # Calculate perf_score using calibrated averages and path frequency
+            runtime_ms = runtime * 1000
+            path_freq = self._get_test_path_frequency(test_path_str)
+            owned_edges = self._get_owned_edges_count(test_path_str)
+            perf_score = self._calculate_perf_score(runtime_ms, edges_hit, 0, test_path_str, path_freq, owned_edges)
+            iterations = self._score_to_iterations(perf_score)
+            
+            # Set newcomer bonus for seeds (they're new to actual fuzzing)
+            self._set_newcomer(test_path_str, 4)
+            
+            # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
+            # Use runtime as sort key so fast seeds are processed first
+            items_to_queue.append((runtime, 2, 0, self._next_seq(), test_path_str))
+        
+        # Sort by runtime (fast first)
+        items_to_queue.sort()
+        self._queue_push_batch(items_to_queue)
+        print(f"[INFO] Re-queued {len(items_to_queue)} calibrated seeds for fuzzing")
 
     def _buffer_mutants(self, mutant_items: list):
         """Buffer mutant queue items to be flushed in sorted order by main loop."""
@@ -966,6 +1325,7 @@ class CoverageGuidedFuzzer:
         global_coverage_map: multiprocessing.Array,
         coverage_map_lock: multiprocessing.Lock,
         timeout: int = 120,
+        iterations: int = None,  # Dynamic iterations based on AFL score
     ) -> Tuple[int, List[Path], float, List[Path]]:
         """
         Run typefuzz inline (no subprocess).
@@ -976,6 +1336,10 @@ class CoverageGuidedFuzzer:
         """
         if not test_path.exists():
             return (1, [], 0.0, [])
+        
+        # Use provided iterations or fall back to max for time budget
+        max_iterations = 250 if self.hours_budget <= 1.5 else 500
+        num_iterations = iterations if iterations is not None else max_iterations
         
         scratch_folder.mkdir(parents=True, exist_ok=True)
         bugs_folder.mkdir(parents=True, exist_ok=True)
@@ -1001,7 +1365,7 @@ class CoverageGuidedFuzzer:
         discarded_no_cov = 0
         new_edges_total = 0
         
-        for i in range(self.iterations):
+        for i in range(num_iterations):
             formula_str, success = mutator.mutate()
             if not success:
                 continue
@@ -1051,6 +1415,9 @@ class CoverageGuidedFuzzer:
                 trace_bits = b'\x00' * AFL_MAP_SIZE
 
             edges_hit = sum(1 for b in trace_bits if b != 0)
+            
+            # Hash coverage pattern for path frequency tracking (AFL's n_fuzz)
+            coverage_hash = self._hash_coverage(trace_bits) if edges_hit > 0 else None
 
             # Check for new coverage using SHARED global_coverage_map (with lock)
             has_new = False
@@ -1099,6 +1466,23 @@ class CoverageGuidedFuzzer:
             else:
                 self._inc_stat('mutants_with_existing_coverage')
 
+            # Track path frequency (AFL's n_fuzz) using coverage hash
+            path_freq = 1
+            if coverage_hash:
+                path_freq = self._update_path_frequency(coverage_hash, str(pending_path))
+            
+            # Update edge ownership (AFL's tc_ref) using trace_bits
+            if edges_hit > 0:
+                self._update_edge_ownership(trace_bits, runtime * 1000, str(pending_path))
+
+            # Set newcomer bonus for new mutants
+            # Mutants with new coverage get higher bonus
+            newcomer_bonus = 4 if has_new else 2
+            self._set_newcomer(str(pending_path), newcomer_bonus)
+            
+            # Update running averages for score calculation
+            self._update_running_averages(runtime_i * 1000, edges_hit)
+
             mutant_item = (runtime_i, cov_rank, generation + 1, self._next_seq(), str(pending_path))
 
             # Buffer mutants: seed phase or regular buffer
@@ -1117,7 +1501,7 @@ class CoverageGuidedFuzzer:
 
         # Log summary for this test
         if produced > 0:
-            print(f"[WORKER {worker_id}] [INLINE] {test_path.name}: produced={produced}, new={queued_new} (+{new_edges_total} edges), existing={queued_existing}, discarded={discarded_no_cov}")
+            print(f"[WORKER {worker_id}] [INLINE] {test_path.name}: iter={num_iterations}, produced={produced}, new={queued_new} (+{new_edges_total} edges), existing={queued_existing}, discarded={discarded_no_cov}")
         
         # Return empty mutant_files since mutants are already queued individually
         return (0, bug_files, time.time() - start_time, [])
@@ -1132,6 +1516,7 @@ class CoverageGuidedFuzzer:
         shm_id: str,
         per_test_timeout: Optional[float] = None,
         keep_mutants: bool = True,
+        iterations: int = None,  # Dynamic iterations based on AFL score
     ) -> Tuple[int, List[Path], float, List[Path]]:
         """
         Run typefuzz on a test file.
@@ -1140,6 +1525,10 @@ class CoverageGuidedFuzzer:
         if not test_path.exists():
             print(f"[WORKER {worker_id}] Error: Test file not found: {test_path}", file=sys.stderr)
             return (1, [], 0.0, [])
+        
+        # Use provided iterations or fall back to max for time budget
+        max_iterations = 250 if self.hours_budget <= 1.5 else 500
+        num_iterations = iterations if iterations is not None else max_iterations
         
         # Clean scratch/log folders but keep bugs
         for folder in [scratch_folder, log_folder]:
@@ -1150,10 +1539,10 @@ class CoverageGuidedFuzzer:
         # Extract COMMAND-LINE flags from test file and build solver command
         solver_clis = self._get_solver_clis(test_path)
         
-        # typefuzz -i 1 -k (1 iteration, keep mutants)
+        # typefuzz -i N -k (N iterations, keep mutants)
         cmd = [
             "typefuzz",
-            "-i", str(self.iterations),
+            "-i", str(num_iterations),
             "-m", str(self.modulo),
             "--seed", str(self.seed),
             "--timeout", "120",
@@ -1355,22 +1744,64 @@ class CoverageGuidedFuzzer:
                             test_path = Path(test_path)
                     
                     test_name = test_path.name if isinstance(test_path, Path) else Path(test_path).name
+                    test_path_str = str(test_path)
                     is_mutant = generation > 0
+                    is_calibration = generation == 0 and not self.calibration_done.is_set()
                     
-                    # Log test pickup
+                    # ---------------------------------------------------------------
+                    # AFL-style scoring: calculate iterations based on perf_score
+                    # ---------------------------------------------------------------
+                    if is_calibration:
+                        # CALIBRATION PHASE: Run seed once (iterations=1) to measure baseline
+                        # No mutations - just execute to get timing and coverage
+                        perf_score = 100.0  # Neutral score for calibration
+                        dynamic_iterations = 1  # Single execution for timing
+                    elif generation == 0:
+                        # POST-CALIBRATION: Seeds re-queued with proper score
+                        runtime_ms = runtime_priority * 1000  # Convert to ms
+                        estimated_edges = int(self._get_avg_coverage())
+                        path_freq = self._get_test_path_frequency(test_path_str)
+                        owned_edges = self._get_owned_edges_count(test_path_str)
+                        perf_score = self._calculate_perf_score(
+                            runtime_ms, estimated_edges, generation, test_path_str, path_freq, owned_edges
+                        )
+                        dynamic_iterations = self._score_to_iterations(perf_score)
+                    else:
+                        # Mutants: estimate score from previous runtime and average coverage
+                        runtime_ms = runtime_priority * 1000  # Convert to ms
+                        estimated_edges = int(self._get_avg_coverage())
+                        path_freq = self._get_test_path_frequency(test_path_str)
+                        owned_edges = self._get_owned_edges_count(test_path_str)
+                        perf_score = self._calculate_perf_score(
+                            runtime_ms, estimated_edges, generation, test_path_str, path_freq, owned_edges
+                        )
+                        dynamic_iterations = self._score_to_iterations(perf_score)
+                    
+                    # Log test pickup (only for mutants or every 10th seed to reduce noise)
                     queue_size = self._get_queue_size()
-                    test_type = f"mutant(gen:{generation})" if is_mutant else "seed"
-                    print(f"[WORKER {worker_id}] [PICK] {test_type} {test_name} (runtime:{runtime_priority:.2f}, queue:{queue_size})")
+                    should_log = is_mutant or (generation == 0 and self._get_stat('tests_processed') % 10 == 0)
+                    if should_log:
+                        if is_calibration:
+                            test_type = "seed[CAL]"
+                        elif is_mutant:
+                            test_type = f"gen{generation}"
+                        else:
+                            test_type = "seed"
+                        print(f"[W{worker_id}] {test_type} {test_name} score={perf_score:.0f} iter={dynamic_iterations} q={queue_size}")
                     
                     # Mark worker as busy
                     self.worker_status[worker_id] = test_name
+                    
+                    # Decrement newcomer bonus after processing (skip during calibration)
+                    if not is_calibration:
+                        self._decrement_newcomer(test_path_str)
                     
                     # Clear shared memory for this test (fast memset, no syscalls)
                     shm.seek(0)
                     shm.write(b'\x00' * AFL_MAP_SIZE)
                     shm.seek(0)
                     
-                    # Run typefuzz (inline or subprocess)
+                    # Run typefuzz (inline or subprocess) with dynamic iterations
                     time_remaining = self._get_time_remaining()
                     test_path_obj = test_path if isinstance(test_path, Path) else Path(test_path)
                     
@@ -1379,29 +1810,59 @@ class CoverageGuidedFuzzer:
                         exit_code, bug_files, runtime, mutant_files = self._run_inline_typefuzz(
                             test_path_obj, worker_id, scratch_folder, bugs_folder,
                             generation, shm_id, shm, global_coverage_map, coverage_map_lock,
+                            iterations=dynamic_iterations,
                         )
                     else:
                         exit_code, bug_files, runtime, mutant_files = self._run_typefuzz(
                             test_path_obj, worker_id, scratch_folder, log_folder, bugs_folder, shm_id,
                             per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
                             keep_mutants=True,
+                            iterations=dynamic_iterations,
                         )
                     
                     # Handle exit code
                     action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
                     self._inc_stat('tests_processed')
 
-                    # AFL++-style seed phase accounting: once every initial seed
-                    # has been executed once, allow mutants to be enqueued.
-                    if generation == 0 and not self.seed_phase_done.is_set():
+                    # AFL++-style calibration phase accounting
+                    if is_calibration:
+                        # Read coverage from shm to get edges_hit for this seed
+                        shm.seek(0)
+                        trace_bits_calib = shm.read(AFL_MAP_SIZE)
+                        edges_hit_calib = sum(1 for b in trace_bits_calib if b != 0)
+                        
+                        # Hash coverage pattern and track frequency
+                        if edges_hit_calib > 0:
+                            coverage_hash = self._hash_coverage(trace_bits_calib)
+                            self._update_path_frequency(coverage_hash, test_path_str)
+                            # Update edge ownership (AFL's tc_ref)
+                            self._update_edge_ownership(trace_bits_calib, runtime * 1000, test_path_str)
+                        
+                        # Update running averages with calibration data
+                        self._update_running_averages(runtime * 1000, edges_hit_calib)
+                        
+                        # Store seed info for re-queuing after calibration
+                        # Format: (runtime, edges_hit, test_path_str)
+                        with self._calibrated_seeds_lock:
+                            self._calibrated_seeds.append((runtime, edges_hit_calib, test_path_str))
+                        
+                        # Decrement seeds remaining
                         remaining = None
                         with self.seeds_remaining.get_lock():
                             if self.seeds_remaining.value > 0:
                                 self.seeds_remaining.value -= 1
                             remaining = self.seeds_remaining.value
+                        
+                        # Log calibration progress every 10 seeds or for slow tests (>2s)
+                        if remaining % 10 == 0 or runtime > 2.0:
+                            print(f"[CAL] {test_name}: {runtime:.2f}s, {edges_hit_calib} edges, {remaining} left")
+                        
                         if remaining == 0:
-                            self.seed_phase_done.set()
-                            print(f"[INFO] Seed phase complete: all initial seeds executed once. Flushing gen1 mutants...", flush=True)
+                            self.calibration_done.set()
+                            avg_rt = self.avg_runtime_ms.value
+                            avg_cov = self.avg_coverage.value
+                            print(f"[INFO] Calibration complete: avg_runtime={avg_rt:.1f}ms, avg_coverage={avg_cov:.1f} edges", flush=True)
+                            print(f"[INFO] Re-queuing {len(self._calibrated_seeds)} seeds with AFL-style scoring...", flush=True)
                     
                     # Periodic garbage collection to prevent memory bloat
                     tests_since_gc += 1
@@ -1458,7 +1919,14 @@ class CoverageGuidedFuzzer:
                                     has_new = True
                         
                         total_edges_after = total_edges_before + new_edges
-                        print(f"[WORKER {worker_id}] [COV] Test: {test_name} | gen:{generation} | hit:{edges_hit} | new:{new_edges} | total:{total_edges_after}")
+                        # Only log coverage for new edges (reduce verbosity)
+                        # print(f"[W{worker_id}] {test_name}: hit={edges_hit} new={new_edges} total={total_edges_after}")
+                        
+                        # Update edge ownership (AFL's tc_ref) and path frequency
+                        if edges_hit > 0:
+                            coverage_hash = self._hash_coverage(trace_bits)
+                            self._update_path_frequency(coverage_hash, test_path_str)
+                            self._update_edge_ownership(trace_bits, runtime * 1000, test_path_str)
                         
                         # Decide what to do with mutants based on coverage.
                         # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
@@ -1469,12 +1937,12 @@ class CoverageGuidedFuzzer:
                             runtime_sort = runtime
                             cov_rank = 0  # NEW coverage gets priority
                             coverage_type = "NEW"
-                            print(f"[WORKER {worker_id}] ✨ New coverage found: {new_edges} edges (total now: {total_edges_after})")
+                            print(f"[W{worker_id}] ✨ +{new_edges} new edges (total: {total_edges_after})")
                         elif edges_hit > 0:
                             runtime_sort = runtime
                             cov_rank = 1  # EXISTING coverage
                             coverage_type = "EXISTING"
-                            print(f"[WORKER {worker_id}] Coverage hit (existing): {edges_hit} edges")
+                            # Don't log existing coverage hits (too verbose)
                         else:
                             # No coverage at all - discard mutants
                             if mutant_files:
@@ -1515,13 +1983,20 @@ class CoverageGuidedFuzzer:
                             
                             if coverage_type is not None:
                                 mutants_to_queue = []
-                                print(f"[WORKER {worker_id}] [MUTANT] Processing {len(mutant_files)} mutant(s) from {test_name} ({coverage_type} coverage, runtime={runtime_sort:.3f}s)")
+                                # Only log mutant processing for new coverage
+                                if coverage_type == "NEW":
+                                    print(f"[W{worker_id}] +{len(mutant_files)} mutants ({coverage_type})")
                                 
                                 for mutant_file in mutant_files:
                                     try:
                                         pending_name = f"gen{generation+1}_w{worker_id}_{mutant_file.name}"
                                         pending_path = self.pending_mutants_dir / pending_name
                                         shutil.move(str(mutant_file), str(pending_path))
+                                        
+                                        # Set newcomer bonus for new mutants
+                                        newcomer_bonus = 4 if coverage_type == "NEW" else 2
+                                        self._set_newcomer(str(pending_path), newcomer_bonus)
+                                        
                                         # Queue item: (runtime, new_cov_rank, generation, seq, path_str)
                                         mutants_to_queue.append(
                                             (runtime_sort, cov_rank, generation + 1, self._next_seq(), str(pending_path))
@@ -1529,6 +2004,9 @@ class CoverageGuidedFuzzer:
                                         self._inc_stat('mutants_created')
                                     except Exception as e:
                                         print(f"[WORKER {worker_id}] Warning: Failed to move mutant {mutant_file}: {e}", file=sys.stderr)
+                                
+                                # Update running averages for score calculation
+                                self._update_running_averages(runtime * 1000, edges_hit)
                                 
                                 if mutants_to_queue:
                                     if coverage_type == "NEW":
@@ -1542,11 +2020,9 @@ class CoverageGuidedFuzzer:
                                     # Seed phase: buffer gen1 mutants and only enqueue after all seeds are done.
                                     if generation == 0 and not self.seed_phase_done.is_set():
                                         self._seed_phase_buffer_mutants(mutants_to_queue)
-                                        print(f"[WORKER {worker_id}] [QUEUE] Buffered {len(mutants_to_queue)} gen1 mutant(s) ({coverage_type}) for seed-phase flush")
                                     else:
                                         # Buffer and let main loop flush in sorted order across ALL workers.
                                         self._buffer_mutants(mutants_to_queue)
-                                        print(f"[WORKER {worker_id}] [QUEUE] Buffered {len(mutants_to_queue)} mutant(s) ({coverage_type}) for sorted flush")
                     
                     # Delete executed mutant if it's from pending folder
                     test_path_obj = test_path if isinstance(test_path, Path) else Path(test_path)
@@ -1597,7 +2073,8 @@ class CoverageGuidedFuzzer:
         print(f"Running coverage-guided fuzzer on {len(self.tests)} test(s){' for job ' + self.job_id if self.job_id else ''}")
         print(f"Tests root: {self.tests_root}")
         print(f"Timeout: {self.time_remaining}s ({self.time_remaining // 60} minutes)" if self.time_remaining else "No timeout")
-        print(f"Iterations per test: {self.iterations}, Modulo: {self.modulo}")
+        iter_range = "[5-250]" if self.hours_budget <= 1.5 else "[10-500]"
+        print(f"Iterations per test: {iter_range} (AFL-scored), Modulo: {self.modulo}")
         print(f"CPU cores: {self.cpu_count}")
         print(f"Workers: {self.num_workers}")
         print(f"Solvers: z3={self.z3_cmd}, cvc5={self.cvc5_path}")
@@ -1681,13 +2158,18 @@ class CoverageGuidedFuzzer:
                     # Flush buffered mutants frequently so workers see sorted work.
                     self._flush_mutant_buffer()
 
+                    # After calibration completes, re-queue seeds with proper scoring
+                    if (not self._calibration_seeds_requeued) and self.calibration_done.is_set():
+                        self._requeue_calibrated_seeds()
+                        self._calibration_seeds_requeued = True
+                    
                     # After the initial seed-only phase completes, flush buffered gen1 mutants once.
                     if (not self._seed_phase_flushed) and self.seed_phase_done.is_set():
                         self._flush_seed_phase_mutants()
                         self._seed_phase_flushed = True
 
-                    # IMPORTANT: during seed phase, do NOT refill seeds (we want exactly one pass).
-                    if self.seed_phase_done.is_set() and self._queue_empty() and idle_workers > 0:
+                    # IMPORTANT: during calibration phase, do NOT refill seeds (we want exactly one pass).
+                    if self.calibration_done.is_set() and self._queue_empty() and idle_workers > 0:
                         gen = self._get_stat('generations_completed') + 1
                         print(f"[INFO] Queue empty with {idle_workers} idle worker(s), refilling (generation {gen})...")
                         self._queue_push_initial_batch(self.tests)
@@ -2059,12 +2541,6 @@ def main():
         help="Minutes before timeout to stop (default: 5)",
     )
     parser.add_argument(
-        "--iterations",
-        type=int,
-        default=5,
-        help="Number of iterations per test (default: 5)",
-    )
-    parser.add_argument(
         "--modulo",
         type=int,
         default=2,
@@ -2165,13 +2641,16 @@ def main():
         args.time_remaining = int(args.fuzzing_duration_minutes * 60)
         print(f"[INFO] Setting fuzzing duration to {args.fuzzing_duration_minutes} minutes ({args.time_remaining} seconds)")
     
+    # Calculate hours_budget for AFL-style iteration scaling
+    hours_budget = args.fuzzing_duration_minutes / 60.0
+    print(f"[INFO] AFL scoring: hours_budget={hours_budget:.2f}h, iteration range=[{5 if hours_budget <= 1.5 else 10}, {250 if hours_budget <= 1.5 else 500}]")
+    
     try:
         fuzzer = CoverageGuidedFuzzer(
             tests=tests,
             tests_root=args.tests_root,
             bugs_folder=args.bugs_folder,
             num_workers=args.workers,
-            iterations=args.iterations,
             modulo=args.modulo,
             seed=args.seed,
             time_remaining=args.time_remaining,
@@ -2185,6 +2664,7 @@ def main():
             min_disk_space_mb=args.min_disk_space_mb,
             total_instrumented_edges=args.total_edges,
             use_inline_mode=args.inline,
+            hours_budget=hours_budget,
         )
         
         fuzzer.run()
