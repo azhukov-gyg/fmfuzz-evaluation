@@ -1313,6 +1313,46 @@ class CoverageGuidedFuzzer:
             return []
         return list(folder.glob("*.smt2")) + list(folder.glob("*.smt"))
     
+    def _run_seed_calibration(
+        self,
+        test_path: Path,
+        shm_id: int,
+    ) -> Tuple[int, float]:
+        """
+        Run seed directly on CVC5 for calibration (no mutations).
+        Returns (exit_code, runtime_seconds).
+        """
+        import subprocess
+        
+        # Build CVC5 command with the seed file
+        cmd = self._get_solver_clis(test_path).split(";")[-1]  # Get CVC5 command
+        cmd_parts = cmd.strip().split() + [str(test_path)]
+        
+        # Set up environment with shared memory ID for coverage
+        env = os.environ.copy()
+        env['__AFL_SHM_ID'] = str(shm_id)
+        
+        # Use global timeout (default 120s = 2 minutes)
+        timeout = self.timeout if self.timeout else 120
+        
+        # Run CVC5 with timeout
+        t0 = time.time()
+        try:
+            result = subprocess.run(
+                cmd_parts,
+                env=env,
+                capture_output=True,
+                timeout=timeout,
+            )
+            exit_code = result.returncode
+        except subprocess.TimeoutExpired:
+            exit_code = -1
+        except Exception:
+            exit_code = -1
+        
+        runtime = time.time() - t0
+        return exit_code, runtime
+    
     def _run_inline_typefuzz(
         self,
         test_path: Path,
@@ -1473,7 +1513,7 @@ class CoverageGuidedFuzzer:
             
             # Update edge ownership (AFL's tc_ref) using trace_bits
             if edges_hit > 0:
-                self._update_edge_ownership(trace_bits, runtime * 1000, str(pending_path))
+                self._update_edge_ownership(trace_bits, runtime_i * 1000, str(pending_path))
 
             # Set newcomer bonus for new mutants
             # Mutants with new coverage get higher bonus
@@ -1752,10 +1792,10 @@ class CoverageGuidedFuzzer:
                     # AFL-style scoring: calculate iterations based on perf_score
                     # ---------------------------------------------------------------
                     if is_calibration:
-                        # CALIBRATION PHASE: Run seed once (iterations=1) to measure baseline
-                        # No mutations - just execute to get timing and coverage
+                        # CALIBRATION PHASE: Run seed directly (no mutations!)
+                        # Just execute CVC5 to get timing and coverage baseline
                         perf_score = 100.0  # Neutral score for calibration
-                        dynamic_iterations = 1  # Single execution for timing
+                        dynamic_iterations = 0  # No mutations during calibration
                     elif generation == 0:
                         # POST-CALIBRATION: Seeds re-queued with proper score
                         runtime_ms = runtime_priority * 1000  # Convert to ms
@@ -1801,27 +1841,36 @@ class CoverageGuidedFuzzer:
                     shm.write(b'\x00' * AFL_MAP_SIZE)
                     shm.seek(0)
                     
-                    # Run typefuzz (inline or subprocess) with dynamic iterations
-                    time_remaining = self._get_time_remaining()
                     test_path_obj = test_path if isinstance(test_path, Path) else Path(test_path)
                     
-                    if self.use_inline_mode:
-                        # Inline mode handles coverage per-mutant and queues directly
-                        exit_code, bug_files, runtime, mutant_files = self._run_inline_typefuzz(
-                            test_path_obj, worker_id, scratch_folder, bugs_folder,
-                            generation, shm_id, shm, global_coverage_map, coverage_map_lock,
-                            iterations=dynamic_iterations,
-                        )
+                    if is_calibration:
+                        # CALIBRATION: Run seed directly on CVC5 (no mutations!)
+                        exit_code, runtime = self._run_seed_calibration(test_path_obj, shm_id)
+                        bug_files = []
+                        mutant_files = []
+                        action = 'keep' if exit_code == 0 else 'remove'
+                        print(f"[WORKER {worker_id}] [CAL] {test_name} (runtime: {runtime:.1f}s)")
                     else:
-                        exit_code, bug_files, runtime, mutant_files = self._run_typefuzz(
-                            test_path_obj, worker_id, scratch_folder, log_folder, bugs_folder, shm_id,
-                            per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
-                            keep_mutants=True,
-                            iterations=dynamic_iterations,
-                        )
-                    
-                    # Handle exit code
-                    action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
+                        # Run typefuzz (inline or subprocess) with dynamic iterations
+                        time_remaining = self._get_time_remaining()
+                        
+                        if self.use_inline_mode:
+                            # Inline mode handles coverage per-mutant and queues directly
+                            exit_code, bug_files, runtime, mutant_files = self._run_inline_typefuzz(
+                                test_path_obj, worker_id, scratch_folder, bugs_folder,
+                                generation, shm_id, shm, global_coverage_map, coverage_map_lock,
+                                iterations=dynamic_iterations,
+                            )
+                        else:
+                            exit_code, bug_files, runtime, mutant_files = self._run_typefuzz(
+                                test_path_obj, worker_id, scratch_folder, log_folder, bugs_folder, shm_id,
+                                per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
+                                keep_mutants=True,
+                                iterations=dynamic_iterations,
+                            )
+                        
+                        # Handle exit code
+                        action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
                     self._inc_stat('tests_processed')
 
                     # AFL++-style calibration phase accounting
