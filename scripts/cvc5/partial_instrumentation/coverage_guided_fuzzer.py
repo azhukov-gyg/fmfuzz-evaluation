@@ -1804,9 +1804,15 @@ class CoverageGuidedFuzzer:
                         estimated_edges = int(self._get_avg_coverage())
                         path_freq = self._get_test_path_frequency(test_path_str)
                         owned_edges = self._get_owned_edges_count(test_path_str)
-                        perf_score = self._calculate_perf_score(
-                            runtime_ms, estimated_edges, generation, test_path_str, path_freq, owned_edges
-                        )
+                        
+                        # Get individual factors for debug logging
+                        S = self._get_speed_base(runtime_ms)
+                        C = self._get_coverage_multiplier(estimated_edges)
+                        N, _ = self._get_newcomer_multiplier(test_path_str)
+                        D = self._get_depth_multiplier(generation)
+                        F = self._get_rarity_multiplier(path_freq)
+                        U = self._get_owned_edges_multiplier(owned_edges)
+                        perf_score = S * C * N * D * F * U
                         dynamic_iterations = self._score_to_iterations(perf_score)
                     else:
                         # Mutants: estimate score from previous runtime and average coverage
@@ -1814,22 +1820,28 @@ class CoverageGuidedFuzzer:
                         estimated_edges = int(self._get_avg_coverage())
                         path_freq = self._get_test_path_frequency(test_path_str)
                         owned_edges = self._get_owned_edges_count(test_path_str)
-                        perf_score = self._calculate_perf_score(
-                            runtime_ms, estimated_edges, generation, test_path_str, path_freq, owned_edges
-                        )
+                        
+                        # Get individual factors for debug logging
+                        S = self._get_speed_base(runtime_ms)
+                        C = self._get_coverage_multiplier(estimated_edges)
+                        N, _ = self._get_newcomer_multiplier(test_path_str)
+                        D = self._get_depth_multiplier(generation)
+                        F = self._get_rarity_multiplier(path_freq)
+                        U = self._get_owned_edges_multiplier(owned_edges)
+                        perf_score = S * C * N * D * F * U
                         dynamic_iterations = self._score_to_iterations(perf_score)
                     
-                    # Log test pickup (only for mutants or every 10th seed to reduce noise)
+                    # Log test pickup with AFL score factors
                     queue_size = self._get_queue_size()
                     should_log = is_mutant or (generation == 0 and self._get_stat('tests_processed') % 10 == 0)
                     if should_log:
                         if is_calibration:
                             test_type = "seed[CAL]"
-                        elif is_mutant:
-                            test_type = f"gen{generation}"
+                            print(f"[W{worker_id}] {test_type} {test_name} iter=0 q={queue_size}", flush=True)
                         else:
-                            test_type = "seed"
-                        print(f"[W{worker_id}] {test_type} {test_name} score={perf_score:.0f} iter={dynamic_iterations} q={queue_size}")
+                            test_type = f"gen{generation}" if is_mutant else "seed"
+                            # Show AFL score factors: S(speed) C(cov) N(new) D(depth) F(rare) U(own)
+                            print(f"[W{worker_id}] {test_type} {test_name} S={S} C={C:.1f} N={N:.0f} D={D} F={F:.1f} U={U:.1f} → score={perf_score:.0f} iter={dynamic_iterations} q={queue_size}", flush=True)
                     
                     # Mark worker as busy
                     self.worker_status[worker_id] = test_name
