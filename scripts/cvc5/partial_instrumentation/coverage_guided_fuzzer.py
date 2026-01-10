@@ -13,6 +13,7 @@ import multiprocessing
 from multiprocessing import Queue
 import os
 import psutil
+import random
 import shutil
 import signal
 import subprocess
@@ -23,12 +24,33 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Optional inline typefuzz
+# Import shared InlineTypeFuzz and RecipeRecorder from scripts/rq2
+SCRIPT_DIR = Path(__file__).parent
+RQ2_PATH = SCRIPT_DIR.parent.parent / "rq2"
+if str(RQ2_PATH) not in sys.path:
+    sys.path.insert(0, str(RQ2_PATH))
+
+# Import InlineTypeFuzz from shared location
 try:
     from inline_typefuzz import InlineTypeFuzz
     INLINE_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    print(f"Warning: InlineTypeFuzz not available: {e}", file=sys.stderr)
     INLINE_AVAILABLE = False
+
+# Recipe recording (lazy import)
+_RecipeRecorder = None
+_get_worker_recipe_path = None
+_merge_recipe_files = None
+
+def _import_recipes():
+    global _RecipeRecorder, _get_worker_recipe_path, _merge_recipe_files
+    if _RecipeRecorder is None:
+        from recipe_recorder import RecipeRecorder, get_worker_recipe_path, merge_recipe_files
+        _RecipeRecorder = RecipeRecorder
+        _get_worker_recipe_path = get_worker_recipe_path
+        _merge_recipe_files = merge_recipe_files
+    return _RecipeRecorder, _get_worker_recipe_path, _merge_recipe_files
 
 
 # AFL-style coverage map size (1KB bitmap)
@@ -77,6 +99,7 @@ class CoverageGuidedFuzzer:
         use_inline_mode: bool = False,
         hours_budget: float = 1.0,  # Time budget in hours for iteration range calculation
         per_test_timeout: int = 120,  # Per-test timeout in seconds (2 minutes default)
+        recipe_output: Optional[str] = None,  # Path to recipe output (enables recording)
     ):
         self.tests = tests
         self.tests_root = Path(tests_root)
@@ -84,6 +107,10 @@ class CoverageGuidedFuzzer:
         self.modulo = modulo
         self.seed = seed
         self.job_id = job_id
+        self.recipe_output = recipe_output
+        
+        # Set random seed for reproducible mutations (must be before any random usage)
+        random.seed(seed)
         self.start_time = time.time()
         self.output_dir = Path(output_dir)
         self.max_pending_mutants = max_pending_mutants
@@ -1370,6 +1397,7 @@ class CoverageGuidedFuzzer:
         coverage_map_lock: multiprocessing.Lock,
         timeout: int = 120,
         iterations: int = None,  # Dynamic iterations based on AFL score
+        recipe_recorder=None,  # Optional recipe recorder
     ) -> Tuple[int, List[Path], float, List[Path]]:
         """
         Run typefuzz inline (no subprocess).
@@ -1390,6 +1418,10 @@ class CoverageGuidedFuzzer:
         
         start_time = time.time()
         bug_files = []
+        
+        # Set random seed BEFORE parsing for reproducibility
+        # Each test gets the same seed, so mutation sequence depends only on test content
+        random.seed(self.seed)
         
         mutator = InlineTypeFuzz(test_path)
         if not mutator.parse():
@@ -1415,6 +1447,10 @@ class CoverageGuidedFuzzer:
                 continue
 
             produced += 1
+            
+            # Record recipe (iteration is 1-indexed for consistency with yinyang)
+            if recipe_recorder:
+                recipe_recorder.record(str(test_path), i + 1)
 
             mutant_path = scratch_folder / f"mutant_{worker_id}_{i}.smt2"
             with open(mutant_path, 'w') as f:
@@ -1429,7 +1465,7 @@ class CoverageGuidedFuzzer:
                 pass
 
             t0 = time.time()
-            is_bug, bug_type = mutator.run_solvers(mutant_path, z3_cmd, cvc5_cmd, timeout, env)
+            is_bug, bug_type = mutator.run_solvers_differential(mutant_path, [z3_cmd, cvc5_cmd], timeout, env)
             t1 = time.time()
             runtime_i = t1 - t0
 
@@ -1705,7 +1741,7 @@ class CoverageGuidedFuzzer:
     # -------------------------------------------------------------------------
     
     def _worker_process(self, worker_id: int, global_coverage_map: multiprocessing.Array, 
-                        coverage_map_lock: multiprocessing.Lock):
+                        coverage_map_lock: multiprocessing.Lock, recipe_output_path: Optional[str] = None):
         """
         Worker process that processes tests and tracks coverage.
         Uses per-worker shared memory for trace_bits (where CVC5 writes edge hits).
@@ -1716,6 +1752,14 @@ class CoverageGuidedFuzzer:
         OPTIMIZATION: Shared memory is created ONCE per worker and reused (cleared between tests).
         """
         print(f"[WORKER {worker_id}] Started", flush=True)
+        
+        # Initialize recipe recorder if enabled
+        recipe_recorder = None
+        if recipe_output_path:
+            RecipeRecorder, get_worker_recipe_path, _ = _import_recipes()
+            worker_recipe_path = get_worker_recipe_path(recipe_output_path, worker_id - 1)
+            recipe_recorder = RecipeRecorder(worker_recipe_path, self.seed, worker_id=worker_id - 1)
+            print(f"[WORKER {worker_id}] Recording recipes to: {worker_recipe_path}", file=sys.stderr)
         
         # Counter for periodic GC and worker restart
         tests_processed_this_worker = 0
@@ -1877,6 +1921,7 @@ class CoverageGuidedFuzzer:
                                 generation, shm_id, shm, global_coverage_map, coverage_map_lock,
                                 timeout=self.per_test_timeout,
                                 iterations=dynamic_iterations,
+                                recipe_recorder=recipe_recorder,
                             )
                         else:
                             exit_code, bug_files, runtime, mutant_files = self._run_typefuzz(
@@ -2124,6 +2169,11 @@ class CoverageGuidedFuzzer:
             self.worker_status[worker_id] = None
             for folder in [scratch_folder, log_folder]:
                 shutil.rmtree(folder, ignore_errors=True)
+            
+            # Close recipe recorder
+            if recipe_recorder:
+                recipe_recorder.close()
+                print(f"[WORKER {worker_id}] Closed recipe recorder ({recipe_recorder.recipe_count} recipes)", file=sys.stderr)
         
         print(f"[WORKER {worker_id}] Stopped")
     
@@ -2164,7 +2214,7 @@ class CoverageGuidedFuzzer:
         for worker_id in range(1, self.num_workers + 1):
             worker = multiprocessing.Process(
                 target=self._worker_process,
-                args=(worker_id, global_coverage_map, coverage_map_lock)
+                args=(worker_id, global_coverage_map, coverage_map_lock, self.recipe_output)
             )
             worker.start()
             workers.append(worker)
@@ -2252,7 +2302,7 @@ class CoverageGuidedFuzzer:
                         worker.join(timeout=1)
                         new_worker = multiprocessing.Process(
                             target=self._worker_process,
-                            args=(worker_id, global_coverage_map, coverage_map_lock)
+                            args=(worker_id, global_coverage_map, coverage_map_lock, self.recipe_output)
                         )
                         new_worker.start()
                         workers[i] = new_worker
@@ -2313,6 +2363,19 @@ class CoverageGuidedFuzzer:
         total_edges = self._count_edges(bytes(global_coverage_map[:]))
         
         print()
+        # Merge recipe files from all workers
+        if self.recipe_output:
+            _, get_worker_recipe_path, merge_recipe_files = _import_recipes()
+            worker_files = [
+                get_worker_recipe_path(self.recipe_output, i)
+                for i in range(self.num_workers)
+            ]
+            existing_files = [f for f in worker_files if Path(f).exists()]
+            if existing_files:
+                merged_path = self.recipe_output if self.recipe_output.endswith('.jsonl') else f"{self.recipe_output}.jsonl"
+                total_recipes = merge_recipe_files(existing_files, merged_path)
+                print(f"\n📝 Merged {total_recipes} recipes from {len(existing_files)} workers → {merged_path}")
+        
         print("=" * 60)
         print(f"COVERAGE-GUIDED FUZZING COMPLETE{' FOR JOB ' + self.job_id if self.job_id else ''}")
         print("=" * 60)
@@ -2685,6 +2748,11 @@ def main():
         default=120,
         help="Per-test timeout in seconds (default: 120 = 2 minutes)",
     )
+    parser.add_argument(
+        "--recipe-output",
+        help="Path to recipe output file (enables recipe recording mode). "
+             "Each worker writes to {path}_worker_N.jsonl, merged at end.",
+    )
     
     args = parser.parse_args()
     
@@ -2738,6 +2806,7 @@ def main():
             use_inline_mode=args.inline,
             hours_budget=hours_budget,
             per_test_timeout=args.per_test_timeout,
+            recipe_output=args.recipe_output,
         )
         
         fuzzer.run()

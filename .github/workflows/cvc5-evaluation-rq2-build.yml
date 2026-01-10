@@ -169,4 +169,50 @@ jobs:
             --body /tmp/artifacts-coverage.tar.gz
           
           echo "✅ Uploaded coverage binary to S3: $S3_KEY"
-
+      
+      # ============================================================
+      # BUILD 2: Fuzzing binary (debug + assertions, NO coverage)
+      # Used by: baseline fuzzing, variant1 fuzzing
+      # ============================================================
+      
+      - name: Clean build for fuzzing binary
+        run: |
+          rm -rf cvc5/build
+          echo "🧹 Cleaned build directory for fuzzing binary"
+      
+      - name: Build CVC5 fuzzing binary (debug + assertions)
+        run: |
+          cd cvc5
+          # Configure with debug + assertions but NO coverage instrumentation
+          # This produces a faster binary for fuzzing (no gcov overhead)
+          ./configure.sh debug --assertions --static --static-binary --auto-download
+          cd build
+          make -j$(nproc)
+          echo "✅ Built fuzzing binary (debug + assertions)"
+      
+      - name: Collect fuzzing artifacts
+        run: |
+          ./scripts/cvc5/collect_build_artifacts.sh cvc5/build .artifacts-fuzzing
+      
+      - name: Compress fuzzing artifacts
+        run: |
+          cd .artifacts-fuzzing
+          tar -czf /tmp/artifacts-fuzzing.tar.gz .
+          cd ..
+      
+      - name: Upload fuzzing binary to S3
+        run: |
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/cvc5/builds/fuzzing/${COMMIT_HASH}.tar.gz"
+          
+          if [ ! -f "/tmp/artifacts-fuzzing.tar.gz" ]; then
+            echo "❌ Error: artifacts-fuzzing.tar.gz not found"
+            exit 1
+          fi
+          
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body /tmp/artifacts-fuzzing.tar.gz
+          
+          echo "✅ Uploaded fuzzing binary to S3: $S3_KEY"

@@ -1,0 +1,112 @@
+name: CVC5 RQ2 Measurement Comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: Skip S3 uploads (default: false)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  compare-measurements:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: pip install boto3 pandas
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Download all measurement results
+        env:
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        run: |
+          mkdir -p measurements/baseline measurements/variant1 measurements/variant2
+          
+          # Download baseline measurements
+          echo "=== Downloading baseline measurements ==="
+          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/cvc5/measurement-results/baseline/ measurements/baseline/
+          BASELINE_COUNT=$(ls measurements/baseline/*.json.gz 2>/dev/null | wc -l || echo 0)
+          echo "Downloaded $BASELINE_COUNT baseline measurement files"
+          
+          # Download variant1 measurements
+          echo "=== Downloading variant1 measurements ==="
+          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/cvc5/measurement-results/variant1/ measurements/variant1/
+          VARIANT1_COUNT=$(ls measurements/variant1/*.json.gz 2>/dev/null | wc -l || echo 0)
+          echo "Downloaded $VARIANT1_COUNT variant1 measurement files"
+          
+          # Download variant2 measurements
+          echo "=== Downloading variant2 measurements ==="
+          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/cvc5/measurement-results/variant2/ measurements/variant2/
+          VARIANT2_COUNT=$(ls measurements/variant2/*.json.gz 2>/dev/null | wc -l || echo 0)
+          echo "Downloaded $VARIANT2_COUNT variant2 measurement files"
+          
+          # Decompress all
+          gunzip measurements/*/*.json.gz 2>/dev/null || true
+          
+          # Show downloaded measurement files content for debugging
+          echo ""
+          echo "=== Downloaded Measurement Files Content ==="
+          for variant in baseline variant1 variant2; do
+            for f in measurements/$variant/*.json; do
+              if [ -f "$f" ]; then
+                echo ""
+                echo "--- $f ---"
+                cat "$f"
+              fi
+            done
+          done
+      
+      - name: Compare measurement results
+        run: |
+          python3 scripts/rq2/compare_measurements.py measurements --output measurement_comparison.json
+      
+      - name: Show full comparison results
+        if: always()
+        run: |
+          if [ -f "measurement_comparison.json" ]; then
+            echo "=== FULL COMPARISON RESULTS ==="
+            cat measurement_comparison.json | python3 -m json.tool
+          fi
+      
+      - name: Upload comparison to S3
+        if: ${{ !inputs.dry_run }}
+        run: |
+          S3_KEY="evaluation/rq2/cvc5/measurement-comparison/comparison.json.gz"
+          
+          if [ ! -f "measurement_comparison.json" ]; then
+            echo "⚠️ Comparison file not found"
+            exit 0
+          fi
+          
+          gzip -c "measurement_comparison.json" > comparison.json.gz
+          
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body comparison.json.gz
+          
+          echo "✅ Uploaded comparison to S3: $S3_KEY"
+      
+      - name: Upload comparison artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: measurement-comparison
+          path: measurement_comparison.json
+          if-no-files-found: ignore

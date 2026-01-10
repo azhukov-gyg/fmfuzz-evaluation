@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""
+Compare measurement results across baseline, variant1, and variant2.
+
+Usage:
+    python compare_measurements.py <measurements_dir> --output <output_file>
+    
+    measurements_dir: Directory containing measurements/{baseline,variant1,variant2}/*.json
+    --output: Output JSON file for comparison results
+
+Used by measurement comparison workflow.
+"""
+
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+
+def load_measurements(folder: Path) -> dict:
+    """Load all measurement results from a folder."""
+    results = {}
+    
+    for f in folder.glob("measurement-*.json"):
+        # Extract commit hash from filename
+        commit = f.stem.replace("measurement-", "")
+        try:
+            with open(f, 'r') as fp:
+                results[commit] = json.load(fp)
+        except Exception as e:
+            print(f"Warning: Failed to load {f}: {e}", file=sys.stderr)
+    
+    return results
+
+
+def compare_measurements(measurements_dir: str) -> dict:
+    """Compare measurements across all variants."""
+    base_path = Path(measurements_dir)
+    
+    # Load all measurements
+    print("Loading measurements...", file=sys.stderr)
+    baseline = load_measurements(base_path / "baseline")
+    variant1 = load_measurements(base_path / "variant1")
+    variant2 = load_measurements(base_path / "variant2")
+    
+    print(f"Baseline: {len(baseline)} commits", file=sys.stderr)
+    print(f"Variant1: {len(variant1)} commits", file=sys.stderr)
+    print(f"Variant2: {len(variant2)} commits", file=sys.stderr)
+    
+    # Find common commits
+    common_commits = set(baseline.keys()) & set(variant1.keys()) & set(variant2.keys())
+    print(f"Common commits (all 3 variants): {len(common_commits)}", file=sys.stderr)
+    
+    if not common_commits:
+        return {
+            "status": "partial",
+            "baseline_commits": len(baseline),
+            "variant1_commits": len(variant1),
+            "variant2_commits": len(variant2),
+            "common_commits": 0,
+            "results": []
+        }
+    
+    results = []
+    
+    for commit in sorted(common_commits):
+        b = baseline[commit]
+        v1 = variant1[commit]
+        v2 = variant2[commit]
+        
+        # Calculate totals
+        b_total = b.get('total_function_calls', 0)
+        v1_total = v1.get('total_function_calls', 0)
+        v2_total = v2.get('total_function_calls', 0)
+        
+        # Calculate recipes processed
+        b_recipes = b.get('recipes_processed', 0)
+        v1_recipes = v1.get('recipes_processed', 0)
+        v2_recipes = v2.get('recipes_processed', 0)
+        
+        # Per-function comparison
+        all_functions = set()
+        all_functions.update(b.get('function_counts', {}).keys())
+        all_functions.update(v1.get('function_counts', {}).keys())
+        all_functions.update(v2.get('function_counts', {}).keys())
+        
+        function_comparison = []
+        for func in sorted(all_functions):
+            b_count = b.get('function_counts', {}).get(func, 0)
+            v1_count = v1.get('function_counts', {}).get(func, 0)
+            v2_count = v2.get('function_counts', {}).get(func, 0)
+            
+            function_comparison.append({
+                "function": func,
+                "baseline": b_count,
+                "variant1": v1_count,
+                "variant2": v2_count,
+                "v1_vs_baseline": v1_count - b_count if b_count > 0 else None,
+                "v2_vs_baseline": v2_count - b_count if b_count > 0 else None,
+                "v2_vs_v1": v2_count - v1_count if v1_count > 0 else None,
+            })
+        
+        results.append({
+            "commit": commit,
+            "baseline": {
+                "total_function_calls": b_total,
+                "recipes_processed": b_recipes,
+                "successful_runs": b.get('successful_runs', 0),
+                "failed_runs": b.get('failed_runs', 0),
+            },
+            "variant1": {
+                "total_function_calls": v1_total,
+                "recipes_processed": v1_recipes,
+                "successful_runs": v1.get('successful_runs', 0),
+                "failed_runs": v1.get('failed_runs', 0),
+            },
+            "variant2": {
+                "total_function_calls": v2_total,
+                "recipes_processed": v2_recipes,
+                "successful_runs": v2.get('successful_runs', 0),
+                "failed_runs": v2.get('failed_runs', 0),
+            },
+            "function_comparison": function_comparison,
+        })
+    
+    # Generate summary statistics
+    summary = {
+        "total_commits": len(results),
+        "avg_baseline_calls": sum(r['baseline']['total_function_calls'] for r in results) / len(results) if results else 0,
+        "avg_variant1_calls": sum(r['variant1']['total_function_calls'] for r in results) / len(results) if results else 0,
+        "avg_variant2_calls": sum(r['variant2']['total_function_calls'] for r in results) / len(results) if results else 0,
+    }
+    
+    # Calculate ratios
+    if summary['avg_baseline_calls'] > 0:
+        summary['v1_vs_baseline_ratio'] = summary['avg_variant1_calls'] / summary['avg_baseline_calls']
+        summary['v2_vs_baseline_ratio'] = summary['avg_variant2_calls'] / summary['avg_baseline_calls']
+    
+    return {
+        "status": "complete",
+        "baseline_commits": len(baseline),
+        "variant1_commits": len(variant1),
+        "variant2_commits": len(variant2),
+        "common_commits": len(common_commits),
+        "summary": summary,
+        "results": results
+    }
+
+
+def print_summary(comparison: dict):
+    """Print human-readable summary."""
+    print("\n" + "="*70, file=sys.stderr)
+    print("MEASUREMENT COMPARISON SUMMARY", file=sys.stderr)
+    print("="*70, file=sys.stderr)
+    
+    if 'summary' in comparison:
+        s = comparison['summary']
+        print(f"Commits compared: {s['total_commits']}", file=sys.stderr)
+        print(f"Average function calls:", file=sys.stderr)
+        print(f"  Baseline:  {s['avg_baseline_calls']:,.0f}", file=sys.stderr)
+        print(f"  Variant1:  {s['avg_variant1_calls']:,.0f}", file=sys.stderr)
+        print(f"  Variant2:  {s['avg_variant2_calls']:,.0f}", file=sys.stderr)
+        
+        if 'v1_vs_baseline_ratio' in s:
+            print(f"\nRatios vs Baseline:", file=sys.stderr)
+            print(f"  Variant1: {s['v1_vs_baseline_ratio']:.2f}x", file=sys.stderr)
+            print(f"  Variant2: {s['v2_vs_baseline_ratio']:.2f}x", file=sys.stderr)
+    else:
+        print(f"Status: {comparison.get('status', 'unknown')}", file=sys.stderr)
+        print(f"Baseline commits: {comparison.get('baseline_commits', 0)}", file=sys.stderr)
+        print(f"Variant1 commits: {comparison.get('variant1_commits', 0)}", file=sys.stderr)
+        print(f"Variant2 commits: {comparison.get('variant2_commits', 0)}", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compare measurement results across variants"
+    )
+    parser.add_argument(
+        "measurements_dir",
+        help="Directory containing measurements/{baseline,variant1,variant2}/*.json"
+    )
+    parser.add_argument(
+        "--output", "-o",
+        required=True,
+        help="Output JSON file for comparison results"
+    )
+    
+    args = parser.parse_args()
+    
+    comparison = compare_measurements(args.measurements_dir)
+    
+    # Save results
+    with open(args.output, 'w') as f:
+        json.dump(comparison, f, indent=2)
+    
+    print(f"\nComparison saved to {args.output}", file=sys.stderr)
+    
+    # Print summary
+    print_summary(comparison)
+
+
+if __name__ == "__main__":
+    main()

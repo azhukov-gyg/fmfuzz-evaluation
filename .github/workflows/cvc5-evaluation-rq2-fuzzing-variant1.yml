@@ -1,4 +1,4 @@
-name: CVC5 RQ2 Fuzzing with Coverage Tracking
+name: CVC5 RQ2 Fuzzing - Variant1
 
 on:
   workflow_dispatch:
@@ -370,16 +370,16 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Download coverage binary from S3
+      - name: Download fuzzing binary from S3
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/cvc5/builds/coverage/${COMMIT_HASH}.tar.gz"
+          S3_KEY="evaluation/rq2/cvc5/builds/fuzzing/${COMMIT_HASH}.tar.gz"
           
           mkdir -p artifacts
           aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY artifacts/artifacts.tar.gz
-          echo "✅ Downloaded coverage binary for $COMMIT_HASH"
+          echo "✅ Downloaded fuzzing binary for $COMMIT_HASH"
 
-      - name: Extract coverage binary
+      - name: Extract fuzzing binary
         run: |
           ./scripts/cvc5/extract_build_artifacts.sh artifacts/artifacts.tar.gz cvc5/build true
 
@@ -394,13 +394,12 @@ jobs:
           z3 --version
           cvc5/build/bin/cvc5 --version
 
-      - name: Run fuzzing with coverage tracking
+      - name: Run fuzzing with recipe recording
         working-directory: cvc5
         timeout-minutes: 75
         run: |
           FUZZING_DURATION="${{ inputs.fuzzing_duration_minutes || 60 }}"
           
-          # Run fuzzer and capture its PID
           python3 ${{ github.workspace }}/scripts/cvc5/commit_fuzzer/simple_commit_fuzzer.py \
             --tests-file ../${{ steps.extract-tests.outputs.tests_file }} \
             --job-id '${{ matrix.job_id }}' \
@@ -409,51 +408,24 @@ jobs:
             --iterations 250 \
             --seed 42 \
             --cvc5-path ./build/bin/cvc5 \
-            --build-dir ./build || true
+            --recipe-output ../recipes_${{ matrix.commit }}_job_${{ matrix.job_id }} || true
           
           echo "Python script exited, cleaning up any orphaned processes..."
-          # Kill any remaining cvc5 or z3 processes that might be hanging
           pkill -9 -f "cvc5" 2>/dev/null || true
           pkill -9 -f "z3" 2>/dev/null || true
           pkill -9 -f "typefuzz" 2>/dev/null || true
           
           echo "Fuzzing step completed"
-
-      - name: Collect coverage with fastcov
-        if: always()
-        working-directory: cvc5
-        run: |
-          echo "Running fastcov..."
-          fastcov --gcov gcov \
-            --search-directory ./build \
-            --output ../fastcov_output.json \
-            --exclude "/usr/include/*" \
-            --exclude "*/deps/*" \
-            --jobs 4
-          echo "Fastcov completed"
-          ls -la ../fastcov_output.json
-
-      - name: Analyze coverage
-        if: always()
-        run: |
-          echo "Running coverage analysis..."
-          python3 scripts/cvc5/commit_fuzzer/analyze_fuzzing_coverage.py \
-            --changed-functions changed_functions.json \
-            --fastcov-json fastcov_output.json \
-            --output statistics_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json \
-            --job-id '${{ matrix.job_id }}' \
-            --commit-hash ${{ matrix.commit }}
-          echo "Coverage analysis completed"
       
-      - name: Upload statistics
+      - name: Upload recipes artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: statistics-commit-${{ matrix.commit }}-job-${{ matrix.job_id }}
-          path: statistics_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json
+          name: variant1-recipes-commit-${{ matrix.commit }}-job-${{ matrix.job_id }}
+          path: recipes_${{ matrix.commit }}_job_${{ matrix.job_id }}.jsonl
           if-no-files-found: ignore
 
-  merge-statistics:
+  merge-and-upload-recipes:
     needs: [generate-matrix, prepare-commit-fuzzer, fuzzing-jobs]
     if: always() && needs.prepare-commit-fuzzer.result == 'success'
     runs-on: ubuntu-latest
@@ -465,11 +437,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
       
-      - name: Download all statistics artifacts for commit
+      - name: Download all recipe artifacts for commit
         uses: actions/download-artifact@v4
         with:
-          path: statistics-artifacts
-          pattern: statistics-commit-${{ matrix.commit }}-job-*
+          path: recipes-artifacts
+          pattern: variant1-recipes-commit-${{ matrix.commit }}-job-*
           merge-multiple: false
       
       - name: Download changed functions
@@ -478,22 +450,31 @@ jobs:
           name: changed-functions-${{ matrix.commit }}
           path: .
       
-      - name: Merge statistics
+      - name: Merge recipes from all jobs
         run: |
-          # Find all statistics files for this commit
-          STATS_FILES=$(find statistics-artifacts -name "statistics_commit_${{ matrix.commit }}_job_*.json" -type f | sort)
+          RECIPE_FILES=$(find recipes-artifacts -name "recipes_${{ matrix.commit }}_job_*.jsonl" -type f | sort)
           
-          if [ -z "$STATS_FILES" ]; then
-            echo "⚠️ No statistics files found for commit ${{ matrix.commit }}"
+          if [ -z "$RECIPE_FILES" ]; then
+            echo "⚠️ No recipe files found for commit ${{ matrix.commit }}"
             exit 0
           fi
           
-          # Merge statistics
-          python3 scripts/cvc5/commit_fuzzer/merge_fuzzing_statistics.py \
-            $STATS_FILES \
-            --output merged_statistics_${{ matrix.commit }}.json \
-            --commit-hash ${{ matrix.commit }} \
-            --coverage-map-commit ${{ matrix.commit }}
+          FILE_COUNT=$(echo "$RECIPE_FILES" | wc -l)
+          echo "Found $FILE_COUNT recipe files"
+          
+          # Merge all recipe files into one
+          cat $RECIPE_FILES > merged_recipes_${{ matrix.commit }}.jsonl
+          
+          TOTAL_RECIPES=$(wc -l < merged_recipes_${{ matrix.commit }}.jsonl)
+          echo "✅ Merged $TOTAL_RECIPES recipes from $FILE_COUNT job files"
+          
+          # Show sample of merged recipes for debugging
+          echo ""
+          echo "=== First 10 recipes (sample) ==="
+          head -10 merged_recipes_${{ matrix.commit }}.jsonl
+          echo ""
+          echo "=== Last 5 recipes ==="
+          tail -5 merged_recipes_${{ matrix.commit }}.jsonl
       
       - name: Configure AWS credentials
         if: ${{ !inputs.dry_run }}
@@ -507,49 +488,60 @@ jobs:
         id: get-commit-merge
         if: always()
         run: |
-          # Expand short hash to full hash if needed
-          if [ -d "cvc5" ]; then
-            cd cvc5
-            git fetch origin --quiet 2>/dev/null || true
-            FULL_HASH=$(git rev-parse "${{ matrix.commit }}")
-            echo "commit_hash=$FULL_HASH" >> $GITHUB_OUTPUT
-            echo "Expanded ${{ matrix.commit }} to $FULL_HASH"
-          else
-            # Fallback: use matrix.commit as-is
-            echo "commit_hash=${{ matrix.commit }}" >> $GITHUB_OUTPUT
-            echo "Using ${{ matrix.commit }} as-is (repo not available)"
-          fi
+          echo "commit_hash=${{ matrix.commit }}" >> $GITHUB_OUTPUT
       
-      - name: Upload merged statistics to S3
+      - name: Upload recipes to S3
         if: always() && !inputs.dry_run
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/cvc5/fuzzing-statistics/variant1/fuzzing_statistics-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/cvc5/fuzzing-recipes/variant1/recipes-${COMMIT_HASH}.jsonl.gz"
           
-          if [ ! -f "merged_statistics_${{ matrix.commit }}.json" ]; then
-            echo "⚠️ Merged statistics file not found"
+          if [ ! -f "merged_recipes_${{ matrix.commit }}.jsonl" ]; then
+            echo "⚠️ Merged recipes file not found"
             exit 0
           fi
           
-          gzip -c "merged_statistics_${{ matrix.commit }}.json" > merged_statistics_${COMMIT_HASH}.json.gz
+          gzip -c "merged_recipes_${{ matrix.commit }}.jsonl" > recipes_${COMMIT_HASH}.jsonl.gz
           
           aws s3api put-object \
             --bucket ${{ secrets.AWS_S3_BUCKET }} \
             --key "$S3_KEY" \
-            --body merged_statistics_${COMMIT_HASH}.json.gz
+            --body recipes_${COMMIT_HASH}.jsonl.gz
           
-          echo "✅ Uploaded fuzzing statistics to S3: $S3_KEY"
+          echo "✅ Uploaded variant1 recipes to S3: $S3_KEY"
+      
+      - name: Upload changed functions to S3
+        if: always() && !inputs.dry_run
+        run: |
+          COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/cvc5/changed-functions/changed_functions-${COMMIT_HASH}.json.gz"
+          
+          if [ ! -f "changed_functions.json" ]; then
+            echo "⚠️ changed_functions.json not found"
+            exit 0
+          fi
+          
+          # Show changed functions content for debugging
+          echo "=== Changed Functions Content ==="
+          cat changed_functions.json | python3 -m json.tool
+          
+          gzip -c "changed_functions.json" > changed_functions_${COMMIT_HASH}.json.gz
+          
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body changed_functions_${COMMIT_HASH}.json.gz
+          
+          echo "✅ Uploaded changed functions to S3: $S3_KEY"
       
       - name: Dry run - Skip S3 upload
         if: always() && inputs.dry_run
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/cvc5/fuzzing-statistics/variant1/fuzzing_statistics-${COMMIT_HASH}.json.gz"
           
-          if [ -f "merged_statistics_${{ matrix.commit }}.json" ]; then
-            echo "🔍 DRY RUN: Would upload to S3: $S3_KEY"
-            echo "🔍 DRY RUN: File exists: merged_statistics_${{ matrix.commit }}.json"
-            echo "🔍 DRY RUN: Skipping upload (dry_run=true)"
+          if [ -f "merged_recipes_${{ matrix.commit }}.jsonl" ]; then
+            RECIPE_COUNT=$(wc -l < "merged_recipes_${{ matrix.commit }}.jsonl")
+            echo "🔍 DRY RUN: Would upload $RECIPE_COUNT recipes to S3"
           else
-            echo "⚠️ Merged statistics file not found"
+            echo "⚠️ Merged recipes file not found"
           fi
