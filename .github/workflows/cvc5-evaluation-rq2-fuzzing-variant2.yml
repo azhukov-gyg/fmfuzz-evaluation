@@ -305,6 +305,22 @@ jobs:
           cd yinyang && pip install -e . && cd ..
           pip cache purge || true
 
+      - name: Clone CVC5 repository
+        run: |
+          if [ ! -d "cvc5" ]; then
+            git clone https://github.com/cvc5/cvc5.git cvc5
+          fi
+
+      - name: Checkout commit
+        working-directory: cvc5
+        run: |
+          git fetch origin
+          git checkout ${{ matrix.commit }}
+          echo "Checked out commit: $(git rev-parse HEAD)"
+      
+      - name: Clean up git repositories
+        run: rm -rf cvc5/.git yinyang/.git || true
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5.1.0
         with:
@@ -312,87 +328,32 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Download pre-built fuzzing binary from S3
-        run: |
-          COMMIT_HASH="${{ matrix.commit }}"
-          S3_KEY="evaluation/rq2/cvc5/builds/fuzzing/${COMMIT_HASH}.tar.gz"
-          
-          mkdir -p artifacts
-          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY artifacts/artifacts.tar.gz
-          echo "✅ Downloaded fuzzing binary for $COMMIT_HASH"
-
-      - name: Extract fuzzing binary
-        run: |
-          mkdir -p cvc5/build
-          ./scripts/cvc5/extract_build_artifacts.sh artifacts/artifacts.tar.gz cvc5/build true
-          echo "✅ Extracted build artifacts (includes compile_commands.json)"
-          ls -la cvc5/build/bin/cvc5
-          ls -la cvc5/build/compile_commands.json || echo "Note: compile_commands.json may not exist"
-
-      - name: Clone CVC5 source (for recompilation)
-        run: |
-          # Clone source for incremental recompilation
-          git clone https://github.com/cvc5/cvc5.git cvc5-src
-          cd cvc5-src
-          git checkout ${{ matrix.commit }}
-          echo "Checked out commit: $(git rev-parse HEAD)"
-          cd ..
-          
-          # Move source into cvc5/ (build dir already extracted there)
-          # Copy src/ directory to cvc5/src/
-          cp -r cvc5-src/src cvc5/
-          rm -rf cvc5-src
-          
-          echo "✅ Source files ready for incremental rebuild"
-          ls -la cvc5/src/ | head -5
-
-      - name: Clean up git directories
-        run: rm -rf cvc5/.git yinyang/.git || true
-
       - name: Download allowlists
         uses: actions/download-artifact@v4
         with:
           name: changed-functions-${{ matrix.commit }}
           path: .
 
-      - name: Add sancov instrumentation (incremental rebuild)
+      - name: Build CVC5 with sancov instrumentation
         run: |
-          echo "=== Adding sancov instrumentation (incremental) ==="
+          echo "=== Building CVC5 with sancov instrumentation ==="
           
-          export CVC5_DIR="${{ github.workspace }}/cvc5"
-          export BUILD_DIR="${{ github.workspace }}/cvc5/build"
+          export WORKSPACE="${{ github.workspace }}"
           export COVERAGE_AGENT="${{ github.workspace }}/scripts/cvc5/partial_instrumentation/coverage_agent.cpp"
           
-          # Check prerequisites
-          echo "Checking prerequisites..."
-          ls -la cvc5/build/bin/cvc5
-          ls -la cvc5/build/compile_commands.json || echo "⚠️ compile_commands.json not found"
+          # Setup allowlists (downloaded to current directory by previous step)
+          SANCOV_ARG=""
           
-          # Setup allowlist
           if [ -f "sancov_allowlist.txt" ]; then
-            SANCOV_ALLOWLIST="$(pwd)/sancov_allowlist.txt"
+            SANCOV_ARG="$(pwd)/sancov_allowlist.txt"
             echo "Using sancov allowlist: $(grep -c '^fun:' sancov_allowlist.txt || echo 0) functions"
-            cat sancov_allowlist.txt
-          else
-            echo "⚠️ No sancov allowlist found"
-            exit 1
           fi
           
-          # Check if compile_commands.json exists
-          if [ -f "cvc5/build/compile_commands.json" ]; then
-            echo "=== Using incremental build ==="
-            chmod +x ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/build_cvc5_sancov_incremental.sh
-            ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/build_cvc5_sancov_incremental.sh \
-              "$(pwd)/changed_functions.json" \
-              "$SANCOV_ALLOWLIST"
-          else
-            echo "=== Falling back to full build (no compile_commands.json) ==="
-            export WORKSPACE="${{ github.workspace }}"
-            ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/build_cvc5_instrumented.sh \
-              "${{ matrix.commit }}" \
-              "$SANCOV_ALLOWLIST" \
-              ""
-          fi
+          # Build with sancov instrumentation (only for changed functions)
+          ${{ github.workspace }}/scripts/cvc5/partial_instrumentation/build_cvc5_instrumented.sh \
+            "${{ matrix.commit }}" \
+            "$SANCOV_ARG" \
+            ""
           
           echo "✅ Build complete"
           ls -la cvc5/build/bin/cvc5
