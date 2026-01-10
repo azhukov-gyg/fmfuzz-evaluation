@@ -2240,8 +2240,10 @@ class CoverageGuidedFuzzer:
             self.shutdown_event.set()
         
         # Handle termination signals
+        # Only handle SIGTERM - ignore SIGINT to prevent spurious interrupts in CI
+        # (SIGINT can be sent unexpectedly in GitHub Actions/containerized environments)
         signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ignore SIGINT
         
         # Main loop: monitor workers and refill queue when needed
         try:

@@ -1,12 +1,15 @@
 #!/bin/bash
-# Build CVC5 with sancov + PGO instrumentation for production fuzzing
+# Build CVC5 with sancov instrumentation for coverage-guided fuzzing
 # 
 # Usage:
-#   ./build_cvc5_instrumented.sh [commit_hash] [sancov_allowlist] [pgo_allowlist]
+#   ./build_cvc5_instrumented.sh [commit_hash] [sancov_allowlist] [--enable-pgo]
 #
 # Environment variables:
 #   WORKSPACE - workspace directory (default: /workspace)
 #   COVERAGE_AGENT - path to coverage_agent.cpp (auto-detected if not set)
+#
+# Note: PGO is disabled by default. Use --enable-pgo to enable profraw collection.
+#       For measurement, we use gcov instead of PGO.
 #
 set -e
 
@@ -18,14 +21,19 @@ BUILD_DIR="${CVC5_DIR}/build"
 # Arguments
 COMMIT_HASH="${1:-}"
 SANCOV_ALLOWLIST="${2:-}"
-PGO_ALLOWLIST="${3:-}"
+ENABLE_PGO="${3:-}"  # Pass --enable-pgo to enable PGO instrumentation
 
 log() { echo -e "\033[0;34m[INFO]\033[0m $1"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $1"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $1"; exit 1; }
 
 echo "=============================================="
-echo "Building CVC5 with Sancov + PGO Instrumentation"
+echo "Building CVC5 with Sancov Instrumentation"
+if [ "$ENABLE_PGO" = "--enable-pgo" ]; then
+    echo "(PGO instrumentation ENABLED)"
+else
+    echo "(PGO instrumentation disabled)"
+fi
 echo "=============================================="
 
 # Phase 1: Clone/checkout CVC5
@@ -93,9 +101,8 @@ export CC=clang
 export CXX=clang++
 
 SANCOV_FLAGS="-fsanitize-coverage=trace-pc-guard"
-PGO_FLAGS="-fprofile-instr-generate -fcoverage-mapping"
 
-# Add allowlists if provided
+# Add sancov allowlist if provided
 if [ -n "$SANCOV_ALLOWLIST" ] && [ -f "$SANCOV_ALLOWLIST" ]; then
     SANCOV_FLAGS="$SANCOV_FLAGS -fsanitize-coverage-allowlist=$SANCOV_ALLOWLIST"
     SANCOV_COUNT=$(grep -c '^fun:' "$SANCOV_ALLOWLIST" 2>/dev/null || echo 0)
@@ -105,13 +112,15 @@ if [ -n "$SANCOV_ALLOWLIST" ] && [ -f "$SANCOV_ALLOWLIST" ]; then
     echo "  ---------------------------------"
 fi
 
-if [ -n "$PGO_ALLOWLIST" ] && [ -f "$PGO_ALLOWLIST" ]; then
-    PGO_FLAGS="$PGO_FLAGS -fprofile-list=$PGO_ALLOWLIST"
-    PGO_COUNT=$(grep -c '^fun:' "$PGO_ALLOWLIST" 2>/dev/null || echo 0)
-    echo "  PGO allowlist: $PGO_ALLOWLIST ($PGO_COUNT functions)"
-    echo "  --- PGO allowlist contents ---"
-    cat "$PGO_ALLOWLIST"
-    echo "  ------------------------------"
+# PGO flags (only if enabled)
+PGO_FLAGS=""
+PGO_LDFLAGS=""
+if [ "$ENABLE_PGO" = "--enable-pgo" ]; then
+    PGO_FLAGS="-fprofile-instr-generate -fcoverage-mapping"
+    PGO_LDFLAGS="-fprofile-instr-generate"
+    echo "  PGO: ENABLED (profraw files will be generated)"
+else
+    echo "  PGO: disabled (use --enable-pgo to enable)"
 fi
 
 # Let CVC5's production profile handle optimization flags
@@ -119,7 +128,7 @@ fi
 # (inlined functions bypass coverage guards, causing 0 edges hit)
 export CFLAGS="$SANCOV_FLAGS $PGO_FLAGS -fno-inline"
 export CXXFLAGS="$SANCOV_FLAGS $PGO_FLAGS -fno-inline"
-export LDFLAGS="-fprofile-instr-generate"
+export LDFLAGS="$PGO_LDFLAGS"
 
 echo "  CFLAGS: $CFLAGS"
 echo "  CXXFLAGS: $CXXFLAGS"
@@ -142,7 +151,7 @@ clang++ -c -o "$AGENT_OBJ" "$AGENT_SRC" -O2 -g -std=c++17 -fPIC -fno-sanitize-co
 cd "$BUILD_DIR"
 
 # Phase 5b: Inject coverage agent via CMake
-# STATIC_BINARY=OFF avoids -static linker flag which breaks PGO runtime linking
+# STATIC_BINARY=OFF avoids -static linker flag which breaks runtime linking
 log "Phase 5b: Injecting coverage agent"
 cmake \
     -DCMAKE_C_FLAGS="${CFLAGS}" \
@@ -187,11 +196,16 @@ echo "Binary: $BINARY"
 echo "Build time: ${BUILD_TIME}s"
 echo "Sancov symbols: $SANCOV_SYM"
 echo "PGO symbols: $PGO_SYM"
+echo "PGO enabled: $( [ "$ENABLE_PGO" = "--enable-pgo" ] && echo "yes" || echo "no" )"
 echo "File size: $(du -h "$BINARY" | cut -f1)"
 
-if [ "$SANCOV_SYM" -gt 0 ] && [ "$PGO_SYM" -gt 0 ]; then
+# Verify instrumentation (only require PGO if enabled)
+if [ "$SANCOV_SYM" -gt 0 ]; then
+    if [ "$ENABLE_PGO" = "--enable-pgo" ] && [ "$PGO_SYM" -eq 0 ]; then
+        err "BUILD FAILED - PGO enabled but no PGO symbols found"
+    fi
     ok "BUILD SUCCESSFUL - Instrumentation verified"
     exit 0
 else
-    err "BUILD FAILED - Missing instrumentation symbols"
+    err "BUILD FAILED - No sancov symbols found"
 fi
