@@ -127,16 +127,33 @@ def extract_function_counts_fastcov(
             total_sources = len(fastcov_data.get('sources', {}))
             log(f"[GCOV DEBUG] fastcov found {total_sources} source files")
             
+            # Debug: show sample source file structure
+            sample_shown = False
+            total_funcs_found = 0
+            
             # Show sample of functions found
             all_funcs = []
             for source_file, source_data in fastcov_data.get('sources', {}).items():
-                for func_name, func_data in source_data.get('functions', {}).items():
+                funcs = source_data.get('functions', {})
+                total_funcs_found += len(funcs)
+                
+                # Show first source with functions as sample
+                if not sample_shown and funcs:
+                    log(f"[GCOV DEBUG] Sample source: {source_file}")
+                    log(f"[GCOV DEBUG]   Keys in source_data: {list(source_data.keys())}")
+                    sample_func = list(funcs.items())[0]
+                    log(f"[GCOV DEBUG]   Sample func: {sample_func[0][:60]}")
+                    log(f"[GCOV DEBUG]   Sample func_data: {sample_func[1]}")
+                    sample_shown = True
+                
+                for func_name, func_data in funcs.items():
                     exec_count = func_data.get('execution_count', 0)
                     if exec_count > 0:
                         all_funcs.append((func_name, exec_count))
                     if func_name in changed_functions:
                         counts[func_name] = counts.get(func_name, 0) + exec_count
             
+            log(f"[GCOV DEBUG] Total functions found: {total_funcs_found}")
             log(f"[GCOV DEBUG] Found {len(all_funcs)} functions with >0 execution count")
             # Show top 5 by execution count
             if all_funcs:
