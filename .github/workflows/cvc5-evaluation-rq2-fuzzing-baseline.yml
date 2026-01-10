@@ -8,6 +8,15 @@ on:
         required: false
         type: number
         default: 60
+      debug_commit_hash:
+        description: 'Debug: Specific commit hash to test. If provided, only this commit will be fuzzed.'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run: Skip S3 uploads (default: false)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   generate-matrix:
@@ -44,27 +53,36 @@ jobs:
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
-          # List commits that have variant1 statistics
-          prefix="evaluation/rq2/cvc5/fuzzing-statistics/variant1/"
-          commits=$(aws s3 ls s3://${{ secrets.AWS_S3_BUCKET }}/$prefix --recursive | \
-            grep "fuzzing_statistics-" | \
-            sed 's/.*fuzzing_statistics-\(.*\)\.json\.gz/\1/' | \
-            sort -u)
-          
-          commit_count=$(echo "$commits" | wc -l)
-          echo "✅ Found $commit_count commits with variant1 statistics"
-          
-          # Generate matrix - build JSON array directly
-          echo "[]" > /tmp/matrix_entries.json
-          for commit in $commits; do
-            jq --arg commit "$commit" '. + [{"commit": $commit}]' /tmp/matrix_entries.json > /tmp/matrix_entries_new.json
-            mv /tmp/matrix_entries_new.json /tmp/matrix_entries.json
-          done
-          
-          # Create final matrix structure in compact format
-          COMMIT_MATRIX=$(jq -c '{include: .}' /tmp/matrix_entries.json)
-          echo "commit_matrix=$COMMIT_MATRIX" >> $GITHUB_OUTPUT
-          echo "total_commits=$commit_count" >> $GITHUB_OUTPUT
+          if [ -n "${{ inputs.debug_commit_hash }}" ]; then
+            echo "🔍 Debug mode: Using specific commit ${{ inputs.debug_commit_hash }}"
+            DEBUG_COMMIT="${{ inputs.debug_commit_hash }}"
+            COMMIT_MATRIX=$(python3 -c "import json; print(json.dumps({'include': [{'commit': '$DEBUG_COMMIT'}]}, separators=(',', ':')))")
+            TOTAL_COMMITS=1
+            echo "commit_matrix=$COMMIT_MATRIX" >> $GITHUB_OUTPUT
+            echo "total_commits=$TOTAL_COMMITS" >> $GITHUB_OUTPUT
+          else
+            # List commits that have variant1 statistics
+            prefix="evaluation/rq2/cvc5/fuzzing-statistics/variant1/"
+            commits=$(aws s3 ls s3://${{ secrets.AWS_S3_BUCKET }}/$prefix --recursive | \
+              grep "fuzzing_statistics-" | \
+              sed 's/.*fuzzing_statistics-\(.*\)\.json\.gz/\1/' | \
+              sort -u)
+            
+            commit_count=$(echo "$commits" | wc -l)
+            echo "✅ Found $commit_count commits with variant1 statistics"
+            
+            # Generate matrix - build JSON array directly
+            echo "[]" > /tmp/matrix_entries.json
+            for commit in $commits; do
+              jq --arg commit "$commit" '. + [{"commit": $commit}]' /tmp/matrix_entries.json > /tmp/matrix_entries_new.json
+              mv /tmp/matrix_entries_new.json /tmp/matrix_entries.json
+            done
+            
+            # Create final matrix structure in compact format
+            COMMIT_MATRIX=$(jq -c '{include: .}' /tmp/matrix_entries.json)
+            echo "commit_matrix=$COMMIT_MATRIX" >> $GITHUB_OUTPUT
+            echo "total_commits=$commit_count" >> $GITHUB_OUTPUT
+          fi
 
   prepare-baseline:
     needs: generate-matrix
@@ -476,6 +494,7 @@ jobs:
           tail -5 merged_recipes_${{ matrix.commit }}.jsonl
       
       - name: Configure AWS credentials
+        if: ${{ !inputs.dry_run }}
         uses: aws-actions/configure-aws-credentials@v5.1.0
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -489,7 +508,7 @@ jobs:
           echo "commit_hash=${{ matrix.commit }}" >> $GITHUB_OUTPUT
       
       - name: Upload recipes to S3
-        if: always()
+        if: always() && !inputs.dry_run
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
           S3_KEY="evaluation/rq2/cvc5/fuzzing-recipes/baseline/recipes-${COMMIT_HASH}.jsonl.gz"
@@ -509,7 +528,7 @@ jobs:
           echo "✅ Uploaded baseline recipes to S3: $S3_KEY"
       
       - name: Upload changed functions to S3
-        if: always()
+        if: always() && !inputs.dry_run
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
           S3_KEY="evaluation/rq2/cvc5/changed-functions/changed_functions-${COMMIT_HASH}.json.gz"
@@ -531,4 +550,16 @@ jobs:
             --body changed_functions_${COMMIT_HASH}.json.gz
           
           echo "✅ Uploaded changed functions to S3: $S3_KEY"
+      
+      - name: Dry run - Skip S3 upload
+        if: always() && inputs.dry_run
+        run: |
+          COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
+          
+          if [ -f "merged_recipes_${{ matrix.commit }}.jsonl" ]; then
+            RECIPE_COUNT=$(wc -l < "merged_recipes_${{ matrix.commit }}.jsonl")
+            echo "🔍 DRY RUN: Would upload $RECIPE_COUNT recipes to S3"
+          else
+            echo "⚠️ Merged recipes file not found"
+          fi
 

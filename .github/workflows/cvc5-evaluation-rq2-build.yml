@@ -2,6 +2,16 @@ name: CVC5 RQ2 Binary Building
 
 on:
   workflow_dispatch:
+    inputs:
+      debug_commit_hash:
+        description: 'Debug: Specific commit hash to build. If provided, only this commit will be built.'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run: Skip S3 uploads (default: false)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   generate-matrix:
@@ -38,8 +48,15 @@ jobs:
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
-          MATRIX=$(python3 scripts/rq2/generate_build_matrix.py cvc5)
-          COMMIT_COUNT=$(echo "$MATRIX" | python3 -c "import sys, json; data=json.load(sys.stdin); print(len(data['include']))")
+          if [ -n "${{ inputs.debug_commit_hash }}" ]; then
+            echo "🔍 Debug mode: Using specific commit ${{ inputs.debug_commit_hash }}"
+            DEBUG_COMMIT="${{ inputs.debug_commit_hash }}"
+            MATRIX=$(python3 -c "import json; print(json.dumps({'include': [{'commit': '$DEBUG_COMMIT'}]}, separators=(',', ':')))")
+            COMMIT_COUNT=1
+          else
+            MATRIX=$(python3 scripts/rq2/generate_build_matrix.py cvc5)
+            COMMIT_COUNT=$(echo "$MATRIX" | python3 -c "import sys, json; data=json.load(sys.stdin); print(len(data['include']))")
+          fi
           
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
           echo "total_commits=$COMMIT_COUNT" >> $GITHUB_OUTPUT
@@ -154,6 +171,7 @@ jobs:
           echo "CVC5 commit hash: $COMMIT_HASH"
       
       - name: Upload coverage binary to S3
+        if: ${{ !inputs.dry_run }}
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
           S3_KEY="evaluation/rq2/cvc5/builds/coverage/${COMMIT_HASH}.tar.gz"
@@ -169,6 +187,12 @@ jobs:
             --body /tmp/artifacts-coverage.tar.gz
           
           echo "✅ Uploaded coverage binary to S3: $S3_KEY"
+      
+      - name: Dry run - Skip coverage binary upload
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "🔍 DRY RUN: Would upload coverage binary to S3"
+          ls -la /tmp/artifacts-coverage.tar.gz
       
       # ============================================================
       # BUILD 2: Fuzzing binary (debug + assertions, NO coverage)
@@ -201,6 +225,7 @@ jobs:
           cd ..
       
       - name: Upload fuzzing binary to S3
+        if: ${{ !inputs.dry_run }}
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
           S3_KEY="evaluation/rq2/cvc5/builds/fuzzing/${COMMIT_HASH}.tar.gz"
@@ -216,3 +241,9 @@ jobs:
             --body /tmp/artifacts-fuzzing.tar.gz
           
           echo "✅ Uploaded fuzzing binary to S3: $S3_KEY"
+      
+      - name: Dry run - Skip fuzzing binary upload
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "🔍 DRY RUN: Would upload fuzzing binary to S3"
+          ls -la /tmp/artifacts-fuzzing.tar.gz
