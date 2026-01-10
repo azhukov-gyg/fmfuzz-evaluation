@@ -90,6 +90,13 @@ def extract_function_counts_fastcov(
     counts = {}
     fastcov_output = None
     
+    # Debug: count .gcda files
+    gcda_files = list(Path(build_dir).rglob("*.gcda"))
+    log(f"[GCOV DEBUG] Found {len(gcda_files)} .gcda files in {build_dir}")
+    if gcda_files[:3]:
+        for f in gcda_files[:3]:
+            log(f"[GCOV DEBUG]   - {f}")
+    
     try:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             fastcov_output = f.name
@@ -109,15 +116,35 @@ def extract_function_counts_fastcov(
             timeout=300
         )
         
+        log(f"[GCOV DEBUG] fastcov return code: {result.returncode}")
+        if result.stderr:
+            log(f"[GCOV DEBUG] fastcov stderr: {result.stderr[:500]}")
+        
         if result.returncode == 0 and os.path.exists(fastcov_output):
             with open(fastcov_output, 'r') as f:
                 fastcov_data = json.load(f)
             
+            total_sources = len(fastcov_data.get('sources', {}))
+            log(f"[GCOV DEBUG] fastcov found {total_sources} source files")
+            
+            # Show sample of functions found
+            all_funcs = []
             for source_file, source_data in fastcov_data.get('sources', {}).items():
                 for func_name, func_data in source_data.get('functions', {}).items():
+                    exec_count = func_data.get('execution_count', 0)
+                    if exec_count > 0:
+                        all_funcs.append((func_name, exec_count))
                     if func_name in changed_functions:
-                        exec_count = func_data.get('execution_count', 0)
                         counts[func_name] = counts.get(func_name, 0) + exec_count
+            
+            log(f"[GCOV DEBUG] Found {len(all_funcs)} functions with >0 execution count")
+            # Show top 5 by execution count
+            if all_funcs:
+                top_funcs = sorted(all_funcs, key=lambda x: -x[1])[:5]
+                for name, count in top_funcs:
+                    log(f"[GCOV DEBUG]   {count:>10}  {name[:80]}")
+        else:
+            log(f"[GCOV DEBUG] fastcov failed or no output")
         
     except Exception as e:
         log(f"Error extracting function counts: {e}")
@@ -203,6 +230,8 @@ def process_seed_group(
     
     # Process iterations sequentially
     current_iteration = 0
+    last_progress_time = time.time()
+    recipes_since_progress = 0
     
     for recipe in group_recipes:
         target_iteration = recipe.get('iteration', 0)
@@ -230,9 +259,19 @@ def process_seed_group(
                             env=gcov_env
                         )
                         successful += 1
+                        recipes_since_progress += 1
+                        
+                        # Log progress every 60 seconds or every 50 mutations
+                        now = time.time()
+                        if now - last_progress_time > 60 or recipes_since_progress >= 50:
+                            progress_queue.put(('progress', worker_id, seed_name, successful, len(group_recipes)))
+                            last_progress_time = now
+                            recipes_since_progress = 0
                         
                     except subprocess.TimeoutExpired:
                         successful += 1  # Still counts as processed
+                        # Log timeout so user knows something is happening
+                        progress_queue.put(('timeout', worker_id, seed_name, current_iteration))
                     except FileNotFoundError as e:
                         if mutations == 1:  # Only log once per seed
                             progress_queue.put(('error', worker_id, seed_name, f'Solver not found: {solver_path}'))
@@ -470,6 +509,12 @@ def replay_recipes_optimized(
                     _, worker_id, seed_name, reason, recipe_count = msg
                     seeds_done += 1
                     log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] SKIP {seed_name}: {reason}")
+                elif msg[0] == 'progress':
+                    _, worker_id, seed_name, done, total = msg
+                    log(f"[W{worker_id}] ... {seed_name}: {done}/{total} recipes")
+                elif msg[0] == 'timeout':
+                    _, worker_id, seed_name, iteration = msg
+                    log(f"[W{worker_id}] TIMEOUT {seed_name} iter {iteration}")
                 elif msg[0] == 'error':
                     _, worker_id, seed_name, error_msg = msg
                     log(f"[W{worker_id}] ERROR {seed_name}: {error_msg}")

@@ -149,13 +149,14 @@ jobs:
             cat "$f" | python3 -m json.tool
           done
       
-      - name: Upload combined matrix and seeds files
+      - name: Upload combined matrix, seeds files, and recipes
         uses: actions/upload-artifact@v4
         with:
           name: variant2-measurement-matrix-${{ matrix.commit }}
           path: |
             combined_matrix.json
             seeds_job_*.json
+            recipes.jsonl
           if-no-files-found: error
 
   # ============================================================
@@ -294,16 +295,13 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
       
-      - name: Download recipes from S3
+      - name: Use recipes from artifact
         run: |
-          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/cvc5/fuzzing-recipes/variant2/recipes-${COMMIT_HASH}.jsonl.gz"
-          
-          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY recipes.jsonl.gz
-          gunzip recipes.jsonl.gz
+          # Use recipes.jsonl from the same artifact as seeds files (ensures consistency)
+          cp matrix-data/recipes.jsonl recipes.jsonl
           
           RECIPE_COUNT=$(wc -l < recipes.jsonl)
-          echo "✅ Downloaded $RECIPE_COUNT total recipes"
+          echo "✅ Using $RECIPE_COUNT recipes from artifact"
           
           # Show sample
           echo ""
