@@ -76,8 +76,9 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
                 recipes.append(recipe)
                 
                 # Group by (seed_path, rng_seed)
+                # NOTE: Default rng_seed must match replay_recipes.py (42)
                 seed_path = recipe.get('seed_path', '')
-                rng_seed = recipe.get('rng_seed', 0)
+                rng_seed = recipe.get('rng_seed', 42)
                 key = (seed_path, rng_seed)
                 
                 if key not in seed_groups:
