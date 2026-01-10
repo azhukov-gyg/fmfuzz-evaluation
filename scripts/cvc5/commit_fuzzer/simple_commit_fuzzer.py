@@ -740,12 +740,12 @@ class SimpleCommitFuzzer:
             
             iterations_done += 1
             
-            # Record recipe (BEFORE running solver - we want to record all generated mutations)
-            recipe_recorder.record(str(test_path), iteration)
-            
             # Only run solver every modulo iterations (like typefuzz -m flag)
             if iteration % self.modulo != 0:
                 continue
+            
+            # Record recipe ONLY for mutations where solver actually runs
+            recipe_recorder.record(str(test_path), iteration)
             
             # Write mutant to temp file
             mutant_path = None

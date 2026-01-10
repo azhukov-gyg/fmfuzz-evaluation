@@ -270,8 +270,9 @@ def process_seed_group(
                         
                     except subprocess.TimeoutExpired:
                         successful += 1  # Still counts as processed
-                        # Log timeout so user knows something is happening
-                        progress_queue.put(('timeout', worker_id, seed_name, current_iteration))
+                        # Log timeout with remaining count so user knows what's left
+                        remaining = len(group_recipes) - successful
+                        progress_queue.put(('timeout', worker_id, seed_name, current_iteration, remaining, len(group_recipes)))
                     except FileNotFoundError as e:
                         if mutations == 1:  # Only log once per seed
                             progress_queue.put(('error', worker_id, seed_name, f'Solver not found: {solver_path}'))
@@ -513,8 +514,8 @@ def replay_recipes_optimized(
                     _, worker_id, seed_name, done, total = msg
                     log(f"[W{worker_id}] ... {seed_name}: {done}/{total} recipes")
                 elif msg[0] == 'timeout':
-                    _, worker_id, seed_name, iteration = msg
-                    log(f"[W{worker_id}] TIMEOUT {seed_name} iter {iteration}")
+                    _, worker_id, seed_name, iteration, remaining, total = msg
+                    log(f"[W{worker_id}] TIMEOUT {seed_name} iter {iteration} ({remaining} remaining of {total})")
                 elif msg[0] == 'error':
                     _, worker_id, seed_name, error_msg = msg
                     log(f"[W{worker_id}] ERROR {seed_name}: {error_msg}")

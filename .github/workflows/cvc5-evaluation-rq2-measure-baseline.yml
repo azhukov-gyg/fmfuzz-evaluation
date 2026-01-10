@@ -383,7 +383,7 @@ jobs:
             --changed-functions ../changed_functions.json \
             --output ../measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}.json \
             --gcov gcov-14 \
-            --timeout 120 \
+            --timeout 15 \
             --num-workers 4 \
             --seeds-file "$SEEDS_FILE"
           

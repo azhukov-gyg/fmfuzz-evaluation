@@ -1447,10 +1447,15 @@ class CoverageGuidedFuzzer:
                 continue
 
             produced += 1
+            iteration = i + 1  # 1-indexed for consistency with yinyang
             
-            # Record recipe (iteration is 1-indexed for consistency with yinyang)
+            # Only run solver every modulo iterations (like typefuzz -m flag)
+            if iteration % self.modulo != 0:
+                continue
+            
+            # Record recipe ONLY for mutations where solver actually runs
             if recipe_recorder:
-                recipe_recorder.record(str(test_path), i + 1)
+                recipe_recorder.record(str(test_path), iteration)
 
             mutant_path = scratch_folder / f"mutant_{worker_id}_{i}.smt2"
             with open(mutant_path, 'w') as f:
