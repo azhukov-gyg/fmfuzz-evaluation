@@ -309,6 +309,26 @@ jobs:
           GCNO_COUNT=$(find cvc5/build -name "*.gcno" | wc -l)
           echo "Found $GCNO_COUNT .gcno files"
       
+      - name: Clone CVC5 repository (for test files)
+        run: |
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          
+          # Clone CVC5 to get the test files that recipes reference
+          if [ ! -d "cvc5/.git" ]; then
+            git clone --depth 1 https://github.com/cvc5/cvc5.git cvc5-src
+            cd cvc5-src
+            git fetch --depth 1 origin $COMMIT_HASH
+            git checkout $COMMIT_HASH
+            cd ..
+            # Move test directory to cvc5/
+            cp -r cvc5-src/test cvc5/test
+            rm -rf cvc5-src
+          fi
+          
+          # Verify test files exist
+          TEST_COUNT=$(find cvc5/test/regress -name "*.smt2" | wc -l)
+          echo "✅ Found $TEST_COUNT test files in cvc5/test/regress"
+      
       - name: Download changed functions from S3
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
@@ -330,6 +350,7 @@ jobs:
           cvc5/build/bin/cvc5 --version
       
       - name: Run recipe replay for measurement
+        working-directory: cvc5
         run: |
           START_IDX="${{ steps.job-params.outputs.start_idx }}"
           END_IDX="${{ steps.job-params.outputs.end_idx }}"
@@ -337,12 +358,13 @@ jobs:
           echo "=== Starting recipe replay for job ${{ matrix.job_id }} ==="
           echo "    Slice: [$START_IDX:$END_IDX]"
           
-          python3 scripts/rq2/replay_recipes.py \
-            recipes.jsonl \
-            --solver cvc5/build/bin/cvc5 \
-            --build-dir cvc5/build \
-            --changed-functions changed_functions.json \
-            --output measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}.json \
+          # Run from cvc5/ directory so seed paths in recipes resolve correctly
+          python3 ${{ github.workspace }}/scripts/rq2/replay_recipes.py \
+            ../recipes.jsonl \
+            --solver ./build/bin/cvc5 \
+            --build-dir ./build \
+            --changed-functions ../changed_functions.json \
+            --output ../measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}.json \
             --gcov gcov-14 \
             --timeout 120 \
             --num-workers 1 \
