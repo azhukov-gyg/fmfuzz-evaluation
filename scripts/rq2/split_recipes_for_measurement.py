@@ -153,20 +153,21 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
         
         # Collect all recipe indices for this job's seeds
         job_recipe_indices = []
-        job_seed_paths = []
+        # Store (seed_path, rng_seed) tuples to ensure correct filtering
+        job_seed_keys = []
         for seed_key in job_seeds[job_id]:
             job_recipe_indices.extend(seed_groups[seed_key])
-            job_seed_paths.append(seed_key[0])  # seed_path only
+            job_seed_keys.append({"seed_path": seed_key[0], "rng_seed": seed_key[1]})
         
-        # Write seeds file for this job
+        # Write seeds file for this job (includes rng_seed for precise filtering)
         seeds_file = output_dir / f"seeds_job_{job_id}.json"
         with open(seeds_file, 'w') as f:
-            json.dump({"seeds": job_seed_paths, "job_id": job_id}, f, indent=2)
+            json.dump({"seed_keys": job_seed_keys, "job_id": job_id}, f, indent=2)
         
         matrix_entries.append({
             "job_id": job_id,
             "recipe_count": len(job_recipe_indices),
-            "seed_count": len(job_seed_paths),
+            "seed_count": len(job_seed_keys),
             "seeds_file": str(seeds_file.name),  # Just the filename
         })
     

@@ -326,17 +326,33 @@ def replay_recipes_optimized(
         log("ERROR: yinyang not available for mutation regeneration")
         return {"error": "yinyang not available"}
     
-    # Load allowed seeds if provided
-    allowed_seeds: Optional[Set[str]] = None
+    # Load allowed seed keys if provided
+    # Can be either:
+    #   - Dict with seed_keys (new format): {"seed_keys": [{"seed_path": "...", "rng_seed": 42}, ...]}
+    #   - List of seed paths (old format): ["path1", "path2"]
+    #   - Dict with seeds list (old format): {"seeds": ["path1", "path2"]}
+    allowed_seed_keys: Optional[Set[Tuple[str, int]]] = None
+    allowed_seed_paths: Optional[Set[str]] = None
+    
     if seeds_file:
         log(f"Loading seed filter from: {seeds_file}")
         with open(seeds_file, 'r') as f:
             seeds_data = json.load(f)
-        if isinstance(seeds_data, list):
-            allowed_seeds = set(seeds_data)
+        
+        if isinstance(seeds_data, dict) and 'seed_keys' in seeds_data:
+            # New format: list of {seed_path, rng_seed} objects
+            allowed_seed_keys = set()
+            for sk in seeds_data['seed_keys']:
+                allowed_seed_keys.add((sk['seed_path'], sk['rng_seed']))
+            log(f"Filtering to {len(allowed_seed_keys)} seed groups (path + rng_seed)")
+        elif isinstance(seeds_data, list):
+            # Old format: list of seed paths (no rng_seed filtering)
+            allowed_seed_paths = set(seeds_data)
+            log(f"Filtering to {len(allowed_seed_paths)} seed paths (legacy mode)")
         elif isinstance(seeds_data, dict) and 'seeds' in seeds_data:
-            allowed_seeds = set(seeds_data['seeds'])
-        log(f"Filtering to {len(allowed_seeds)} seeds")
+            # Old format: dict with seeds list
+            allowed_seed_paths = set(seeds_data['seeds'])
+            log(f"Filtering to {len(allowed_seed_paths)} seed paths (legacy mode)")
     
     # Load recipes
     log(f"Loading recipes from: {recipe_file}")
@@ -345,9 +361,14 @@ def replay_recipes_optimized(
     log(f"Total recipes in file: {len(all_recipes)}")
     
     # Apply filtering
-    if allowed_seeds is not None:
-        # Filter by seed paths
-        recipes = [r for r in all_recipes if r.get('seed_path') in allowed_seeds]
+    if allowed_seed_keys is not None:
+        # Filter by (seed_path, rng_seed) tuples - precise filtering
+        recipes = [r for r in all_recipes 
+                   if (r.get('seed_path'), r.get('rng_seed', 42)) in allowed_seed_keys]
+        log(f"After seed filter: {len(recipes)} recipes")
+    elif allowed_seed_paths is not None:
+        # Legacy: filter by seed_path only
+        recipes = [r for r in all_recipes if r.get('seed_path') in allowed_seed_paths]
         log(f"After seed filter: {len(recipes)} recipes")
     elif end_idx is not None:
         # Apply index slice (legacy mode - may split seeds)
