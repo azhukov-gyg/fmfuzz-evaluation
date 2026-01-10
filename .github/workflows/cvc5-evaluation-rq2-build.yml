@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.generate-matrix.outputs.matrix }}
-      total_commits: ${{ steps.generate-matrix.outputs.total_commits }}
+      total_jobs: ${{ steps.generate-matrix.outputs.total_jobs }}
     
     steps:
       - name: Checkout repository and submodules
@@ -51,17 +51,35 @@ jobs:
           if [ -n "${{ inputs.debug_commit_hash }}" ]; then
             echo "🔍 Debug mode: Using specific commit ${{ inputs.debug_commit_hash }}"
             DEBUG_COMMIT="${{ inputs.debug_commit_hash }}"
-            MATRIX=$(python3 -c "import json; print(json.dumps({'include': [{'commit': '$DEBUG_COMMIT'}]}, separators=(',', ':')))")
-            COMMIT_COUNT=1
+            # Single commit, both build types
+            MATRIX=$(python3 -c "
+          import json
+          commits = ['$DEBUG_COMMIT']
+          build_types = ['coverage', 'fuzzing']
+          include = [{'commit': c, 'build_type': b} for c in commits for b in build_types]
+          print(json.dumps({'include': include}, separators=(',', ':')))
+          ")
+            TOTAL_JOBS=2
           else
-            MATRIX=$(python3 scripts/rq2/generate_build_matrix.py cvc5)
-            COMMIT_COUNT=$(echo "$MATRIX" | python3 -c "import sys, json; data=json.load(sys.stdin); print(len(data['include']))")
+            # Get commits from generate_build_matrix.py
+            COMMITS_JSON=$(python3 scripts/rq2/generate_build_matrix.py cvc5)
+            
+            # Expand to include both build types for each commit
+            MATRIX=$(echo "$COMMITS_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          commits = [entry['commit'] for entry in data['include']]
+          build_types = ['coverage', 'fuzzing']
+          include = [{'commit': c, 'build_type': b} for c in commits for b in build_types]
+          print(json.dumps({'include': include}, separators=(',', ':')))
+          ")
+            TOTAL_JOBS=$(echo "$MATRIX" | python3 -c "import sys, json; print(len(json.load(sys.stdin)['include']))")
           fi
           
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "total_commits=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+          echo "total_jobs=$TOTAL_JOBS" >> $GITHUB_OUTPUT
           
-          echo "✅ Generated matrix with $COMMIT_COUNT commits"
+          echo "✅ Generated matrix with $TOTAL_JOBS jobs (commits × 2 build types)"
           echo "$MATRIX" | python3 -m json.tool
 
   build-binaries:
@@ -79,10 +97,13 @@ jobs:
         with:
           submodules: recursive
       
+      - name: Show build info
+        run: |
+          echo "🔨 Building: ${{ matrix.commit }} (${{ matrix.build_type }})"
+      
       - name: Prepare CVC5 for commit
         run: |
           COMMIT_HASH="${{ matrix.commit }}"
-          echo "🔨 Building commit: $COMMIT_HASH"
           if [ -d "cvc5" ]; then
             rm -rf cvc5
           fi
@@ -92,76 +113,6 @@ jobs:
           echo "Checked out commit: $(git rev-parse HEAD)"
           cd ..
       
-      - name: Install LLVM/Clang 17 for coverage build
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: '17'
-      
-      - name: Add LLVM to PATH
-        run: echo "${{ env.LLVM_PATH }}/bin" >> $GITHUB_PATH
-      
-      - name: Install GCC 14 (for consistent toolchain)
-        run: |
-          # Install GCC 14 to ensure consistent toolchain version
-          # Clang will use this via --gcc-toolchain=/usr
-          sudo apt-get update
-          sudo apt-get install -y gcc-14 g++-14 libstdc++-14-dev
-          # Set GCC 14 as default so Clang picks it up
-          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 60
-          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 60
-          sudo update-alternatives --set gcc /usr/bin/gcc-14
-          sudo update-alternatives --set g++ /usr/bin/g++-14
-      
-      - name: Clean build for coverage
-        run: |
-          if [ -d "cvc5/build" ]; then
-            rm -rf cvc5/build
-          fi
-      
-      - name: Build CVC5 coverage binary
-        run: |
-          # Use GCC 14 directly for compilation to ensure coverage format matches
-          # Clang defaults to '408*' format (GCC 4.8) regardless of toolchain
-          # Using GCC 14 directly ensures 'B42*' format that gcov-14 can read
-          export CXX="g++-14"
-          export CC="gcc-14"
-          ./fmfuzz-dev/scripts/cvc5/build.sh --static --coverage
-      
-      - name: Collect coverage artifacts
-        run: |
-          ./scripts/cvc5/collect_build_artifacts.sh cvc5/build .artifacts-coverage
-      
-      - name: Show build directory structure
-        run: |
-          echo "=== Full build directory structure ==="
-          echo "Build directory: cvc5/build"
-          echo ""
-          if [ -d "cvc5/build" ]; then
-            echo "Directory tree:"
-            find cvc5/build -type f -o -type d | sort | sed 's|^cvc5/build/||' | sed 's|^|  |'
-            echo ""
-            echo "File count by type:"
-            echo "  .cpp files: $(find cvc5/build -name "*.cpp" -type f 2>/dev/null | wc -l)"
-            echo "  .h files: $(find cvc5/build -name "*.h" -type f 2>/dev/null | wc -l)"
-            echo "  .gcno files: $(find cvc5/build -name "*.gcno" -type f 2>/dev/null | wc -l)"
-            echo "  Total files: $(find cvc5/build -type f 2>/dev/null | wc -l)"
-          else
-            echo "Build directory does not exist"
-          fi
-      
-      - name: Compress coverage artifacts
-        run: |
-          cd .artifacts-coverage
-          tar -czf /tmp/artifacts-coverage.tar.gz .
-          cd ..
-      
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5.1.0
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-      
       - name: Get commit hash
         id: get-commit
         working-directory: cvc5
@@ -170,80 +121,99 @@ jobs:
           echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
           echo "CVC5 commit hash: $COMMIT_HASH"
       
-      - name: Upload coverage binary to S3
-        if: ${{ !inputs.dry_run }}
-        run: |
-          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/cvc5/builds/coverage/${COMMIT_HASH}.tar.gz"
-          
-          if [ ! -f "/tmp/artifacts-coverage.tar.gz" ]; then
-            echo "❌ Error: artifacts-coverage.tar.gz not found"
-            exit 1
-          fi
-          
-          aws s3api put-object \
-            --bucket ${{ secrets.AWS_S3_BUCKET }} \
-            --key "$S3_KEY" \
-            --body /tmp/artifacts-coverage.tar.gz
-          
-          echo "✅ Uploaded coverage binary to S3: $S3_KEY"
-      
-      - name: Dry run - Skip coverage binary upload
-        if: ${{ inputs.dry_run }}
-        run: |
-          echo "🔍 DRY RUN: Would upload coverage binary to S3"
-          ls -la /tmp/artifacts-coverage.tar.gz
-      
       # ============================================================
-      # BUILD 2: Fuzzing binary (debug + assertions, NO coverage)
-      # Used by: baseline fuzzing, variant1 fuzzing
+      # COVERAGE BUILD
       # ============================================================
       
-      - name: Clean build for fuzzing binary
+      - name: Install GCC 14 (for coverage build)
+        if: matrix.build_type == 'coverage'
         run: |
-          rm -rf cvc5/build
-          echo "🧹 Cleaned build directory for fuzzing binary"
+          sudo apt-get update
+          sudo apt-get install -y gcc-14 g++-14 libstdc++-14-dev
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 60
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 60
+          sudo update-alternatives --set gcc /usr/bin/gcc-14
+          sudo update-alternatives --set g++ /usr/bin/g++-14
       
-      - name: Build CVC5 fuzzing binary (debug + assertions)
+      - name: Build CVC5 coverage binary
+        if: matrix.build_type == 'coverage'
+        run: |
+          export CXX="g++-14"
+          export CC="gcc-14"
+          ./fmfuzz-dev/scripts/cvc5/build.sh --static --coverage
+          echo "✅ Built coverage binary (GCC 14 + gcov)"
+      
+      - name: Collect coverage artifacts
+        if: matrix.build_type == 'coverage'
+        run: |
+          ./scripts/cvc5/collect_build_artifacts.sh cvc5/build .artifacts
+          
+          echo "=== Build info ==="
+          echo "  .gcno files: $(find cvc5/build -name '*.gcno' -type f 2>/dev/null | wc -l)"
+          echo "  Total files: $(find cvc5/build -type f 2>/dev/null | wc -l)"
+      
+      # ============================================================
+      # FUZZING BUILD
+      # ============================================================
+      
+      - name: Build CVC5 fuzzing binary
+        if: matrix.build_type == 'fuzzing'
         run: |
           cd cvc5
-          # Configure with debug + assertions but NO coverage instrumentation
-          # This produces a faster binary for fuzzing (no gcov overhead)
           ./configure.sh debug --assertions --static --static-binary --auto-download
           cd build
           make -j$(nproc)
           echo "✅ Built fuzzing binary (debug + assertions)"
       
       - name: Collect fuzzing artifacts
+        if: matrix.build_type == 'fuzzing'
         run: |
-          ./scripts/cvc5/collect_build_artifacts.sh cvc5/build .artifacts-fuzzing
+          ./scripts/cvc5/collect_build_artifacts.sh cvc5/build .artifacts
       
-      - name: Compress fuzzing artifacts
+      # ============================================================
+      # UPLOAD (common for both build types)
+      # ============================================================
+      
+      - name: Compress artifacts
         run: |
-          cd .artifacts-fuzzing
-          tar -czf /tmp/artifacts-fuzzing.tar.gz .
+          cd .artifacts
+          tar -czf /tmp/artifacts.tar.gz .
           cd ..
+          ls -la /tmp/artifacts.tar.gz
       
-      - name: Upload fuzzing binary to S3
+      - name: Configure AWS credentials
+        if: ${{ !inputs.dry_run }}
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Upload binary to S3
         if: ${{ !inputs.dry_run }}
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/cvc5/builds/fuzzing/${COMMIT_HASH}.tar.gz"
+          BUILD_TYPE="${{ matrix.build_type }}"
+          S3_KEY="evaluation/rq2/cvc5/builds/${BUILD_TYPE}/${COMMIT_HASH}.tar.gz"
           
-          if [ ! -f "/tmp/artifacts-fuzzing.tar.gz" ]; then
-            echo "❌ Error: artifacts-fuzzing.tar.gz not found"
+          if [ ! -f "/tmp/artifacts.tar.gz" ]; then
+            echo "❌ Error: artifacts.tar.gz not found"
             exit 1
           fi
           
           aws s3api put-object \
             --bucket ${{ secrets.AWS_S3_BUCKET }} \
             --key "$S3_KEY" \
-            --body /tmp/artifacts-fuzzing.tar.gz
+            --body /tmp/artifacts.tar.gz
           
-          echo "✅ Uploaded fuzzing binary to S3: $S3_KEY"
+          echo "✅ Uploaded ${BUILD_TYPE} binary to S3: $S3_KEY"
       
-      - name: Dry run - Skip fuzzing binary upload
+      - name: Dry run - Skip S3 upload
         if: ${{ inputs.dry_run }}
         run: |
-          echo "🔍 DRY RUN: Would upload fuzzing binary to S3"
-          ls -la /tmp/artifacts-fuzzing.tar.gz
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          BUILD_TYPE="${{ matrix.build_type }}"
+          echo "🔍 DRY RUN: Would upload ${BUILD_TYPE} binary to S3"
+          echo "   Commit: $COMMIT_HASH"
+          echo "   Path: evaluation/rq2/cvc5/builds/${BUILD_TYPE}/${COMMIT_HASH}.tar.gz"
+          ls -la /tmp/artifacts.tar.gz
