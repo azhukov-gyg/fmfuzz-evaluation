@@ -229,7 +229,8 @@ jobs:
       - name: Install GCC 14 (for gcov)
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-14 g++-14 gcov-14
+          # gcov-14 is included with gcc-14 (not a separate package)
+          sudo apt-get install -y gcc-14 g++-14
           sudo update-alternatives --install /usr/bin/gcov gcov /usr/bin/gcov-14 60
           pip install fastcov
       
