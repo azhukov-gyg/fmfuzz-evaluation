@@ -131,16 +131,31 @@ def extract_function_counts_fastcov(
             sample_shown = False
             total_funcs_found = 0
             
+            # Show first source file structure regardless of functions
+            sources = fastcov_data.get('sources', {})
+            if sources:
+                first_source = list(sources.items())[0]
+                log(f"[GCOV DEBUG] First source file: {first_source[0]}")
+                log(f"[GCOV DEBUG]   Keys available: {list(first_source[1].keys())}")
+                # Show first few items of each key
+                for key, value in first_source[1].items():
+                    if isinstance(value, dict):
+                        sample_items = list(value.items())[:2]
+                        log(f"[GCOV DEBUG]   {key}: {len(value)} items, sample: {sample_items}")
+                    elif isinstance(value, list):
+                        log(f"[GCOV DEBUG]   {key}: {len(value)} items, first: {value[:2] if value else 'empty'}")
+                    else:
+                        log(f"[GCOV DEBUG]   {key}: {value}")
+            
             # Show sample of functions found
             all_funcs = []
-            for source_file, source_data in fastcov_data.get('sources', {}).items():
+            for source_file, source_data in sources.items():
                 funcs = source_data.get('functions', {})
                 total_funcs_found += len(funcs)
                 
                 # Show first source with functions as sample
                 if not sample_shown and funcs:
-                    log(f"[GCOV DEBUG] Sample source: {source_file}")
-                    log(f"[GCOV DEBUG]   Keys in source_data: {list(source_data.keys())}")
+                    log(f"[GCOV DEBUG] Sample source with funcs: {source_file}")
                     sample_func = list(funcs.items())[0]
                     log(f"[GCOV DEBUG]   Sample func: {sample_func[0][:60]}")
                     log(f"[GCOV DEBUG]   Sample func_data: {sample_func[1]}")
