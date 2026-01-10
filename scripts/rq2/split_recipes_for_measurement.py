@@ -19,19 +19,76 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
     """
     Split recipes into jobs and generate GitHub Actions matrix.
     """
+    # Check if file exists
+    recipe_path = Path(recipe_file)
+    if not recipe_path.exists():
+        print(f"Error: Recipe file not found: {recipe_file}", file=sys.stderr)
+        # Return empty matrix to allow workflow to continue
+        result = {
+            "total_recipes": 0,
+            "num_jobs": 0,
+            "matrix": {"include": []}
+        }
+        with open(output_file, 'w') as f:
+            json.dump(result, f, indent=2)
+        print("0")
+        return
+    
+    # Check file size
+    file_size = recipe_path.stat().st_size
+    print(f"Recipe file: {recipe_file} ({file_size} bytes)", file=sys.stderr)
+    
+    if file_size == 0:
+        print(f"Warning: Recipe file is empty: {recipe_file}", file=sys.stderr)
+        result = {
+            "total_recipes": 0,
+            "num_jobs": 0,
+            "matrix": {"include": []}
+        }
+        with open(output_file, 'w') as f:
+            json.dump(result, f, indent=2)
+        print("0")
+        return
+    
     # Load recipes
     recipes = []
+    parse_errors = 0
     
-    if recipe_file.endswith('.gz'):
-        with gzip.open(recipe_file, 'rt') as f:
-            for line in f:
-                if line.strip():
-                    recipes.append(json.loads(line))
-    else:
-        with open(recipe_file, 'r') as f:
-            for line in f:
-                if line.strip():
-                    recipes.append(json.loads(line))
+    def parse_jsonl(f):
+        nonlocal parse_errors
+        for line_num, line in enumerate(f, 1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                recipes.append(json.loads(stripped))
+            except json.JSONDecodeError as e:
+                parse_errors += 1
+                if parse_errors <= 5:
+                    print(f"Warning: Failed to parse line {line_num}: {e}", file=sys.stderr)
+                    print(f"  Line content (first 100 chars): {repr(stripped[:100])}", file=sys.stderr)
+    
+    try:
+        if recipe_file.endswith('.gz'):
+            with gzip.open(recipe_file, 'rt') as f:
+                parse_jsonl(f)
+        else:
+            with open(recipe_file, 'r') as f:
+                parse_jsonl(f)
+    except Exception as e:
+        print(f"Error reading recipe file: {e}", file=sys.stderr)
+        result = {
+            "total_recipes": 0,
+            "num_jobs": 0,
+            "matrix": {"include": []}
+        }
+        with open(output_file, 'w') as f:
+            json.dump(result, f, indent=2)
+        print("0")
+        return
+    
+    if parse_errors > 0:
+        print(f"Warning: {parse_errors} lines failed to parse", file=sys.stderr)
     
     total_recipes = len(recipes)
     
