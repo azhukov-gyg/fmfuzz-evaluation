@@ -58,7 +58,8 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
         nonlocal parse_errors
         for line_num, line in enumerate(f, 1):
             stripped = line.strip()
-            if not stripped:
+            # Skip empty lines and comments
+            if not stripped or stripped.startswith('#'):
                 continue
             try:
                 recipes.append(json.loads(stripped))

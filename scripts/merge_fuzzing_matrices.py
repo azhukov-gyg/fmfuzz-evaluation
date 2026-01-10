@@ -69,8 +69,17 @@ def merge_matrices(matrix_files, output_file, minimal_output_file=None):
             if not isinstance(entry, dict):
                 continue
             
-            fuzzer_job = entry.get('fuzzer_job', {})
-            job_id = fuzzer_job.get('job_id')
+            # Handle both fuzzing matrix format (nested fuzzer_job) and measurement matrix format (flat)
+            if 'fuzzer_job' in entry:
+                # Fuzzing matrix format: {"commit": ..., "fuzzer_job": {"job_id": ...}}
+                job_id = entry['fuzzer_job'].get('job_id')
+            else:
+                # Measurement/flat format: {"commit": ..., "job_id": ...}
+                job_id = entry.get('job_id')
+            
+            # Validate job_id
+            if job_id is None:
+                print(f"Warning: entry missing job_id: {entry}", file=sys.stderr)
             
             minimal_entries.append({
                 'commit': entry.get('commit'),
