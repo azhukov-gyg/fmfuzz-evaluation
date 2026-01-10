@@ -2,38 +2,54 @@
 """
 Recipe Replay - Regenerates mutations from recipes and measures function calls using gcov.
 
+OPTIMIZED: Recipes are grouped by (seed_path, rng_seed) and processed sequentially.
+- Before: O(N²) - for each recipe, regenerate all previous iterations
+- After: O(N) - parse seed once, generate mutations in order, reuse RNG state
+
 This script:
-1. Reads recipe JSONL files from fuzzing phase
-2. Regenerates each mutation deterministically (using seed_path + iteration + rng_seed)
+1. Groups recipes by seed_path + rng_seed
+2. For each group, sorts by iteration and processes sequentially
 3. Runs mutations on gcov-instrumented binary
 4. Extracts function call counts for ALL changed functions
 
-Parallel support:
-- Can run multiple replay workers in parallel (--num-workers)
-- Each worker processes a chunk of recipes
-- Results are merged at the end
-- Proper cleanup after each mutation to avoid filling disk
-
-Used by measurement workflows for:
-- Baseline
-- Variant1
-- Variant2
+Used by measurement workflows for: Baseline, Variant1, Variant2
 """
 
 import argparse
 import json
-import multiprocessing
 import os
+import random
 import subprocess
 import sys
 import tempfile
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-# Import from shared modules
+# Add current directory to path for imports
+SCRIPT_DIR = Path(__file__).parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
 from recipe_recorder import RecipeReader
-from inline_typefuzz import regenerate_mutation, YINYANG_AVAILABLE
+
+# Try to import yinyang components
+YINYANG_AVAILABLE = False
+InlineTypeFuzz = None
+
+try:
+    from inline_typefuzz import InlineTypeFuzz as _InlineTypeFuzz, YINYANG_AVAILABLE as _YY_AVAIL
+    InlineTypeFuzz = _InlineTypeFuzz
+    YINYANG_AVAILABLE = _YY_AVAIL
+except ImportError:
+    pass
+
+
+def log(msg: str, flush: bool = True):
+    """Print with timestamp and flush."""
+    timestamp = time.strftime("%H:%M:%S")
+    print(f"[{timestamp}] {msg}", flush=flush)
 
 
 def load_changed_functions(changed_functions_file: str) -> Set[str]:
@@ -62,57 +78,8 @@ def load_changed_functions(changed_functions_file: str) -> Set[str]:
         
         return functions
     except Exception as e:
-        print(f"Error loading changed functions: {e}")
+        log(f"Error loading changed functions: {e}")
         return set()
-
-
-def replay_single_recipe(
-    recipe: dict,
-    solver_path: str,
-    build_dir: str,
-    timeout: int
-) -> Tuple[Optional[str], bool]:
-    """
-    Replay a single recipe: regenerate mutation, run solver, cleanup.
-    
-    Returns:
-        (mutant_content, success)
-    """
-    mutant = regenerate_mutation(
-        recipe['seed_path'],
-        recipe['iteration'],
-        recipe['rng_seed']
-    )
-    
-    if not mutant:
-        return None, False
-    
-    # Create temp file, run, cleanup immediately
-    mutant_path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
-            f.write(mutant)
-            mutant_path = f.name
-        
-        subprocess.run(
-            [solver_path, mutant_path],
-            capture_output=True,
-            timeout=timeout,
-            cwd=build_dir
-        )
-        return mutant, True
-        
-    except subprocess.TimeoutExpired:
-        return mutant, True  # Still count it, just timed out
-    except Exception:
-        return None, False
-    finally:
-        # ALWAYS cleanup temp file
-        if mutant_path and os.path.exists(mutant_path):
-            try:
-                os.unlink(mutant_path)
-            except:
-                pass
 
 
 def extract_function_counts_fastcov(
@@ -154,7 +121,7 @@ def extract_function_counts_fastcov(
                         counts[func_name] = counts.get(func_name, 0) + exec_count
         
     except Exception as e:
-        print(f"Error extracting function counts: {e}")
+        log(f"Error extracting function counts: {e}")
     finally:
         if fastcov_output and os.path.exists(fastcov_output):
             try:
@@ -167,100 +134,38 @@ def extract_function_counts_fastcov(
 
 def reset_gcda_files(build_dir: str):
     """Remove existing .gcda files to start fresh."""
+    count = 0
     for gcda in Path(build_dir).rglob("*.gcda"):
         try:
             gcda.unlink()
+            count += 1
         except:
             pass
+    return count
 
 
-def replay_worker(
-    worker_id: int,
-    recipes: List[dict],
-    solver_path: str,
-    build_dir: str,
-    changed_functions: Set[str],
-    gcov_cmd: str,
-    timeout: int,
-    batch_size: int,
-    result_queue: multiprocessing.Queue
-):
+def group_recipes_by_seed(recipes: List[dict]) -> Dict[Tuple[str, int], List[dict]]:
     """
-    Worker function for parallel replay.
-    Processes a chunk of recipes and returns function counts.
+    Group recipes by (seed_path, rng_seed) and sort each group by iteration.
+    This enables efficient sequential processing.
     """
-    function_counts: Dict[str, int] = {fn: 0 for fn in changed_functions}
-    successful_runs = 0
-    failed_runs = 0
+    groups = defaultdict(list)
     
-    # Reset gcda files at start
-    reset_gcda_files(build_dir)
+    for recipe in recipes:
+        seed_path = recipe.get('seed_path')
+        rng_seed = recipe.get('rng_seed', 42)
+        if seed_path:
+            key = (seed_path, rng_seed)
+            groups[key].append(recipe)
     
-    for i, recipe in enumerate(recipes):
-        # Run single recipe with cleanup
-        mutant_path = None
-        try:
-            mutant = regenerate_mutation(
-                recipe['seed_path'],
-                recipe['iteration'],
-                recipe['rng_seed']
-            )
-            
-            if not mutant:
-                failed_runs += 1
-                continue
-            
-            # Create temp file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
-                f.write(mutant)
-                mutant_path = f.name
-            
-            # Run solver
-            subprocess.run(
-                [solver_path, mutant_path],
-                capture_output=True,
-                timeout=timeout,
-                cwd=build_dir
-            )
-            successful_runs += 1
-            
-        except subprocess.TimeoutExpired:
-            successful_runs += 1  # Still ran
-        except Exception:
-            failed_runs += 1
-        finally:
-            # ALWAYS cleanup temp file immediately
-            if mutant_path and os.path.exists(mutant_path):
-                try:
-                    os.unlink(mutant_path)
-                except:
-                    pass
-        
-        # Extract counts every batch_size mutations
-        if (i + 1) % batch_size == 0:
-            counts = extract_function_counts_fastcov(build_dir, gcov_cmd, changed_functions)
-            for func, count in counts.items():
-                function_counts[func] = function_counts.get(func, 0) + count
-            reset_gcda_files(build_dir)
-            
-            print(f"  [Worker {worker_id}] Processed {i+1}/{len(recipes)}")
+    # Sort each group by iteration
+    for key in groups:
+        groups[key].sort(key=lambda r: r.get('iteration', 0))
     
-    # Final extraction
-    counts = extract_function_counts_fastcov(build_dir, gcov_cmd, changed_functions)
-    for func, count in counts.items():
-        function_counts[func] = function_counts.get(func, 0) + count
-    
-    # Send results back
-    result_queue.put({
-        'worker_id': worker_id,
-        'function_counts': function_counts,
-        'successful_runs': successful_runs,
-        'failed_runs': failed_runs,
-        'recipes_processed': len(recipes)
-    })
+    return dict(groups)
 
 
-def replay_recipes(
+def replay_recipes_optimized(
     recipe_file: str,
     solver_path: str,
     build_dir: str,
@@ -268,142 +173,177 @@ def replay_recipes(
     output_file: str,
     gcov_cmd: str = "gcov",
     timeout: int = 60,
-    max_recipes: Optional[int] = None,
-    num_workers: int = 1,
     batch_size: int = 100,
     start_idx: int = 0,
     end_idx: Optional[int] = None
 ) -> dict:
     """
-    Replay recipes and measure function calls.
-    Supports parallel execution with proper cleanup.
+    Replay recipes with OPTIMIZED batching by seed.
     
-    Args:
-        start_idx: Start index for slicing recipes (for parallel job distribution)
-        end_idx: End index for slicing recipes (None = all remaining)
+    Instead of regenerating all previous iterations for each recipe,
+    we group by (seed_path, rng_seed), sort by iteration, and process
+    sequentially - reusing the parsed seed and RNG state.
     """
-    if not YINYANG_AVAILABLE:
-        print("Error: yinyang not available for mutation regeneration")
-        return {}
+    log("=" * 60)
+    log(f"RECIPE REPLAY (OPTIMIZED)")
+    log("=" * 60)
     
-    print(f"\n{'='*60}")
-    print(f"Replaying: {recipe_file}")
-    print(f"Workers: {num_workers}")
-    print(f"{'='*60}")
+    if not YINYANG_AVAILABLE:
+        log("ERROR: yinyang not available for mutation regeneration")
+        return {"error": "yinyang not available"}
     
     # Load recipes
+    log(f"Loading recipes from: {recipe_file}")
     reader = RecipeReader(recipe_file)
     all_recipes = reader.recipes
+    log(f"Total recipes in file: {len(all_recipes)}")
     
     # Apply slice for parallel job distribution
     if end_idx is not None:
         recipes = all_recipes[start_idx:end_idx]
-        print(f"Processing slice [{start_idx}:{end_idx}] of {len(all_recipes)} total recipes")
+        log(f"Processing slice [{start_idx}:{end_idx}] = {len(recipes)} recipes")
     else:
         recipes = all_recipes[start_idx:]
+        log(f"Processing from index {start_idx} = {len(recipes)} recipes")
     
-    if max_recipes:
-        recipes = recipes[:max_recipes]
-    
-    print(f"Processing {len(recipes)} recipes (rng_seed={reader.get_rng_seed()})")
+    if len(recipes) == 0:
+        log("WARNING: No recipes to process!")
+        results = {
+            "recipe_file": recipe_file,
+            "recipes_processed": 0,
+            "successful_runs": 0,
+            "failed_runs": 0,
+            "function_counts": {},
+            "total_function_calls": 0,
+        }
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        return results
     
     # Load changed functions
+    log(f"Loading changed functions from: {changed_functions_file}")
     changed_functions = load_changed_functions(changed_functions_file)
-    print(f"Tracking {len(changed_functions)} changed functions")
+    log(f"Tracking {len(changed_functions)} changed functions")
+    
+    # Group recipes by seed for efficient processing
+    log("Grouping recipes by seed...")
+    seed_groups = group_recipes_by_seed(recipes)
+    log(f"Found {len(seed_groups)} unique seed groups")
+    
+    # Show sample of groups
+    sample_groups = list(seed_groups.items())[:3]
+    for (seed_path, rng_seed), group_recipes in sample_groups:
+        seed_name = Path(seed_path).name
+        iterations = [r.get('iteration', 0) for r in group_recipes]
+        log(f"  - {seed_name}: {len(group_recipes)} recipes, iterations {min(iterations)}-{max(iterations)}")
+    
+    # Initialize counters
+    function_counts: Dict[str, int] = {fn: 0 for fn in changed_functions}
+    successful_runs = 0
+    failed_runs = 0
+    total_mutations_generated = 0
+    seeds_processed = 0
     
     start_time = time.time()
     
-    if num_workers == 1:
-        # Single-threaded mode
-        function_counts: Dict[str, int] = {fn: 0 for fn in changed_functions}
-        successful_runs = 0
-        failed_runs = 0
+    # Reset gcda files
+    log("Resetting gcda files...")
+    reset_gcda_files(build_dir)
+    
+    log("")
+    log("Starting optimized replay...")
+    log("-" * 60)
+    
+    mutations_since_extract = 0
+    
+    for (seed_path, rng_seed), group_recipes in seed_groups.items():
+        seeds_processed += 1
+        seed_name = Path(seed_path).name
         
-        reset_gcda_files(build_dir)
+        # Check if seed file exists
+        if not os.path.exists(seed_path):
+            log(f"[{seeds_processed}/{len(seed_groups)}] SKIP {seed_name}: file not found")
+            failed_runs += len(group_recipes)
+            continue
         
-        for i, recipe in enumerate(recipes):
-            mutant_path = None
-            try:
-                mutant = regenerate_mutation(
-                    recipe['seed_path'],
-                    recipe['iteration'],
-                    recipe['rng_seed']
-                )
-                
-                if not mutant:
-                    failed_runs += 1
-                    continue
-                
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
-                    f.write(mutant)
-                    mutant_path = f.name
-                
-                subprocess.run(
-                    [solver_path, mutant_path],
-                    capture_output=True,
-                    timeout=timeout,
-                    cwd=build_dir
-                )
-                successful_runs += 1
-                
-            except subprocess.TimeoutExpired:
-                successful_runs += 1
-            except Exception:
-                failed_runs += 1
-            finally:
-                if mutant_path and os.path.exists(mutant_path):
-                    try:
-                        os.unlink(mutant_path)
-                    except:
-                        pass
+        # Initialize RNG and parse seed ONCE
+        random.seed(rng_seed)
+        fuzzer = InlineTypeFuzz(Path(seed_path))
+        
+        if not fuzzer.parse():
+            log(f"[{seeds_processed}/{len(seed_groups)}] SKIP {seed_name}: parse failed")
+            failed_runs += len(group_recipes)
+            continue
+        
+        # Process iterations sequentially
+        current_iteration = 0
+        recipes_done_for_seed = 0
+        
+        for recipe in group_recipes:
+            target_iteration = recipe.get('iteration', 0)
             
-            if (i + 1) % batch_size == 0:
-                counts = extract_function_counts_fastcov(build_dir, gcov_cmd, changed_functions)
-                for func, count in counts.items():
-                    function_counts[func] = function_counts.get(func, 0) + count
-                reset_gcda_files(build_dir)
-                print(f"  Processed {i+1}/{len(recipes)}")
+            # Generate mutations up to target (reusing RNG state!)
+            while current_iteration < target_iteration:
+                current_iteration += 1
+                mutant, success = fuzzer.mutate()
+                total_mutations_generated += 1
+                
+                if current_iteration == target_iteration:
+                    # This is the mutation we want
+                    if success and mutant:
+                        # Run solver
+                        mutant_path = None
+                        try:
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
+                                f.write(mutant)
+                                mutant_path = f.name
+                            
+                            subprocess.run(
+                                [solver_path, mutant_path],
+                                capture_output=True,
+                                timeout=timeout,
+                                cwd=build_dir
+                            )
+                            successful_runs += 1
+                            recipes_done_for_seed += 1
+                            
+                        except subprocess.TimeoutExpired:
+                            successful_runs += 1
+                            recipes_done_for_seed += 1
+                        except Exception as e:
+                            failed_runs += 1
+                        finally:
+                            if mutant_path and os.path.exists(mutant_path):
+                                try:
+                                    os.unlink(mutant_path)
+                                except:
+                                    pass
+                    else:
+                        failed_runs += 1
+                    
+                    mutations_since_extract += 1
         
-        # Final extraction
+        # Log progress for this seed
+        elapsed = time.time() - start_time
+        rate = (successful_runs + failed_runs) / elapsed if elapsed > 0 else 0
+        log(f"[{seeds_processed}/{len(seed_groups)}] {seed_name}: {recipes_done_for_seed} recipes, "
+            f"total={successful_runs + failed_runs}, rate={rate:.1f}/s")
+        
+        # Extract counts periodically
+        if mutations_since_extract >= batch_size:
+            log(f"  → Extracting function counts (batch of {mutations_since_extract})...")
+            counts = extract_function_counts_fastcov(build_dir, gcov_cmd, changed_functions)
+            for func, count in counts.items():
+                function_counts[func] = function_counts.get(func, 0) + count
+            reset_gcda_files(build_dir)
+            mutations_since_extract = 0
+    
+    # Final extraction
+    if mutations_since_extract > 0:
+        log(f"Final extraction ({mutations_since_extract} remaining)...")
         counts = extract_function_counts_fastcov(build_dir, gcov_cmd, changed_functions)
         for func, count in counts.items():
             function_counts[func] = function_counts.get(func, 0) + count
-        
-    else:
-        # Parallel mode
-        chunk_size = len(recipes) // num_workers
-        chunks = []
-        for i in range(num_workers):
-            start = i * chunk_size
-            end = start + chunk_size if i < num_workers - 1 else len(recipes)
-            chunks.append(recipes[start:end])
-        
-        result_queue = multiprocessing.Queue()
-        processes = []
-        
-        for i, chunk in enumerate(chunks):
-            p = multiprocessing.Process(
-                target=replay_worker,
-                args=(i, chunk, solver_path, build_dir, changed_functions, 
-                      gcov_cmd, timeout, batch_size, result_queue)
-            )
-            p.start()
-            processes.append(p)
-        
-        # Collect results
-        function_counts: Dict[str, int] = {fn: 0 for fn in changed_functions}
-        successful_runs = 0
-        failed_runs = 0
-        
-        for _ in range(num_workers):
-            result = result_queue.get()
-            for func, count in result['function_counts'].items():
-                function_counts[func] = function_counts.get(func, 0) + count
-            successful_runs += result['successful_runs']
-            failed_runs += result['failed_runs']
-        
-        for p in processes:
-            p.join()
     
     elapsed = time.time() - start_time
     
@@ -415,10 +355,11 @@ def replay_recipes(
         "recipes_processed": len(recipes),
         "successful_runs": successful_runs,
         "failed_runs": failed_runs,
+        "total_mutations_generated": total_mutations_generated,
+        "unique_seeds": len(seed_groups),
         "function_counts": function_counts,
         "total_function_calls": sum(function_counts.values()),
         "changed_functions_tracked": len(changed_functions),
-        "num_workers": num_workers,
         "elapsed_seconds": elapsed,
         "recipes_per_second": len(recipes) / elapsed if elapsed > 0 else 0
     }
@@ -430,27 +371,28 @@ def replay_recipes(
         json.dump(results, f, indent=2)
     
     # Print summary
-    print(f"\n{'='*60}")
-    print(f"RESULTS")
-    print(f"{'='*60}")
-    print(f"Recipes processed: {results['recipes_processed']}")
-    print(f"Successful runs: {results['successful_runs']}")
-    print(f"Failed runs: {results['failed_runs']}")
-    print(f"Total function calls: {results['total_function_calls']:,}")
-    print(f"Time: {elapsed:.1f}s ({results['recipes_per_second']:.1f} recipes/sec)")
-    print(f"\nTop 10 functions by call count:")
+    log("")
+    log("=" * 60)
+    log("RESULTS")
+    log("=" * 60)
+    log(f"Recipes processed: {results['recipes_processed']}")
+    log(f"Successful runs: {results['successful_runs']}")
+    log(f"Failed runs: {results['failed_runs']}")
+    log(f"Total mutations generated: {results['total_mutations_generated']}")
+    log(f"Unique seeds: {results['unique_seeds']}")
+    log(f"Total function calls: {results['total_function_calls']:,}")
+    log(f"Time: {elapsed:.1f}s ({results['recipes_per_second']:.1f} recipes/sec)")
+    log(f"\nTop 10 functions by call count:")
     sorted_funcs = sorted(function_counts.items(), key=lambda x: x[1], reverse=True)[:10]
     for func, count in sorted_funcs:
-        print(f"  {count:>12,}  {func}")
-    print(f"\nResults saved to: {output_file}")
+        log(f"  {count:>12,}  {func}")
+    log(f"\nResults saved to: {output_file}")
     
     return results
 
 
 def merge_results(result_files: List[str], output_file: str) -> dict:
-    """
-    Merge results from multiple parallel runs (e.g., from different workers or runs).
-    """
+    """Merge results from multiple parallel runs."""
     merged = {
         "merged_from": result_files,
         "recipes_processed": 0,
@@ -481,7 +423,7 @@ def merge_results(result_files: List[str], output_file: str) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Replay mutation recipes and measure function calls using gcov"
+        description="Replay mutation recipes and measure function calls using gcov (OPTIMIZED)"
     )
     parser.add_argument("recipe_file", help="Recipe JSONL file to replay")
     parser.add_argument("--solver", required=True, help="Path to gcov-instrumented solver binary")
@@ -489,16 +431,14 @@ def main():
     parser.add_argument("--changed-functions", required=True, help="Path to changed_functions.json")
     parser.add_argument("--output", required=True, help="Output JSON file for results")
     parser.add_argument("--gcov", default="gcov", help="gcov command (e.g., gcov-14)")
-    parser.add_argument("--timeout", type=int, default=60, help="Per-mutation timeout (seconds)")
-    parser.add_argument("--max-recipes", type=int, help="Maximum recipes to process (for testing)")
-    parser.add_argument("--num-workers", type=int, default=1, help="Number of parallel workers")
+    parser.add_argument("--timeout", type=int, default=120, help="Per-mutation timeout (seconds)")
     parser.add_argument("--batch-size", type=int, default=100, help="Mutations per gcov extraction batch")
-    parser.add_argument("--start-idx", type=int, default=0, help="Start index for recipe slice (for parallel jobs)")
-    parser.add_argument("--end-idx", type=int, help="End index for recipe slice (for parallel jobs)")
+    parser.add_argument("--start-idx", type=int, default=0, help="Start index for recipe slice")
+    parser.add_argument("--end-idx", type=int, help="End index for recipe slice")
     
     args = parser.parse_args()
     
-    replay_recipes(
+    replay_recipes_optimized(
         recipe_file=args.recipe_file,
         solver_path=args.solver,
         build_dir=args.build_dir,
@@ -506,8 +446,6 @@ def main():
         output_file=args.output,
         gcov_cmd=args.gcov,
         timeout=args.timeout,
-        max_recipes=args.max_recipes,
-        num_workers=args.num_workers,
         batch_size=args.batch_size,
         start_idx=args.start_idx,
         end_idx=args.end_idx
