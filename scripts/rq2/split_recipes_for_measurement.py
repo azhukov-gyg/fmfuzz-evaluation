@@ -5,6 +5,10 @@ Split recipes into multiple jobs for parallel measurement.
 This script splits a recipe file into N chunks for parallel measurement.
 Each chunk is processed by a separate GitHub Actions job.
 
+IMPORTANT: Splits by SEED BOUNDARIES to ensure all iterations of a seed
+stay together. This is critical for efficient replay (avoids regenerating
+iterations just to get RNG state).
+
 Output: JSON with matrix structure for GitHub Actions.
 """
 
@@ -12,18 +16,22 @@ import argparse
 import gzip
 import json
 import sys
+from collections import OrderedDict
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 
 def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measurement_matrix.json"):
     """
-    Split recipes into jobs and generate GitHub Actions matrix.
+    Split recipes into jobs by SEED BOUNDARIES and generate GitHub Actions matrix.
+    
+    All recipes for a given seed stay in the same job to avoid inefficient
+    replay (regenerating mutations just to advance RNG state).
     """
     # Check if file exists
     recipe_path = Path(recipe_file)
     if not recipe_path.exists():
         print(f"Error: Recipe file not found: {recipe_file}", file=sys.stderr)
-        # Return empty matrix to allow workflow to continue
         result = {
             "total_recipes": 0,
             "num_jobs": 0,
@@ -50,8 +58,9 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
         print("0")
         return
     
-    # Load recipes
-    recipes = []
+    # Load recipes and group by seed
+    recipes: List[dict] = []
+    seed_groups: Dict[Tuple[str, int], List[int]] = OrderedDict()  # (seed_path, rng_seed) -> [recipe_indices]
     parse_errors = 0
     
     def parse_jsonl(f):
@@ -62,7 +71,19 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
             if not stripped or stripped.startswith('#'):
                 continue
             try:
-                recipes.append(json.loads(stripped))
+                recipe = json.loads(stripped)
+                recipe_idx = len(recipes)
+                recipes.append(recipe)
+                
+                # Group by (seed_path, rng_seed)
+                seed_path = recipe.get('seed_path', '')
+                rng_seed = recipe.get('rng_seed', 0)
+                key = (seed_path, rng_seed)
+                
+                if key not in seed_groups:
+                    seed_groups[key] = []
+                seed_groups[key].append(recipe_idx)
+                
             except json.JSONDecodeError as e:
                 parse_errors += 1
                 if parse_errors <= 5:
@@ -92,10 +113,12 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
         print(f"Warning: {parse_errors} lines failed to parse", file=sys.stderr)
     
     total_recipes = len(recipes)
+    total_seeds = len(seed_groups)
+    
+    print(f"Total recipes: {total_recipes}, unique seeds: {total_seeds}", file=sys.stderr)
     
     if total_recipes == 0:
         print(f"Warning: No recipes found in {recipe_file}", file=sys.stderr)
-        # Return empty matrix
         result = {
             "total_recipes": 0,
             "num_jobs": 0,
@@ -103,31 +126,59 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
         }
         with open(output_file, 'w') as f:
             json.dump(result, f, indent=2)
-        print(f"0")  # Output for shell capture
+        print("0")
         return
     
-    # Split into chunks
-    chunk_size = (total_recipes + num_jobs - 1) // num_jobs  # Ceiling division
+    # Distribute seed groups across jobs (balanced by recipe count)
+    # Sort seeds by size (largest first) for better balancing
+    sorted_seeds = sorted(seed_groups.items(), key=lambda x: -len(x[1]))
     
+    # Greedy bin packing: assign each seed to the job with fewest recipes
+    job_seeds: List[List[Tuple[str, int]]] = [[] for _ in range(num_jobs)]
+    job_counts: List[int] = [0] * num_jobs
+    
+    for seed_key, indices in sorted_seeds:
+        # Find job with minimum recipes
+        min_job = min(range(num_jobs), key=lambda j: job_counts[j])
+        job_seeds[min_job].append(seed_key)
+        job_counts[min_job] += len(indices)
+    
+    # Build matrix entries with seed lists and write seeds files
     matrix_entries = []
+    output_dir = Path(output_file).parent
+    
     for job_id in range(num_jobs):
-        start_idx = job_id * chunk_size
-        end_idx = min(start_idx + chunk_size, total_recipes)
+        if job_counts[job_id] == 0:
+            continue
         
-        if start_idx >= total_recipes:
-            break
+        # Collect all recipe indices for this job's seeds
+        job_recipe_indices = []
+        job_seed_paths = []
+        for seed_key in job_seeds[job_id]:
+            job_recipe_indices.extend(seed_groups[seed_key])
+            job_seed_paths.append(seed_key[0])  # seed_path only
+        
+        # Write seeds file for this job
+        seeds_file = output_dir / f"seeds_job_{job_id}.json"
+        with open(seeds_file, 'w') as f:
+            json.dump({"seeds": job_seed_paths, "job_id": job_id}, f, indent=2)
         
         matrix_entries.append({
             "job_id": job_id,
-            "start_idx": start_idx,
-            "end_idx": end_idx,
-            "recipe_count": end_idx - start_idx
+            "recipe_count": len(job_recipe_indices),
+            "seed_count": len(job_seed_paths),
+            "seeds_file": str(seeds_file.name),  # Just the filename
         })
+    
+    # Log distribution
+    print(f"Split into {len(matrix_entries)} jobs:", file=sys.stderr)
+    for entry in matrix_entries:
+        print(f"  Job {entry['job_id']}: {entry['recipe_count']} recipes, {entry['seed_count']} seeds", file=sys.stderr)
     
     result = {
         "total_recipes": total_recipes,
+        "total_seeds": total_seeds,
         "num_jobs": len(matrix_entries),
-        "chunk_size": chunk_size,
         "matrix": {"include": matrix_entries}
     }
     

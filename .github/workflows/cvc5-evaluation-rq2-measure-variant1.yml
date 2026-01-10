@@ -116,8 +116,9 @@ jobs:
           RECIPE_COUNT=$(wc -l < recipes.jsonl)
           echo "✅ Downloaded $RECIPE_COUNT recipes for variant1 measurement"
       
-      - name: Split recipes into 4 jobs
+      - name: Split recipes into 4 jobs (by seed boundaries)
         run: |
+          # Split by seed boundaries to keep all iterations of a seed in the same job
           python3 scripts/rq2/split_recipes_for_measurement.py \
             recipes.jsonl \
             --num-jobs 4 \
@@ -131,20 +132,30 @@ jobs:
             "include": (.matrix.include | map({
               "commit": $commit,
               "job_id": .job_id,
-              "start_idx": .start_idx,
-              "end_idx": .end_idx,
-              "recipe_count": .recipe_count
+              "recipe_count": .recipe_count,
+              "seed_count": .seed_count,
+              "seeds_file": .seeds_file
             }))
           }' measurement_matrix.json > combined_matrix.json
           
           echo "=== Combined Matrix ==="
           cat combined_matrix.json | python3 -m json.tool
+          
+          # Show generated seeds files
+          echo ""
+          echo "=== Seeds files generated ==="
+          for f in seeds_job_*.json; do
+            echo "--- $f ---"
+            cat "$f" | python3 -m json.tool
+          done
       
-      - name: Upload combined matrix
+      - name: Upload combined matrix and seeds files
         uses: actions/upload-artifact@v4
         with:
           name: variant1-measurement-matrix-${{ matrix.commit }}
-          path: combined_matrix.json
+          path: |
+            combined_matrix.json
+            seeds_job_*.json
           if-no-files-found: error
 
   # ============================================================
@@ -205,26 +216,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
       
-      - name: Download full matrix data
+      - name: Download matrix and seeds files for this commit
         uses: actions/download-artifact@v4
         with:
-          name: variant1-measurement-matrix-full
-          path: .
+          name: variant1-measurement-matrix-${{ matrix.commit }}
+          path: matrix-data
       
       - name: Extract job parameters
         id: job-params
         run: |
-          # Extract parameters for this job from full matrix
-          JOB_DATA=$(jq -r ".include[] | select(.commit == \"${{ matrix.commit }}\" and .job_id == ${{ matrix.job_id }})" measurement_matrix.json)
-          START_IDX=$(echo "$JOB_DATA" | jq -r '.start_idx')
-          END_IDX=$(echo "$JOB_DATA" | jq -r '.end_idx')
-          RECIPE_COUNT=$(echo "$JOB_DATA" | jq -r '.recipe_count')
+          # Get seeds file for this job
+          SEEDS_FILE="matrix-data/seeds_job_${{ matrix.job_id }}.json"
           
-          echo "start_idx=$START_IDX" >> $GITHUB_OUTPUT
-          echo "end_idx=$END_IDX" >> $GITHUB_OUTPUT
-          echo "recipe_count=$RECIPE_COUNT" >> $GITHUB_OUTPUT
+          if [ ! -f "$SEEDS_FILE" ]; then
+            echo "❌ Seeds file not found: $SEEDS_FILE"
+            ls -la matrix-data/
+            exit 1
+          fi
           
-          echo "📊 Job ${{ matrix.job_id }}: recipes $START_IDX to $END_IDX ($RECIPE_COUNT recipes)"
+          # Extract info
+          SEED_COUNT=$(jq '.seeds | length' "$SEEDS_FILE")
+          
+          echo "seeds_file=$SEEDS_FILE" >> $GITHUB_OUTPUT
+          echo "seed_count=$SEED_COUNT" >> $GITHUB_OUTPUT
+          
+          echo "📊 Job ${{ matrix.job_id }}: $SEED_COUNT seeds"
+          echo ""
+          echo "=== Seeds for this job ==="
+          cat "$SEEDS_FILE" | python3 -m json.tool
       
       - name: Install GCC 14 (for gcov)
         run: |
@@ -352,11 +371,11 @@ jobs:
       - name: Run recipe replay for measurement
         working-directory: cvc5
         run: |
-          START_IDX="${{ steps.job-params.outputs.start_idx }}"
-          END_IDX="${{ steps.job-params.outputs.end_idx }}"
+          SEEDS_FILE="${{ github.workspace }}/${{ steps.job-params.outputs.seeds_file }}"
           
           echo "=== Starting recipe replay for job ${{ matrix.job_id }} ==="
-          echo "    Slice: [$START_IDX:$END_IDX]"
+          echo "    Seeds file: $SEEDS_FILE"
+          echo "    Seeds count: ${{ steps.job-params.outputs.seed_count }}"
           
           # Run from cvc5/ directory so seed paths in recipes resolve correctly
           python3 ${{ github.workspace }}/scripts/rq2/replay_recipes.py \
@@ -367,10 +386,8 @@ jobs:
             --output ../measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}.json \
             --gcov gcov-14 \
             --timeout 120 \
-            --batch-size 100 \
             --num-workers 4 \
-            --start-idx $START_IDX \
-            --end-idx $END_IDX
+            --seeds-file "$SEEDS_FILE"
           
           echo "=== Measurement complete for job ${{ matrix.job_id }} ==="
       

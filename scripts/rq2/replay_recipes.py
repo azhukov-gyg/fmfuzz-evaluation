@@ -300,10 +300,15 @@ def replay_recipes_optimized(
     batch_size: int = 100,
     num_workers: int = 4,
     start_idx: int = 0,
-    end_idx: Optional[int] = None
+    end_idx: Optional[int] = None,
+    seeds_file: Optional[str] = None
 ) -> dict:
     """
     Replay recipes with OPTIMIZED batching by seed and PARALLEL workers.
+    
+    Can filter by:
+    - start_idx/end_idx: process a slice of recipes (may split seeds!)
+    - seeds_file: process only recipes for specific seeds (keeps seeds intact)
     """
     log("=" * 60)
     log(f"RECIPE REPLAY (OPTIMIZED + PARALLEL)")
@@ -321,14 +326,31 @@ def replay_recipes_optimized(
         log("ERROR: yinyang not available for mutation regeneration")
         return {"error": "yinyang not available"}
     
+    # Load allowed seeds if provided
+    allowed_seeds: Optional[Set[str]] = None
+    if seeds_file:
+        log(f"Loading seed filter from: {seeds_file}")
+        with open(seeds_file, 'r') as f:
+            seeds_data = json.load(f)
+        if isinstance(seeds_data, list):
+            allowed_seeds = set(seeds_data)
+        elif isinstance(seeds_data, dict) and 'seeds' in seeds_data:
+            allowed_seeds = set(seeds_data['seeds'])
+        log(f"Filtering to {len(allowed_seeds)} seeds")
+    
     # Load recipes
     log(f"Loading recipes from: {recipe_file}")
     reader = RecipeReader(recipe_file)
     all_recipes = reader.recipes
     log(f"Total recipes in file: {len(all_recipes)}")
     
-    # Apply slice for parallel job distribution
-    if end_idx is not None:
+    # Apply filtering
+    if allowed_seeds is not None:
+        # Filter by seed paths
+        recipes = [r for r in all_recipes if r.get('seed_path') in allowed_seeds]
+        log(f"After seed filter: {len(recipes)} recipes")
+    elif end_idx is not None:
+        # Apply index slice (legacy mode - may split seeds)
         recipes = all_recipes[start_idx:end_idx]
         log(f"Processing slice [{start_idx}:{end_idx}] = {len(recipes)} recipes")
     else:
@@ -549,8 +571,9 @@ def main():
     parser.add_argument("--timeout", type=int, default=120, help="Per-mutation timeout (seconds)")
     parser.add_argument("--batch-size", type=int, default=100, help="Mutations per gcov extraction batch")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of parallel workers")
-    parser.add_argument("--start-idx", type=int, default=0, help="Start index for recipe slice")
-    parser.add_argument("--end-idx", type=int, help="End index for recipe slice")
+    parser.add_argument("--start-idx", type=int, default=0, help="Start index for recipe slice (legacy)")
+    parser.add_argument("--end-idx", type=int, help="End index for recipe slice (legacy)")
+    parser.add_argument("--seeds-file", help="JSON file with list of seed paths to process (recommended)")
     
     args = parser.parse_args()
     
@@ -565,7 +588,8 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         start_idx=args.start_idx,
-        end_idx=args.end_idx
+        end_idx=args.end_idx,
+        seeds_file=args.seeds_file
     )
 
 
