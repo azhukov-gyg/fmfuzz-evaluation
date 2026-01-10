@@ -331,26 +331,23 @@ jobs:
 
       - name: Clone CVC5 source (for recompilation)
         run: |
-          # We need the source files for incremental recompilation
-          if [ ! -d "cvc5-src" ]; then
-            git clone --depth 100 https://github.com/cvc5/cvc5.git cvc5-src
-          fi
+          # Clone source for incremental recompilation
+          git clone https://github.com/cvc5/cvc5.git cvc5-src
           cd cvc5-src
-          git fetch --depth 100 origin
           git checkout ${{ matrix.commit }}
           echo "Checked out commit: $(git rev-parse HEAD)"
           cd ..
           
-          # Copy source to cvc5 directory (merge with extracted build)
-          # --exclude=build preserves the already-extracted build directory
-          rsync -a --exclude=build cvc5-src/ cvc5/
-          rm -rf cvc5-src cvc5/.git
+          # Move source into cvc5/ (build dir already extracted there)
+          # Copy src/ directory to cvc5/src/
+          cp -r cvc5-src/src cvc5/
+          rm -rf cvc5-src
           
           echo "✅ Source files ready for incremental rebuild"
           ls -la cvc5/src/ | head -5
 
-      - name: Clean up yinyang git
-        run: rm -rf yinyang/.git || true
+      - name: Clean up git directories
+        run: rm -rf cvc5/.git yinyang/.git || true
 
       - name: Download allowlists
         uses: actions/download-artifact@v4
