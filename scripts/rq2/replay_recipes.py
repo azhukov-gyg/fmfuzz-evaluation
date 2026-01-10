@@ -210,10 +210,10 @@ def process_seed_group(
     
     seed_name = Path(seed_path).name
     
-    # Set up gcov environment - redirect .gcda files to build directory
+    # Don't set GCOV_PREFIX - let gcov use embedded absolute paths
+    # The binary was compiled with absolute paths, and we're running on the same CI
+    # Setting GCOV_PREFIX would cause doubled paths like /build/path/build/path/...
     gcov_env = os.environ.copy()
-    gcov_env['GCOV_PREFIX'] = build_dir
-    gcov_env['GCOV_PREFIX_STRIP'] = '0'
     
     # Check if seed file exists
     if not os.path.exists(seed_path):
@@ -359,8 +359,7 @@ def replay_recipes_optimized(
     build_dir = os.path.abspath(build_dir)
     log(f"Solver: {solver_path}")
     log(f"Build dir: {build_dir}")
-    log(f"GCOV_PREFIX will be set to: {build_dir}")
-    log(f"GCOV_PREFIX_STRIP: 0")
+    log(f"GCOV: Using embedded absolute paths (no GCOV_PREFIX)")
     
     if not YINYANG_AVAILABLE:
         log("ERROR: yinyang not available for mutation regeneration")
