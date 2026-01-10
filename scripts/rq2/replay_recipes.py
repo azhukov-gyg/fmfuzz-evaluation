@@ -183,6 +183,11 @@ def process_seed_group(
     
     seed_name = Path(seed_path).name
     
+    # Set up gcov environment - redirect .gcda files to build directory
+    gcov_env = os.environ.copy()
+    gcov_env['GCOV_PREFIX'] = build_dir
+    gcov_env['GCOV_PREFIX_STRIP'] = '0'
+    
     # Check if seed file exists
     if not os.path.exists(seed_path):
         progress_queue.put(('skip', worker_id, seed_name, 'not found', len(group_recipes)))
@@ -221,7 +226,8 @@ def process_seed_group(
                             [solver_path, mutant_path],
                             capture_output=True,
                             timeout=timeout,
-                            cwd=build_dir
+                            cwd=build_dir,
+                            env=gcov_env
                         )
                         successful += 1
                         
@@ -308,6 +314,8 @@ def replay_recipes_optimized(
     build_dir = os.path.abspath(build_dir)
     log(f"Solver: {solver_path}")
     log(f"Build dir: {build_dir}")
+    log(f"GCOV_PREFIX will be set to: {build_dir}")
+    log(f"GCOV_PREFIX_STRIP: 0")
     
     if not YINYANG_AVAILABLE:
         log("ERROR: yinyang not available for mutation regeneration")
@@ -399,12 +407,9 @@ def replay_recipes_optimized(
         p.start()
         processes.append(p)
     
-    # Monitor progress and periodically extract counts
-    function_counts: Dict[str, int] = {fn: 0 for fn in changed_functions}
+    # Monitor progress (extraction happens once at end)
     seeds_done = 0
     total_seeds = len(seed_groups_list)
-    last_extract_time = time.time()
-    extract_interval = 30  # Extract every 30 seconds
     
     log("")
     while any(p.is_alive() for p in processes):
@@ -428,17 +433,6 @@ def replay_recipes_optimized(
         except:
             pass
         
-        # Periodically extract counts
-        if time.time() - last_extract_time > extract_interval:
-            log(f"  → Extracting function counts...")
-            counts = extract_function_counts_fastcov(build_dir, gcov_cmd, changed_functions)
-            for func, count in counts.items():
-                function_counts[func] = function_counts.get(func, 0) + count
-            total_calls = sum(function_counts.values())
-            log(f"  → Total function calls so far: {total_calls:,}")
-            reset_gcda_files(build_dir)
-            last_extract_time = time.time()
-        
         time.sleep(0.5)
     
     # Collect final results from workers
@@ -455,11 +449,14 @@ def replay_recipes_optimized(
     for p in processes:
         p.join()
     
-    # Final extraction
-    log("Final extraction...")
+    # Extract function counts once at the end (all .gcda files have accumulated)
+    log("")
+    log("All workers finished. Extracting function counts...")
+    function_counts: Dict[str, int] = {fn: 0 for fn in changed_functions}
     counts = extract_function_counts_fastcov(build_dir, gcov_cmd, changed_functions)
     for func, count in counts.items():
         function_counts[func] = function_counts.get(func, 0) + count
+    log(f"Total function calls: {sum(function_counts.values()):,}")
     
     elapsed = time.time() - start_time
     
