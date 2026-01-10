@@ -217,7 +217,7 @@ def process_seed_group(
                             f.write(mutant)
                             mutant_path = f.name
                         
-                        subprocess.run(
+                        result = subprocess.run(
                             [solver_path, mutant_path],
                             capture_output=True,
                             timeout=timeout,
@@ -227,7 +227,13 @@ def process_seed_group(
                         
                     except subprocess.TimeoutExpired:
                         successful += 1  # Still counts as processed
-                    except Exception:
+                    except FileNotFoundError as e:
+                        if mutations == 1:  # Only log once per seed
+                            progress_queue.put(('error', worker_id, seed_name, f'Solver not found: {solver_path}'))
+                        failed += 1
+                    except Exception as e:
+                        if mutations == 1:  # Only log once per seed
+                            progress_queue.put(('error', worker_id, seed_name, str(e)))
                         failed += 1
                     finally:
                         if mutant_path and os.path.exists(mutant_path):
@@ -296,6 +302,12 @@ def replay_recipes_optimized(
     log("=" * 60)
     log(f"RECIPE REPLAY (OPTIMIZED + PARALLEL)")
     log("=" * 60)
+    
+    # Convert paths to absolute to avoid cwd issues
+    solver_path = os.path.abspath(solver_path)
+    build_dir = os.path.abspath(build_dir)
+    log(f"Solver: {solver_path}")
+    log(f"Build dir: {build_dir}")
     
     if not YINYANG_AVAILABLE:
         log("ERROR: yinyang not available for mutation regeneration")
@@ -405,11 +417,14 @@ def replay_recipes_optimized(
                     seeds_done += 1
                     elapsed = time.time() - start_time
                     rate = seeds_done / elapsed if elapsed > 0 else 0
-                    log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] {seed_name}: {recipe_count} recipes ({rate:.1f} seeds/s)")
+                    log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] {seed_name}: {recipe_count} recipes, {successful} ok ({rate:.1f} seeds/s)")
                 elif msg[0] == 'skip':
                     _, worker_id, seed_name, reason, recipe_count = msg
                     seeds_done += 1
                     log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] SKIP {seed_name}: {reason}")
+                elif msg[0] == 'error':
+                    _, worker_id, seed_name, error_msg = msg
+                    log(f"[W{worker_id}] ERROR {seed_name}: {error_msg}")
         except:
             pass
         
