@@ -217,7 +217,6 @@ class CoverageGuidedFuzzer:
         self.stats_bugs_found = multiprocessing.Value('i', 0)
         self.stats_tests_removed_unsupported = multiprocessing.Value('i', 0)
         self.stats_tests_removed_timeout = multiprocessing.Value('i', 0)
-        self.stats_tests_skipped = multiprocessing.Value('i', 0)  # AFL++ probabilistic skipping
         self.stats_mutants_created = multiprocessing.Value('i', 0)
         self.stats_mutants_with_new_coverage = multiprocessing.Value('i', 0)
         self.stats_mutants_with_existing_coverage = multiprocessing.Value('i', 0)
@@ -297,10 +296,10 @@ class CoverageGuidedFuzzer:
         # Track fuzz_level per test (how many times it's been fuzzed)
         self.test_fuzz_level = self.manager.dict()  # test_path -> int
         
-        # Skip probabilities (from AFL++ config.h)
-        self.SKIP_TO_NEW_PROB = 99   # Skip 99% when pending favorites exist
-        self.SKIP_NFAV_OLD_PROB = 95  # Skip 95% of already-fuzzed non-favored
-        self.SKIP_NFAV_NEW_PROB = 75  # Skip 75% of new non-favored
+        # Slow test handling - don't skip, but give very few iterations
+        # Tests slower than this get minimum iterations (5) instead of being excluded
+        self.SLOW_TEST_THRESHOLD_S = 10.0  # seconds - tests slower than this get min iterations
+        self.MIN_SLOW_TEST_ITERATIONS = 5  # Minimum iterations for very slow tests
         
     def _validate_solvers(self):
         z3_binary = self.z3_cmd.split()[0]
@@ -317,10 +316,16 @@ class CoverageGuidedFuzzer:
         """
         AFL-style speed-based starting score.
         Faster tests get higher base score (more iterations).
+        Very slow tests (>10s) get minimal score to ensure ~5 iterations.
         
-        Returns base score in [10, 300].
+        Returns base score in [2, 300].
         """
         avg_runtime = self._get_avg_runtime_ms()
+        
+        # VERY SLOW tests (>10s absolute) get minimal iterations regardless of average
+        # Score of 2 gives ~5 iterations after _score_to_iterations calculation
+        if runtime_ms > self.SLOW_TEST_THRESHOLD_S * 1000:
+            return 2  # Minimal score for extremely slow tests
         
         ratio = runtime_ms / avg_runtime
         
@@ -566,11 +571,16 @@ class CoverageGuidedFuzzer:
         For >1.5h budget: [10, 500] iterations
         
         Linear mapping: low score → few iterations, high score → many iterations.
+        Very low scores (≤5) are treated as slow tests and get MIN_SLOW_TEST_ITERATIONS.
         """
         if self.hours_budget <= 1.5:
             min_iter, max_iter = 5, 250
         else:
             min_iter, max_iter = 10, 500
+        
+        # Very low scores (slow tests) get minimum iterations
+        if score <= 5:
+            return self.MIN_SLOW_TEST_ITERATIONS
         
         # Clamp score to expected range [10, 1600]
         score = max(10, min(score, 1600))
@@ -737,37 +747,6 @@ class CoverageGuidedFuzzer:
         
         print(f"[CULL] Marked {len(favored_tests)} tests as favored ({pending} pending)", flush=True)
     
-    def _should_skip_test(self, test_path: str) -> bool:
-        """
-        AFL++ style probabilistic skipping.
-        Returns True if this test should be skipped.
-        
-        Based on AFL++ fuzz_one() skipping logic in afl-fuzz-one.c
-        """
-        is_favored = self.test_favored.get(test_path, False)
-        fuzz_level = self.test_fuzz_level.get(test_path, 0)
-        pending_fav = self.pending_favored.value
-        
-        if pending_fav > 0:
-            # There are pending favored tests - skip non-favored with high probability
-            if fuzz_level > 0 or not is_favored:
-                # Already fuzzed OR not favored
-                if random.random() * 100 < self.SKIP_TO_NEW_PROB:  # 99%
-                    return True
-        else:
-            # No pending favored - still skip non-favored sometimes
-            if not is_favored and self._get_stat('tests_processed') > 10:
-                if fuzz_level == 0:
-                    # Never fuzzed, non-favored
-                    if random.random() * 100 < self.SKIP_NFAV_NEW_PROB:  # 75%
-                        return True
-                else:
-                    # Already fuzzed, non-favored
-                    if random.random() * 100 < self.SKIP_NFAV_OLD_PROB:  # 95%
-                        return True
-        
-        return False
-    
     def _weighted_random_select(self, tests: list, count: int) -> list:
         """
         Select tests using weighted random selection (AFL++ alias table style).
@@ -929,9 +908,15 @@ class CoverageGuidedFuzzer:
             return
         
         items_to_queue = []
+        slow_tests_count = 0
+        
         for runtime, edges_hit, test_path_str in seeds:
             # Store calibration data for weighted selection and future refills
             self._store_calibration_data(test_path_str, runtime, edges_hit)
+            
+            # Track slow tests (they'll get very low iterations via scoring, not excluded)
+            if runtime > self.SLOW_TEST_THRESHOLD_S:
+                slow_tests_count += 1
             
             # Calculate perf_score using calibrated averages and path frequency
             runtime_ms = runtime * 1000
@@ -949,6 +934,9 @@ class CoverageGuidedFuzzer:
             # Use runtime as sort key so fast seeds are processed first
             items_to_queue.append((runtime, 2, 0, self._next_seq(), test_path_str))
         
+        if slow_tests_count > 0:
+            print(f"[INFO] {slow_tests_count} slow tests (>{self.SLOW_TEST_THRESHOLD_S}s) will get minimum iterations ({self.MIN_SLOW_TEST_ITERATIONS})")
+        
         # Mark favored tests based on edge ownership (AFL's cull_queue)
         self._cull_queue()
         
@@ -965,7 +953,7 @@ class CoverageGuidedFuzzer:
         self._queue_push_batch(items_to_queue)
         
         favored_count = sum(1 for _, _, _, _, p in items_to_queue if self.test_favored.get(p, False))
-        print(f"[INFO] Re-queued {len(items_to_queue)} calibrated seeds ({favored_count} favored) for fuzzing")
+        print(f"[INFO] Re-queued {len(items_to_queue)} calibrated seeds ({favored_count} favored, {slow_tests_count} slow) for fuzzing")
 
     def _buffer_mutants(self, mutant_items: list):
         """Buffer mutant queue items to be flushed in sorted order by main loop."""
@@ -1512,7 +1500,7 @@ class CoverageGuidedFuzzer:
         print(f"[STATUS] Mutants: {self._get_stat('mutants_created')} created | {self._get_stat('mutants_with_new_coverage')} new cov | {self._get_stat('mutants_with_existing_coverage')} exist cov")
         print(f"[STATUS] Discarded: {self._get_stat('mutants_discarded_no_coverage')} no-cov | {self._get_stat('mutants_discarded_disk_space')} disk-limit")
         print(f"[STATUS] Disk: {free_mb:.0f}MB free, {pending_mutants} pending mutants (max: {self.max_pending_mutants})")
-        print(f"[STATUS] Tests: {self._get_stat('tests_processed')} processed, {self._get_stat('tests_skipped')} skipped, {len(self.excluded_tests)} excluded")
+        print(f"[STATUS] Tests: {self._get_stat('tests_processed')} processed, {len(self.excluded_tests)} excluded")
         print(f"[STATUS] Favored: {self.pending_favored.value} pending, {sum(1 for v in self.test_favored.values() if v)} total")
         print(f"[STATUS] Generations: {self._get_stat('generations_completed')} completed")
         print(f"[STATUS] Bugs: {self._get_stat('bugs_found')} found")
@@ -2144,19 +2132,6 @@ class CoverageGuidedFuzzer:
                     test_path_str = str(test_path)
                     is_mutant = generation > 0
                     is_calibration = generation == 0 and not self.calibration_done.is_set()
-                    
-                    # ---------------------------------------------------------------
-                    # AFL++ style probabilistic skipping (skip non-favored tests)
-                    # ---------------------------------------------------------------
-                    # Don't skip during calibration - we need to measure everything
-                    if not is_calibration and self._should_skip_test(test_path_str):
-                        # Skip this test - put it back at the end of the queue with lower priority
-                        # Use slightly higher runtime to deprioritize
-                        # IMPORTANT: Use original_test_path to maintain consistent path format
-                        new_runtime = runtime_priority + 0.001 if runtime_priority > 0 else 0.001
-                        self._queue_push((new_runtime, new_cov_rank, generation, self._next_seq(), original_test_path))
-                        self._inc_stat('tests_skipped')
-                        continue
                     
                     # ---------------------------------------------------------------
                     # AFL-style scoring: calculate iterations based on perf_score
