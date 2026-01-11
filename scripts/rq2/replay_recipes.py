@@ -165,6 +165,10 @@ def extract_function_counts_fastcov(
             for (fp, ln), fk in list(changed_file_lines.items())[:4]:
                 log(f"[GCOV DEBUG]   {fp}:{ln} -> {fk[:60]}...")
             
+            # Build a set of files we're looking for (for targeted debugging)
+            target_files = set(fp for fp, ln in changed_file_lines.keys())
+            log(f"[GCOV DEBUG] Looking for files: {target_files}")
+            
             # Show sample of functions found
             all_funcs = []
             for source_file, source_data in sources.items():
@@ -188,6 +192,19 @@ def extract_function_counts_fastcov(
                     log(f"[GCOV DEBUG]   Sample func: {sample_func[0][:60]}")
                     log(f"[GCOV DEBUG]   Sample func_data: {sample_func[1]}")
                     sample_shown = True
+                
+                # If this is one of our target files, show all its functions and lines
+                if source_relative in target_files:
+                    log(f"[GCOV DEBUG] FOUND TARGET FILE: {source_relative}")
+                    log(f"[GCOV DEBUG]   Full path: {source_file}")
+                    log(f"[GCOV DEBUG]   Functions in file ({len(funcs)}):")
+                    for fn, fd in sorted(funcs.items(), key=lambda x: x[1].get('start_line', 0)):
+                        sl = fd.get('start_line', 0)
+                        ec = fd.get('execution_count', 0)
+                        # Show which lines we're looking for
+                        wanted = [ln for fp, ln in changed_file_lines.keys() if fp == source_relative]
+                        marker = " <-- WANTED" if sl in wanted else ""
+                        log(f"[GCOV DEBUG]     line {sl}: {ec} calls{marker}")
                 
                 for func_name, func_data in funcs.items():
                     exec_count = func_data.get('execution_count', 0)
