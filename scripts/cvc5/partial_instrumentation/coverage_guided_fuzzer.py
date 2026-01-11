@@ -8,6 +8,7 @@ Based on simple_commit_fuzzer_sancov.py with coverage-guided enhancements.
 import argparse
 import gc
 import json
+import math
 import mmap
 import multiprocessing
 from multiprocessing import Queue
@@ -216,6 +217,7 @@ class CoverageGuidedFuzzer:
         self.stats_bugs_found = multiprocessing.Value('i', 0)
         self.stats_tests_removed_unsupported = multiprocessing.Value('i', 0)
         self.stats_tests_removed_timeout = multiprocessing.Value('i', 0)
+        self.stats_tests_skipped = multiprocessing.Value('i', 0)  # AFL++ probabilistic skipping
         self.stats_mutants_created = multiprocessing.Value('i', 0)
         self.stats_mutants_with_new_coverage = multiprocessing.Value('i', 0)
         self.stats_mutants_with_existing_coverage = multiprocessing.Value('i', 0)
@@ -271,6 +273,34 @@ class CoverageGuidedFuzzer:
         self.edge_owner_lock = multiprocessing.Lock()
         # Test -> owned_edges_count mapping (for score lookup)
         self.test_owned_edges = self.manager.dict()
+        
+        # -------------------------------------------------------------------------
+        # AFL++ style queue management
+        # -------------------------------------------------------------------------
+        # Calibration data: test_path -> (runtime_sec, edges_hit, perf_score, weight)
+        self.calibration_data = self.manager.dict()
+        self.calibration_data_lock = multiprocessing.Lock()
+        
+        # Favored tests (AFL's favored flag): tests that own unique coverage
+        self.test_favored = self.manager.dict()  # test_path -> bool
+        self.favored_lock = multiprocessing.Lock()
+        
+        # Counters for probabilistic skipping
+        self.pending_favored = multiprocessing.Value('i', 0)  # favored tests not yet fuzzed in current cycle
+        self.queued_favored = multiprocessing.Value('i', 0)   # favored tests in queue
+        
+        # Top-rated per edge (AFL's top_rated[]): edge_id -> test_path
+        # Stores the "best" test for each edge (fastest × smallest)
+        self.top_rated = self.manager.dict()
+        self.top_rated_lock = multiprocessing.Lock()
+        
+        # Track fuzz_level per test (how many times it's been fuzzed)
+        self.test_fuzz_level = self.manager.dict()  # test_path -> int
+        
+        # Skip probabilities (from AFL++ config.h)
+        self.SKIP_TO_NEW_PROB = 99   # Skip 99% when pending favorites exist
+        self.SKIP_NFAV_OLD_PROB = 95  # Skip 95% of already-fuzzed non-favored
+        self.SKIP_NFAV_NEW_PROB = 75  # Skip 75% of new non-favored
         
     def _validate_solvers(self):
         z3_binary = self.z3_cmd.split()[0]
@@ -571,6 +601,228 @@ class CoverageGuidedFuzzer:
             return self.total_coverage.value / self.sample_count.value
     
     # -------------------------------------------------------------------------
+    # AFL++ style queue management
+    # -------------------------------------------------------------------------
+    
+    def _calculate_weight(self, test_path: str) -> float:
+        """
+        Calculate weight for weighted random selection.
+        Higher weight = more likely to be selected.
+        
+        Simplified from AFL++ - we prioritize FAST tests for recipe generation.
+        """
+        with self.calibration_data_lock:
+            data = self.calibration_data.get(test_path)
+        
+        if not data:
+            return 1.0  # Default weight for uncalibrated tests
+        
+        runtime_sec, edges_hit, perf_score, _ = data
+        runtime_ms = runtime_sec * 1000
+        
+        weight = 1.0
+        avg_runtime = self._get_avg_runtime_ms()
+        
+        if avg_runtime > 0:
+            t = runtime_ms / avg_runtime
+            
+            # Simple speed-based weighting: faster = higher weight
+            # This prioritizes fast tests for more recipe generation
+            if t < 0.25:
+                weight = 4.0    # Very fast: big bonus
+            elif t < 0.5:
+                weight = 2.0    # Fast: bonus
+            elif t < 1.0:
+                weight = 1.0    # Average: neutral
+            elif t < 2.0:
+                weight = 0.5    # Slow: penalty
+            elif t < 5.0:
+                weight = 0.2    # Very slow: big penalty
+            else:
+                weight = 0.05   # Extremely slow: severe penalty
+        
+        # Bonus for favored tests (own unique edges)
+        if self.test_favored.get(test_path, False):
+            weight *= 2.0
+        
+        # Penalty for already-fuzzed tests (encourage diversity)
+        fuzz_level = self.test_fuzz_level.get(test_path, 0)
+        if fuzz_level > 0:
+            weight /= (1 + math.log10(fuzz_level + 1))
+        
+        return max(0.01, weight)  # Ensure positive weight
+    
+    def _update_top_rated(self, test_path: str, trace_bits: bytes, runtime_ms: float):
+        """
+        Update top_rated[] for each edge hit by this test.
+        A test becomes top_rated for an edge if it's the fastest to hit it.
+        
+        Based on AFL++ update_bitmap_score() in afl-fuzz-queue.c
+        """
+        # Get test length (use path length as proxy, or could use actual file size)
+        test_len = len(test_path)
+        fav_factor = runtime_ms * test_len  # Faster × smaller = better
+        
+        # First, collect edges we might update (only non-zero edges for efficiency)
+        candidate_edges = [(i, b) for i, b in enumerate(trace_bits) if b != 0]
+        if not candidate_edges:
+            return
+        
+        # Pre-fetch calibration data outside the lock to avoid nested locking
+        with self.calibration_data_lock:
+            cal_data_snapshot = dict(self.calibration_data)
+        
+        edges_to_update = []
+        
+        with self.top_rated_lock:
+            for edge_id, hit_count in candidate_edges:
+                current_top = self.top_rated.get(edge_id)
+                
+                if current_top is None:
+                    # No existing top_rated for this edge
+                    edges_to_update.append((edge_id, test_path))
+                else:
+                    # Compare with existing top_rated (using pre-fetched data)
+                    top_data = cal_data_snapshot.get(current_top)
+                    
+                    if top_data:
+                        top_runtime_ms = top_data[0] * 1000
+                        top_len = len(current_top)
+                        top_fav_factor = top_runtime_ms * top_len
+                        
+                        if fav_factor < top_fav_factor:
+                            # This test is better - take over
+                            edges_to_update.append((edge_id, test_path))
+                    else:
+                        # No calibration data for current top - take over
+                        edges_to_update.append((edge_id, test_path))
+            
+            # Apply updates
+            for edge_id, path in edges_to_update:
+                self.top_rated[edge_id] = path
+    
+    def _cull_queue(self):
+        """
+        Mark tests as 'favored' based on top_rated[].
+        A test is favored if it's the best way to hit some edge.
+        
+        Based on AFL++ cull_queue() in afl-fuzz-queue.c
+        """
+        # Reset all favored flags
+        with self.favored_lock:
+            for test_path in list(self.test_favored.keys()):
+                self.test_favored[test_path] = False
+        
+        # Collect all tests that are top_rated for at least one edge
+        favored_tests = set()
+        with self.top_rated_lock:
+            for edge_id, test_path in self.top_rated.items():
+                if test_path:
+                    favored_tests.add(test_path)
+        
+        # Mark them as favored
+        with self.favored_lock:
+            for test_path in favored_tests:
+                self.test_favored[test_path] = True
+        
+        # Update pending_favored counter
+        pending = 0
+        for test_path in favored_tests:
+            fuzz_level = self.test_fuzz_level.get(test_path, 0)
+            if fuzz_level == 0:
+                pending += 1
+        
+        with self.pending_favored.get_lock():
+            self.pending_favored.value = pending
+        
+        print(f"[CULL] Marked {len(favored_tests)} tests as favored ({pending} pending)", flush=True)
+    
+    def _should_skip_test(self, test_path: str) -> bool:
+        """
+        AFL++ style probabilistic skipping.
+        Returns True if this test should be skipped.
+        
+        Based on AFL++ fuzz_one() skipping logic in afl-fuzz-one.c
+        """
+        is_favored = self.test_favored.get(test_path, False)
+        fuzz_level = self.test_fuzz_level.get(test_path, 0)
+        pending_fav = self.pending_favored.value
+        
+        if pending_fav > 0:
+            # There are pending favored tests - skip non-favored with high probability
+            if fuzz_level > 0 or not is_favored:
+                # Already fuzzed OR not favored
+                if random.random() * 100 < self.SKIP_TO_NEW_PROB:  # 99%
+                    return True
+        else:
+            # No pending favored - still skip non-favored sometimes
+            if not is_favored and self._get_stat('tests_processed') > 10:
+                if fuzz_level == 0:
+                    # Never fuzzed, non-favored
+                    if random.random() * 100 < self.SKIP_NFAV_NEW_PROB:  # 75%
+                        return True
+                else:
+                    # Already fuzzed, non-favored
+                    if random.random() * 100 < self.SKIP_NFAV_OLD_PROB:  # 95%
+                        return True
+        
+        return False
+    
+    def _weighted_random_select(self, tests: list, count: int) -> list:
+        """
+        Select tests using weighted random selection (AFL++ alias table style).
+        Returns up to 'count' tests, selected with probability proportional to weight.
+        """
+        if not tests:
+            return []
+        
+        # Calculate weights for all tests
+        weights = []
+        valid_tests = []
+        
+        for test in tests:
+            if test in self.excluded_tests:
+                continue
+            weight = self._calculate_weight(test)
+            if weight > 0:
+                weights.append(weight)
+                valid_tests.append(test)
+        
+        if not valid_tests:
+            return []
+        
+        # Normalize weights
+        total_weight = sum(weights)
+        if total_weight == 0:
+            weights = [1.0] * len(valid_tests)
+            total_weight = len(valid_tests)
+        
+        # Select tests using weighted random choice
+        # Use random.choices for weighted selection (with replacement)
+        # Then deduplicate to get unique tests
+        selected = set()
+        attempts = 0
+        max_attempts = count * 3  # Avoid infinite loop
+        
+        while len(selected) < count and attempts < max_attempts:
+            chosen = random.choices(valid_tests, weights=weights, k=min(count, len(valid_tests)))
+            selected.update(chosen)
+            attempts += 1
+        
+        return list(selected)[:count]
+    
+    def _store_calibration_data(self, test_path: str, runtime_sec: float, edges_hit: int):
+        """Store calibration data for a test."""
+        runtime_ms = runtime_sec * 1000
+        path_freq = self._get_test_path_frequency(test_path)
+        owned_edges = self._get_owned_edges_count(test_path)
+        perf_score = self._calculate_perf_score(runtime_ms, edges_hit, 0, test_path, path_freq, owned_edges)
+        weight = self._calculate_weight(test_path)
+        
+        with self.calibration_data_lock:
+            self.calibration_data[test_path] = (runtime_sec, edges_hit, perf_score, weight)
+    
+    # -------------------------------------------------------------------------
     # Work queue helpers (sorted FIFO enqueue via periodic buffer flush)
     # -------------------------------------------------------------------------
     
@@ -592,15 +844,49 @@ class CoverageGuidedFuzzer:
         # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
         self._queue_push((0.0, 2, 0, self._next_seq(), test_name))
     
-    def _queue_push_initial_batch(self, test_names: list):
-        """Push multiple initial tests efficiently, filtering out excluded tests."""
+    def _queue_push_initial_batch(self, test_names: list, use_calibration: bool = True):
+        """
+        Push multiple initial tests efficiently, filtering out excluded tests.
+        
+        If use_calibration=True (after calibration), uses stored runtime data and
+        weighted selection. If False (initial calibration), uses uniform weights.
+        """
         excluded_list = list(self.excluded_tests)
         excluded_set = set(excluded_list)
         filtered_tests = [name for name in test_names if name not in excluded_set]
         skipped_count = len(test_names) - len(filtered_tests)
         
-        # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
-        items = [(0.0, 2, 0, self._next_seq(), name) for name in filtered_tests]
+        # If we have calibration data, use it for proper ordering
+        if use_calibration and len(self.calibration_data) > 0:
+            # Re-run cull_queue to update favored status
+            self._cull_queue()
+            
+            # Build queue items with calibration data
+            items = []
+            for name in filtered_tests:
+                with self.calibration_data_lock:
+                    cal_data = self.calibration_data.get(name)
+                
+                if cal_data:
+                    runtime_sec, edges_hit, perf_score, weight = cal_data
+                    is_favored = self.test_favored.get(name, False)
+                    # Favored tests get priority (runtime=0), others use actual runtime
+                    effective_runtime = 0.0 if is_favored else runtime_sec
+                else:
+                    # No calibration data - use default
+                    effective_runtime = 0.0
+                
+                items.append((effective_runtime, 2, 0, self._next_seq(), name))
+            
+            # Sort by runtime (favored first, then fast)
+            items.sort()
+            
+            favored_count = sum(1 for _, _, _, _, p in items if self.test_favored.get(p, False))
+            print(f"[QUEUE] Refilling with {len(items)} tests ({favored_count} favored, {skipped_count} excluded)")
+        else:
+            # Initial calibration - uniform ordering
+            items = [(0.0, 2, 0, self._next_seq(), name) for name in filtered_tests]
+        
         queue_size_before = self._get_queue_size()
         self._queue_push_batch(items)
         
@@ -644,6 +930,9 @@ class CoverageGuidedFuzzer:
         
         items_to_queue = []
         for runtime, edges_hit, test_path_str in seeds:
+            # Store calibration data for weighted selection and future refills
+            self._store_calibration_data(test_path_str, runtime, edges_hit)
+            
             # Calculate perf_score using calibrated averages and path frequency
             runtime_ms = runtime * 1000
             path_freq = self._get_test_path_frequency(test_path_str)
@@ -660,10 +949,23 @@ class CoverageGuidedFuzzer:
             # Use runtime as sort key so fast seeds are processed first
             items_to_queue.append((runtime, 2, 0, self._next_seq(), test_path_str))
         
-        # Sort by runtime (fast first)
-        items_to_queue.sort()
+        # Mark favored tests based on edge ownership (AFL's cull_queue)
+        self._cull_queue()
+        
+        # Sort by runtime (fast first), but also prioritize favored tests
+        # Favored tests get runtime=0 to be processed first
+        def sort_key(item):
+            runtime, rank, gen, seq, path = item
+            is_favored = self.test_favored.get(path, False)
+            # Favored tests: use 0.0 runtime, non-favored: use actual runtime
+            effective_runtime = 0.0 if is_favored else runtime
+            return (effective_runtime, rank, gen, seq)
+        
+        items_to_queue.sort(key=sort_key)
         self._queue_push_batch(items_to_queue)
-        print(f"[INFO] Re-queued {len(items_to_queue)} calibrated seeds for fuzzing")
+        
+        favored_count = sum(1 for _, _, _, _, p in items_to_queue if self.test_favored.get(p, False))
+        print(f"[INFO] Re-queued {len(items_to_queue)} calibrated seeds ({favored_count} favored) for fuzzing")
 
     def _buffer_mutants(self, mutant_items: list):
         """Buffer mutant queue items to be flushed in sorted order by main loop."""
@@ -1210,7 +1512,8 @@ class CoverageGuidedFuzzer:
         print(f"[STATUS] Mutants: {self._get_stat('mutants_created')} created | {self._get_stat('mutants_with_new_coverage')} new cov | {self._get_stat('mutants_with_existing_coverage')} exist cov")
         print(f"[STATUS] Discarded: {self._get_stat('mutants_discarded_no_coverage')} no-cov | {self._get_stat('mutants_discarded_disk_space')} disk-limit")
         print(f"[STATUS] Disk: {free_mb:.0f}MB free, {pending_mutants} pending mutants (max: {self.max_pending_mutants})")
-        print(f"[STATUS] Tests: {self._get_stat('tests_processed')} processed, {len(self.excluded_tests)} excluded ({self._get_stat('tests_removed_unsupported')} unsupported, {self._get_stat('tests_removed_timeout')} timeout)")
+        print(f"[STATUS] Tests: {self._get_stat('tests_processed')} processed, {self._get_stat('tests_skipped')} skipped, {len(self.excluded_tests)} excluded")
+        print(f"[STATUS] Favored: {self.pending_favored.value} pending, {sum(1 for v in self.test_favored.values() if v)} total")
         print(f"[STATUS] Generations: {self._get_stat('generations_completed')} completed")
         print(f"[STATUS] Bugs: {self._get_stat('bugs_found')} found")
         print(f"[STATUS] Rate: {tests_per_min:.1f} tests/min, {edges_per_min:.1f} new edges/min")
@@ -1826,6 +2129,7 @@ class CoverageGuidedFuzzer:
                     
                     # Parse test item: (runtime, new_cov_rank, generation, seq, test_path_str)
                     runtime_priority, new_cov_rank, generation, seq, test_path = test_item
+                    original_test_path = test_path  # Keep original for re-queueing
                     
                     # Handle string paths:
                     # - Seeds (generation==0): relative to tests_root
@@ -1840,6 +2144,19 @@ class CoverageGuidedFuzzer:
                     test_path_str = str(test_path)
                     is_mutant = generation > 0
                     is_calibration = generation == 0 and not self.calibration_done.is_set()
+                    
+                    # ---------------------------------------------------------------
+                    # AFL++ style probabilistic skipping (skip non-favored tests)
+                    # ---------------------------------------------------------------
+                    # Don't skip during calibration - we need to measure everything
+                    if not is_calibration and self._should_skip_test(test_path_str):
+                        # Skip this test - put it back at the end of the queue with lower priority
+                        # Use slightly higher runtime to deprioritize
+                        # IMPORTANT: Use original_test_path to maintain consistent path format
+                        new_runtime = runtime_priority + 0.001 if runtime_priority > 0 else 0.001
+                        self._queue_push((new_runtime, new_cov_rank, generation, self._next_seq(), original_test_path))
+                        self._inc_stat('tests_skipped')
+                        continue
                     
                     # ---------------------------------------------------------------
                     # AFL-style scoring: calculate iterations based on perf_score
@@ -1939,6 +2256,17 @@ class CoverageGuidedFuzzer:
                         # Handle exit code
                         action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
                     self._inc_stat('tests_processed')
+                    
+                    # Track fuzz_level for AFL++ probabilistic skipping
+                    # Increment only after actual fuzzing (not calibration)
+                    if not is_calibration:
+                        current_level = self.test_fuzz_level.get(test_path_str, 0)
+                        self.test_fuzz_level[test_path_str] = current_level + 1
+                        
+                        # Update pending_favored if this was a favored test
+                        if self.test_favored.get(test_path_str, False) and current_level == 0:
+                            with self.pending_favored.get_lock():
+                                self.pending_favored.value = max(0, self.pending_favored.value - 1)
 
                     # AFL++-style calibration phase accounting
                     if is_calibration:
@@ -1953,6 +2281,8 @@ class CoverageGuidedFuzzer:
                             self._update_path_frequency(coverage_hash, test_path_str)
                             # Update edge ownership (AFL's tc_ref)
                             self._update_edge_ownership(trace_bits_calib, runtime * 1000, test_path_str)
+                            # Update top_rated for favored marking (AFL's update_bitmap_score)
+                            self._update_top_rated(test_path_str, trace_bits_calib, runtime * 1000)
                         
                         # Update running averages with calibration data
                         self._update_running_averages(runtime * 1000, edges_hit_calib)
@@ -2205,8 +2535,9 @@ class CoverageGuidedFuzzer:
         print()
         
         # Initialize priority queue with initial tests (runtime=0 for initial tests)
+        # use_calibration=False because we don't have calibration data yet
         print(f"[INFO] Loading {len(self.tests)} initial tests into priority queue...")
-        self._queue_push_initial_batch(self.tests)
+        self._queue_push_initial_batch(self.tests, use_calibration=False)
         
         # SHARED global_coverage_map across all workers (0xFF = unseen, 0x00 = seen)
         # Using multiprocessing.Array for cross-process sharing
