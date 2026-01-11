@@ -567,14 +567,14 @@ class CoverageGuidedFuzzer:
         """
         Map AFL-style perf_score to iteration count.
         
-        For ≤1.5h budget: [5, 250] iterations
+        For ≤1.5h budget: [5, 500] iterations (increased from 250 for more recipes)
         For >1.5h budget: [10, 500] iterations
         
         Linear mapping: low score → few iterations, high score → many iterations.
         Very low scores (≤5) are treated as slow tests and get MIN_SLOW_TEST_ITERATIONS.
         """
         if self.hours_budget <= 1.5:
-            min_iter, max_iter = 5, 250
+            min_iter, max_iter = 5, 500  # Increased from 250 for fair comparison with baseline
         else:
             min_iter, max_iter = 10, 500
         
@@ -1701,7 +1701,7 @@ class CoverageGuidedFuzzer:
             return (1, [], 0.0, [])
         
         # Use provided iterations or fall back to max for time budget
-        max_iterations = 250 if self.hours_budget <= 1.5 else 500
+        max_iterations = 500  # Increased from 250 for more recipes
         num_iterations = iterations if iterations is not None else max_iterations
         
         scratch_folder.mkdir(parents=True, exist_ok=True)
@@ -1903,7 +1903,7 @@ class CoverageGuidedFuzzer:
             return (1, [], 0.0, [])
         
         # Use provided iterations or fall back to max for time budget
-        max_iterations = 250 if self.hours_budget <= 1.5 else 500
+        max_iterations = 500  # Increased from 250 for more recipes
         num_iterations = iterations if iterations is not None else max_iterations
         
         # Clean scratch/log folders but keep bugs
