@@ -51,6 +51,30 @@ def log(msg: str, flush: bool = True):
     print(f"[{timestamp}] {msg}", flush=flush)
 
 
+def extract_command_line_flags(test_path: str) -> str:
+    """
+    Extract COMMAND-LINE flags from test file header.
+    
+    CVC5 regression tests use comments like:
+    ; COMMAND-LINE: --flag1 --flag2
+    
+    Returns the flags as a string, or empty string if no COMMAND-LINE comment found.
+    """
+    try:
+        with open(test_path, 'r') as f:
+            for line in f:
+                # Skip lines that do not start with a comment character
+                stripped = line.lstrip()
+                if stripped.startswith(';') or stripped.startswith('%'):
+                    line_content = stripped[1:].lstrip()
+                    if line_content.startswith('COMMAND-LINE:'):
+                        flags = line_content[len('COMMAND-LINE:'):].strip()
+                        return flags
+    except Exception:
+        pass
+    return ""
+
+
 def load_changed_functions(changed_functions_file: str) -> Set[str]:
     """Load changed function names from JSON file."""
     try:
@@ -305,6 +329,9 @@ def process_seed_group(
         progress_queue.put(('skip', worker_id, seed_name, 'not found', len(group_recipes)))
         return 0, len(group_recipes), 0
     
+    # Extract test-specific flags from seed file header (like ; COMMAND-LINE: --flag)
+    test_flags = extract_command_line_flags(seed_path)
+    
     # Initialize RNG and parse seed ONCE
     random.seed(rng_seed)
     fuzzer = InlineTypeFuzz(Path(seed_path))
@@ -336,8 +363,20 @@ def process_seed_group(
                             f.write(mutant)
                             mutant_path = f.name
                         
+                        # Use same flags as fuzzing to trigger the same code paths
+                        # Base flags + any test-specific flags from seed header
+                        solver_cmd = [
+                            solver_path,
+                            "--check-models",
+                            "--check-proofs", 
+                            "--strings-exp",
+                        ]
+                        # Add test-specific flags if any
+                        if test_flags:
+                            solver_cmd.extend(test_flags.split())
+                        solver_cmd.append(mutant_path)
                         result = subprocess.run(
-                            [solver_path, mutant_path],
+                            solver_cmd,
                             capture_output=True,
                             timeout=timeout,
                             cwd=build_dir,
