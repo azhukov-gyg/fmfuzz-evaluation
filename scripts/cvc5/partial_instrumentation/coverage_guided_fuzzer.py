@@ -2502,7 +2502,7 @@ class CoverageGuidedFuzzer:
         print(f"Running coverage-guided fuzzer on {len(self.tests)} test(s){' for job ' + self.job_id if self.job_id else ''}")
         print(f"Tests root: {self.tests_root}")
         print(f"Timeout: {self.time_remaining}s ({self.time_remaining // 60} minutes)" if self.time_remaining else "No timeout")
-        iter_range = "[5-250]" if self.hours_budget <= 1.5 else "[10-500]"
+        iter_range = "[5-500]" if self.hours_budget <= 1.5 else "[10-500]"
         print(f"Iterations per test: {iter_range} (AFL-scored), Modulo: {self.modulo}")
         print(f"CPU cores: {self.cpu_count}")
         print(f"Workers: {self.num_workers}")
@@ -3099,7 +3099,7 @@ def main():
     
     # Calculate hours_budget for AFL-style iteration scaling
     hours_budget = args.fuzzing_duration_minutes / 60.0
-    print(f"[INFO] AFL scoring: hours_budget={hours_budget:.2f}h, iteration range=[{5 if hours_budget <= 1.5 else 10}, {250 if hours_budget <= 1.5 else 500}]")
+    print(f"[INFO] AFL scoring: hours_budget={hours_budget:.2f}h, iteration range=[{5 if hours_budget <= 1.5 else 10}, 500]")
     
     try:
         fuzzer = CoverageGuidedFuzzer(
