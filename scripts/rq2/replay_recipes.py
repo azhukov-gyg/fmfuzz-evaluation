@@ -147,11 +147,33 @@ def extract_function_counts_fastcov(
                     else:
                         log(f"[GCOV DEBUG]   {key}: {value}")
             
+            # Parse changed_functions to extract file:line for matching
+            # Format: "src/path/file.cpp:function_name:line_number"
+            changed_file_lines = {}  # {(file_basename, line): full_function_key}
+            for func_key in changed_functions:
+                parts = func_key.rsplit(':', 2)
+                if len(parts) >= 2:
+                    try:
+                        line_num = int(parts[-1])
+                        file_path = parts[0].split(':')[0]  # Get file path before function name
+                        file_basename = os.path.basename(file_path)
+                        changed_file_lines[(file_basename, line_num)] = func_key
+                    except ValueError:
+                        pass
+            
+            log(f"[GCOV DEBUG] Parsed {len(changed_file_lines)} changed functions for matching")
+            for (fb, ln), fk in list(changed_file_lines.items())[:3]:
+                log(f"[GCOV DEBUG]   {fb}:{ln} -> {fk[:60]}...")
+            
             # Show sample of functions found
             all_funcs = []
             for source_file, source_data in sources.items():
-                funcs = source_data.get('functions', {})
+                # fastcov structure: source_data['']['functions'] (empty string key!)
+                inner_data = source_data.get('', {})
+                funcs = inner_data.get('functions', {}) if isinstance(inner_data, dict) else {}
                 total_funcs_found += len(funcs)
+                
+                source_basename = os.path.basename(source_file)
                 
                 # Show first source with functions as sample
                 if not sample_shown and funcs:
@@ -163,10 +185,18 @@ def extract_function_counts_fastcov(
                 
                 for func_name, func_data in funcs.items():
                     exec_count = func_data.get('execution_count', 0)
+                    start_line = func_data.get('start_line', 0)
+                    
                     if exec_count > 0:
                         all_funcs.append((func_name, exec_count))
-                    if func_name in changed_functions:
-                        counts[func_name] = counts.get(func_name, 0) + exec_count
+                    
+                    # Match by file basename + line number
+                    match_key = (source_basename, start_line)
+                    if match_key in changed_file_lines:
+                        full_key = changed_file_lines[match_key]
+                        counts[full_key] = counts.get(full_key, 0) + exec_count
+                        if exec_count > 0:
+                            log(f"[GCOV DEBUG] MATCHED: {source_basename}:{start_line} -> {exec_count} calls")
             
             log(f"[GCOV DEBUG] Total functions found: {total_funcs_found}")
             log(f"[GCOV DEBUG] Found {len(all_funcs)} functions with >0 execution count")
@@ -322,7 +352,12 @@ def process_seed_group(
                 else:
                     failed += 1
     
-    progress_queue.put(('done', worker_id, seed_name, len(group_recipes), successful))
+    # Get iteration range for reporting
+    iterations = [r.get('iteration', 0) for r in group_recipes]
+    min_iter = min(iterations) if iterations else 0
+    max_iter = max(iterations) if iterations else 0
+    
+    progress_queue.put(('done', worker_id, seed_name, len(group_recipes), successful, min_iter, max_iter))
     return successful, failed, mutations
 
 
@@ -536,7 +571,9 @@ def replay_recipes_optimized(
                     seeds_done += 1
                     elapsed = time.time() - start_time
                     rate = seeds_done / elapsed if elapsed > 0 else 0
-                    log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] {seed_name}: {recipe_count} recipes, {successful} ok ({rate:.1f} seeds/s)")
+                    min_iter = msg[5] if len(msg) > 5 else 0
+                    max_iter = msg[6] if len(msg) > 6 else 0
+                    log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] {seed_name}: {recipe_count} recipes (iter {min_iter}-{max_iter}), {successful} ok ({rate:.1f} seeds/s)")
                 elif msg[0] == 'skip':
                     _, worker_id, seed_name, reason, recipe_count = msg
                     seeds_done += 1
