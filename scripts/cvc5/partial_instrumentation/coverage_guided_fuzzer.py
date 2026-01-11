@@ -514,15 +514,18 @@ class CoverageGuidedFuzzer:
         AFL-style owned edges factor (tc_ref).
         Tests owning more edges get higher multiplier (they're "favored").
         
-        Returns multiplier in [0.5, 4.0].
+        NOTE: With limited instrumentation scope (~69 edges), most tests hit all edges
+        so none "own" unique edges. Changed to only give BONUSES, no penalties.
+        
+        Returns multiplier in [1.0, 4.0] (no penalty for unfavored tests).
         """
         if owned_edges >= 100: return 4.0   # Owns many edges
         if owned_edges >= 50:  return 3.0
         if owned_edges >= 20:  return 2.0
         if owned_edges >= 10:  return 1.5
-        if owned_edges >= 5:   return 1.0   # Average
-        if owned_edges >= 1:   return 0.75
-        return 0.5                           # Owns no edges
+        if owned_edges >= 5:   return 1.25
+        if owned_edges >= 1:   return 1.1
+        return 1.0                           # No penalty - baseline iterations
     
     def _calculate_perf_score(
         self,
@@ -545,9 +548,9 @@ class CoverageGuidedFuzzer:
           N: [1.0, 4.0]  - newcomer bonus (decays over processing)
           D: [1, 5]      - depth/generation bonus (deep lineages get more)
           F: [0.5, 4.0]  - path rarity (rare paths get priority)
-          U: [0.5, 4.0]  - owned edges (favored tests get priority)
+          U: [1.0, 4.0]  - owned edges (favored tests get bonus, no penalty)
         
-        Theoretical range: [0.6, 288000], but clamped to [10, 1600] for iteration mapping.
+        Theoretical range: [1.0, 288000], but clamped to [10, 1600] for iteration mapping.
         Typical scores: 
           - Bad test (slow, common, no edges): 5-15
           - Average test: 100-300
