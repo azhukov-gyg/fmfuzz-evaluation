@@ -149,21 +149,21 @@ def extract_function_counts_fastcov(
             
             # Parse changed_functions to extract file:line for matching
             # Format: "src/path/file.cpp:function_name:line_number"
-            changed_file_lines = {}  # {(file_basename, line): full_function_key}
+            changed_file_lines = {}  # {(relative_path, line): full_function_key}
             for func_key in changed_functions:
                 parts = func_key.rsplit(':', 2)
                 if len(parts) >= 2:
                     try:
                         line_num = int(parts[-1])
                         file_path = parts[0].split(':')[0]  # Get file path before function name
-                        file_basename = os.path.basename(file_path)
-                        changed_file_lines[(file_basename, line_num)] = func_key
+                        # Use the relative path (e.g., "src/theory/arith/rewriter/addition.cpp")
+                        changed_file_lines[(file_path, line_num)] = func_key
                     except ValueError:
                         pass
             
             log(f"[GCOV DEBUG] Parsed {len(changed_file_lines)} changed functions for matching")
-            for (fb, ln), fk in list(changed_file_lines.items())[:3]:
-                log(f"[GCOV DEBUG]   {fb}:{ln} -> {fk[:60]}...")
+            for (fp, ln), fk in list(changed_file_lines.items())[:4]:
+                log(f"[GCOV DEBUG]   {fp}:{ln} -> {fk[:60]}...")
             
             # Show sample of functions found
             all_funcs = []
@@ -173,11 +173,17 @@ def extract_function_counts_fastcov(
                 funcs = inner_data.get('functions', {}) if isinstance(inner_data, dict) else {}
                 total_funcs_found += len(funcs)
                 
-                source_basename = os.path.basename(source_file)
+                # Extract relative path from /cvc5/ (e.g., "src/theory/arith/...")
+                # Full path: /home/runner/.../cvc5/src/theory/arith/rewriter/addition.cpp
+                # We want: src/theory/arith/rewriter/addition.cpp
+                source_relative = source_file
+                if '/cvc5/' in source_file:
+                    source_relative = source_file.split('/cvc5/', 1)[1]
                 
                 # Show first source with functions as sample
                 if not sample_shown and funcs:
                     log(f"[GCOV DEBUG] Sample source with funcs: {source_file}")
+                    log(f"[GCOV DEBUG]   Relative path: {source_relative}")
                     sample_func = list(funcs.items())[0]
                     log(f"[GCOV DEBUG]   Sample func: {sample_func[0][:60]}")
                     log(f"[GCOV DEBUG]   Sample func_data: {sample_func[1]}")
@@ -190,13 +196,13 @@ def extract_function_counts_fastcov(
                     if exec_count > 0:
                         all_funcs.append((func_name, exec_count))
                     
-                    # Match by file basename + line number
-                    match_key = (source_basename, start_line)
+                    # Match by relative path + line number
+                    match_key = (source_relative, start_line)
                     if match_key in changed_file_lines:
                         full_key = changed_file_lines[match_key]
                         counts[full_key] = counts.get(full_key, 0) + exec_count
                         if exec_count > 0:
-                            log(f"[GCOV DEBUG] MATCHED: {source_basename}:{start_line} -> {exec_count} calls")
+                            log(f"[GCOV DEBUG] MATCHED: {source_relative}:{start_line} -> {exec_count} calls")
             
             log(f"[GCOV DEBUG] Total functions found: {total_funcs_found}")
             log(f"[GCOV DEBUG] Found {len(all_funcs)} functions with >0 execution count")

@@ -1975,8 +1975,8 @@ class CoverageGuidedFuzzer:
                         
                         if remaining == 0:
                             self.calibration_done.set()
-                            avg_rt = self.avg_runtime_ms.value
-                            avg_cov = self.avg_coverage.value
+                            avg_rt = self._get_avg_runtime_ms()
+                            avg_cov = self._get_avg_coverage()
                             print(f"[INFO] Calibration complete: avg_runtime={avg_rt:.1f}ms, avg_coverage={avg_cov:.1f} edges", flush=True)
                             print(f"[INFO] Re-queuing {len(self._calibrated_seeds)} seeds with AFL-style scoring...", flush=True)
                     
