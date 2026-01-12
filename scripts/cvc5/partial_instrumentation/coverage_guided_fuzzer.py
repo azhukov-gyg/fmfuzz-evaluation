@@ -343,19 +343,22 @@ class CoverageGuidedFuzzer:
         AFL-style coverage factor.
         Tests hitting more edges get higher multiplier.
         
-        Returns multiplier in [0.25, 3.0].
+        Returns multiplier in [1.0, 5.0].
+        NO PENALTY for low coverage - we want to exercise changed functions,
+        not maximize total edge coverage.
         """
         avg_cov = self._get_avg_coverage()
         
         ratio = edges_hit / avg_cov
         
-        if ratio > 3.3:   return 3.0    # Much more coverage: big boost
-        if ratio > 2:     return 2.0
-        if ratio > 1.33:  return 1.5
-        if ratio < 0.33:  return 0.25   # Much less coverage: big penalty
-        if ratio < 0.5:   return 0.5
-        if ratio < 0.67:  return 0.75
-        return 1.0                       # Average coverage
+        # Big bonuses for high coverage, NO penalty for low coverage
+        if ratio > 3.3:   return 5.0    # Much more coverage: maximum boost
+        if ratio > 2:     return 3.0
+        if ratio > 1.33:  return 2.0
+        if ratio > 1.0:   return 1.5
+        # No penalty - tests hitting ANY edges should get full iterations
+        # This ensures CaDiCaL tests (which may hit fewer total edges) aren't penalized
+        return 1.0
     
     def _get_newcomer_multiplier(self, test_path: str) -> tuple:
         """
@@ -363,12 +366,17 @@ class CoverageGuidedFuzzer:
         Newly discovered tests get temporary boost, decremented each processing.
         
         Returns (multiplier, should_update_bonus).
-        - multiplier in [1.0, 4.0]
+        - multiplier in [1.0, 8.0]
+        
+        Tests that discover NEW coverage get 8x bonus (decays by 4 each time).
+        Tests with existing coverage get 2x bonus (decays by 1 each time).
         """
         with self.newcomer_lock:
             bonus = self.test_newcomer.get(test_path, 0)
             
-            if bonus >= 4:
+            if bonus >= 8:
+                return 8.0, True  # Maximum boost for NEW coverage discoverers
+            elif bonus >= 4:
                 return 4.0, True  # Big boost, will decrement by 4
             elif bonus > 0:
                 return 2.0, True  # Medium boost, will decrement by 1
@@ -378,8 +386,10 @@ class CoverageGuidedFuzzer:
         """Decrement newcomer bonus after processing."""
         with self.newcomer_lock:
             bonus = self.test_newcomer.get(test_path, 0)
-            if bonus >= 4:
-                self.test_newcomer[test_path] = bonus - 4
+            if bonus >= 8:
+                self.test_newcomer[test_path] = bonus - 4  # 8 -> 4
+            elif bonus >= 4:
+                self.test_newcomer[test_path] = bonus - 4  # 4 -> 0
             elif bonus > 0:
                 self.test_newcomer[test_path] = bonus - 1
     
@@ -544,8 +554,8 @@ class CoverageGuidedFuzzer:
         
         Factors:
           S: [10, 300]   - base score from speed (fast=300, slow=10)
-          C: [0.25, 3.0] - coverage relative to average
-          N: [1.0, 4.0]  - newcomer bonus (decays over processing)
+          C: [1.0, 5.0]  - coverage relative to average (no penalty, only bonus)
+          N: [1.0, 8.0]  - newcomer bonus (8x for NEW coverage, decays over processing)
           D: [1, 5]      - depth/generation bonus (deep lineages get more)
           F: [0.5, 4.0]  - path rarity (rare paths get priority)
           U: [1.0, 4.0]  - owned edges (favored tests get bonus, no penalty)
@@ -570,16 +580,18 @@ class CoverageGuidedFuzzer:
         """
         Map AFL-style perf_score to iteration count.
         
-        For ≤1.5h budget: [5, 500] iterations (increased from 250 for more recipes)
-        For >1.5h budget: [10, 500] iterations
+        For ≤1.5h budget: [25, 500] iterations (increased min for more recipes)
+        For >1.5h budget: [25, 500] iterations
         
         Linear mapping: low score → few iterations, high score → many iterations.
         Very low scores (≤5) are treated as slow tests and get MIN_SLOW_TEST_ITERATIONS.
         """
+        # Increased minimum from 5 to 25 to generate more recipes
+        # This ensures even low-scoring tests contribute to recipe count
         if self.hours_budget <= 1.5:
-            min_iter, max_iter = 5, 500  # Increased from 250 for fair comparison with baseline
+            min_iter, max_iter = 25, 500
         else:
-            min_iter, max_iter = 10, 500
+            min_iter, max_iter = 25, 500
         
         # Very low scores (slow tests) get minimum iterations
         if score <= 5:
@@ -1894,8 +1906,9 @@ class CoverageGuidedFuzzer:
                 self._update_edge_ownership(trace_bits, runtime_i * 1000, str(pending_path))
 
             # Set newcomer bonus for new mutants
-            # Mutants with new coverage get higher bonus
-            newcomer_bonus = 4 if has_new else 2
+            # Mutants with NEW coverage get big bonus (8x) to encourage exploration
+            # Mutants with existing coverage get smaller bonus (2x)
+            newcomer_bonus = 8 if has_new else 2
             self._set_newcomer(str(pending_path), newcomer_bonus)
             
             # Update running averages for score calculation
@@ -2477,7 +2490,8 @@ class CoverageGuidedFuzzer:
                                         shutil.move(str(mutant_file), str(pending_path))
                                         
                                         # Set newcomer bonus for new mutants
-                                        newcomer_bonus = 4 if coverage_type == "NEW" else 2
+                                        # NEW coverage gets big bonus (8x) to encourage exploration
+                                        newcomer_bonus = 8 if coverage_type == "NEW" else 2
                                         self._set_newcomer(str(pending_path), newcomer_bonus)
                                         
                                         # Queue item: (runtime, new_cov_rank, generation, seq, path_str)
