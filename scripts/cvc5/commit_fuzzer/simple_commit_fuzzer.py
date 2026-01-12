@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 # Add scripts/rq2 to path for shared components (RecipeRecorder, InlineTypeFuzz)
 SCRIPT_DIR = Path(__file__).parent
@@ -533,11 +533,21 @@ class SimpleCommitFuzzer:
         with self.resource_lock:
             return self.resource_state.get('paused', False)
     
-    def _extract_command_line_flags(self, test_path: Path) -> str:
-        """Extract COMMAND-LINE flags from test file (like run_regression.py does).
+    def _extract_test_directives(self, test_path: Path) -> Tuple[str, Set[str]]:
+        """Extract COMMAND-LINE flags and DISABLE-TESTER directives from test file.
         
-        Returns the flags as a string, or empty string if no COMMAND-LINE comment found.
+        CVC5 regression tests use comments like:
+        ; COMMAND-LINE: --flag1 --flag2
+        ; DISABLE-TESTER: proof
+        ; DISABLE-TESTER: model
+        
+        Returns:
+            (command_line_flags, disabled_testers) where disabled_testers is a set
+            of disabled tester names (e.g., {'proof', 'model'})
         """
+        command_line = ""
+        disabled_testers: Set[str] = set()
+        
         try:
             with open(test_path, 'r') as f:
                 for line in f:
@@ -545,35 +555,64 @@ class SimpleCommitFuzzer:
                     stripped = line.lstrip()
                     if stripped.startswith(';') or stripped.startswith('%'):
                         line_content = stripped[1:].lstrip()
+                        
+                        # Check for COMMAND-LINE:
                         if line_content.startswith('COMMAND-LINE:'):
-                            flags = line_content[len('COMMAND-LINE:'):].strip()
-                            return flags
+                            command_line = line_content[len('COMMAND-LINE:'):].strip()
+                        
+                        # Check for DISABLE-TESTER:
+                        elif line_content.startswith('DISABLE-TESTER:'):
+                            tester = line_content[len('DISABLE-TESTER:'):].strip().lower()
+                            disabled_testers.add(tester)
+                    
+                    # Stop after first non-comment, non-empty line (directives are at top)
+                    elif stripped and not stripped.startswith('('):
+                        break
         except Exception as e:
-            print(f"[WARNING] Could not extract COMMAND-LINE flags from {test_path}: {e}", file=sys.stderr)
-        return ""
+            print(f"[WARNING] Could not extract directives from {test_path}: {e}", file=sys.stderr)
+        
+        return command_line, disabled_testers
+    
+    def _extract_command_line_flags(self, test_path: Path) -> str:
+        """Extract COMMAND-LINE flags from test file (legacy wrapper)."""
+        command_line, _ = self._extract_test_directives(test_path)
+        return command_line
     
     def _get_solver_clis(self, test_path: Optional[Path] = None) -> str:
-        solvers = [self.z3_new]
-        # if self.z3_old_path:
-        #     solvers.append(str(self.z3_old_path))
-        # CVC5: No built-in memory limit - rely on our process killing mechanism (max_process_memory_mb)
-        base_flags = "--check-models --check-proofs --strings-exp"
+        """Get solver CLI string for typefuzz (z3 + cvc5).
         
-        # Extract COMMAND-LINE flags from test file if provided (to match coverage mapping behavior)
+        Uses flags like CVC5's regression testers:
+        - --debug-check-models (like ModelTester, checks internal+user assertions)
+        - --check-proofs (like ProofTester)
+        - --strings-exp (feature flag)
+        
+        Respects DISABLE-TESTER directives from test headers.
+        """
+        solvers = [self.z3_new]
+        
+        # Base CVC5 flags - mimicking regression testers
+        # Use --debug-check-models (not --check-models) like CVC5's ModelTester
+        base_flags_list = ["--debug-check-models", "--check-proofs", "--strings-exp"]
+        
+        # Extract directives from test file if provided
         test_flags = ""
         if test_path and test_path.exists():
-            test_flags = self._extract_command_line_flags(test_path)
-            if test_flags:
-                # Merge test flags with base flags (test flags may override base flags)
-                # For now, just append test flags after base flags
-                base_flags = f"{base_flags} {test_flags}"
-                print(f"[DEBUG] Extracted COMMAND-LINE flags from {test_path.name}: {test_flags}", file=sys.stderr)
-                print(f"[DEBUG] Final CVC5 command: {self.cvc5_path} {base_flags}", file=sys.stderr)
+            command_line, disabled_testers = self._extract_test_directives(test_path)
+            test_flags = command_line
+            
+            # Remove flags for disabled testers (like CVC5 regression system)
+            if 'proof' in disabled_testers:
+                base_flags_list = [f for f in base_flags_list if f != '--check-proofs']
+            if 'model' in disabled_testers:
+                base_flags_list = [f for f in base_flags_list if f != '--debug-check-models']
+        
+        # Combine base flags + test-specific flags
+        base_flags = " ".join(base_flags_list)
+        if test_flags:
+            base_flags = f"{base_flags} {test_flags}"
         
         cvc5_cmd = f"{self.cvc5_path} {base_flags}"
         solvers.append(cvc5_cmd)
-        # if self.cvc4_path:
-        #     solvers.append(str(self.cvc4_path))
         return ";".join(solvers)
     
     def _compute_time_remaining(self, job_start_time: float, stop_buffer_minutes: int) -> int:
@@ -711,8 +750,17 @@ class SimpleCommitFuzzer:
         z3_memory_mb = self.RESOURCE_CONFIG['z3_memory_limit_mb']
         z3_cmd = f"z3 smt.threads=1 memory_max_size={z3_memory_mb} model_validate=true"
         
-        base_flags = "--check-models --check-proofs --strings-exp"
-        test_flags = self._extract_command_line_flags(test_path)
+        # Build CVC5 command with proper flags respecting DISABLE-TESTER
+        base_flags_list = ["--debug-check-models", "--check-proofs", "--strings-exp"]
+        test_flags, disabled_testers = self._extract_test_directives(test_path)
+        
+        # Remove flags for disabled testers (like CVC5 regression system)
+        if 'proof' in disabled_testers:
+            base_flags_list = [f for f in base_flags_list if f != '--check-proofs']
+        if 'model' in disabled_testers:
+            base_flags_list = [f for f in base_flags_list if f != '--debug-check-models']
+        
+        base_flags = " ".join(base_flags_list)
         if test_flags:
             base_flags = f"{base_flags} {test_flags}"
         cvc5_cmd = f"{self.cvc5_path} {base_flags}"
@@ -935,7 +983,7 @@ class SimpleCommitFuzzer:
         print(f"Iterations per test: {self.iterations}, Modulo: {self.modulo}")
         print(f"CPU cores: {self.cpu_count}")
         print(f"Workers: {self.num_workers}")
-        print(f"Solvers: z3={self.z3_new}, cvc5={self.cvc5_path} --check-models --check-proofs --strings-exp")
+        print(f"Solvers: z3={self.z3_new}, cvc5={self.cvc5_path} --debug-check-models --check-proofs --strings-exp (respects DISABLE-TESTER)")
         print()
         
         # Add all tests to queue
