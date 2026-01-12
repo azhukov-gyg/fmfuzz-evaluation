@@ -863,6 +863,10 @@ class CoverageGuidedFuzzer:
                 
                 if cal_data:
                     runtime_sec, edges_hit, perf_score, weight = cal_data
+                    # Skip tests with 0 edges - they don't hit changed functions
+                    if edges_hit == 0:
+                        skipped_count += 1
+                        continue
                     is_favored = self.test_favored.get(name, False)
                     # Favored tests get priority (runtime=0), others use actual runtime
                     effective_runtime = 0.0 if is_favored else runtime_sec
@@ -924,10 +928,21 @@ class CoverageGuidedFuzzer:
         
         items_to_queue = []
         slow_tests_count = 0
+        zero_cov_count = 0
         
         for runtime, edges_hit, test_path_str in seeds:
             # Store calibration data for weighted selection and future refills
             self._store_calibration_data(test_path_str, runtime, edges_hit)
+            
+            # SKIP tests that hit 0 instrumented edges during calibration.
+            # These tests don't exercise the changed functions at all and will
+            # never produce useful mutations for this commit.
+            if edges_hit == 0:
+                zero_cov_count += 1
+                # Add to excluded list so we don't re-add them on queue refill
+                if test_path_str not in self.excluded_tests:
+                    self.excluded_tests.append(test_path_str)
+                continue
             
             # Track slow tests (they'll get very low iterations via scoring, not excluded)
             if runtime > self.SLOW_TEST_THRESHOLD_S:
@@ -949,6 +964,8 @@ class CoverageGuidedFuzzer:
             # Use runtime as sort key so fast seeds are processed first
             items_to_queue.append((runtime, 2, 0, self._next_seq(), test_path_str))
         
+        if zero_cov_count > 0:
+            print(f"[INFO] ⚠️  Excluded {zero_cov_count} tests with 0 instrumented edges (no coverage of changed functions)")
         if slow_tests_count > 0:
             print(f"[INFO] {slow_tests_count} slow tests (>{self.SLOW_TEST_THRESHOLD_S}s) will get minimum iterations ({self.MIN_SLOW_TEST_ITERATIONS})")
         
