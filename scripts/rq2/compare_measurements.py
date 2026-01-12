@@ -86,6 +86,27 @@ def compare_measurements(measurements_dir: str) -> dict:
         all_functions.update(v1.get('function_counts', {}).keys())
         all_functions.update(v2.get('function_counts', {}).keys())
         
+        total_functions = len(all_functions)
+        
+        # Count functions covered (non-zero calls) - CAN'T BE GAMED BY ITERATIONS
+        b_funcs_covered = sum(1 for f in all_functions if b.get('function_counts', {}).get(f, 0) > 0)
+        v1_funcs_covered = sum(1 for f in all_functions if v1.get('function_counts', {}).get(f, 0) > 0)
+        v2_funcs_covered = sum(1 for f in all_functions if v2.get('function_counts', {}).get(f, 0) > 0)
+        
+        # Functions ONLY covered by each variant (exclusive coverage)
+        b_only = sum(1 for f in all_functions if 
+                     b.get('function_counts', {}).get(f, 0) > 0 and
+                     v1.get('function_counts', {}).get(f, 0) == 0 and
+                     v2.get('function_counts', {}).get(f, 0) == 0)
+        v1_only = sum(1 for f in all_functions if 
+                      v1.get('function_counts', {}).get(f, 0) > 0 and
+                      b.get('function_counts', {}).get(f, 0) == 0 and
+                      v2.get('function_counts', {}).get(f, 0) == 0)
+        v2_only = sum(1 for f in all_functions if 
+                      v2.get('function_counts', {}).get(f, 0) > 0 and
+                      b.get('function_counts', {}).get(f, 0) == 0 and
+                      v1.get('function_counts', {}).get(f, 0) == 0)
+        
         function_comparison = []
         for func in sorted(all_functions):
             b_count = b.get('function_counts', {}).get(func, 0)
@@ -104,39 +125,77 @@ def compare_measurements(measurements_dir: str) -> dict:
         
         results.append({
             "commit": commit,
+            "total_changed_functions": total_functions,
             "baseline": {
                 "total_function_calls": b_total,
                 "recipes_processed": b_recipes,
                 "successful_runs": b.get('successful_runs', 0),
                 "failed_runs": b.get('failed_runs', 0),
+                # NEW METRICS - can't be gamed by iterations
+                "functions_covered": b_funcs_covered,
+                "coverage_breadth_pct": round(100.0 * b_funcs_covered / total_functions, 1) if total_functions > 0 else 0,
+                "exclusive_functions": b_only,  # Functions ONLY baseline covers
+                "calls_per_recipe": round(b_total / b_recipes, 2) if b_recipes > 0 else 0,
             },
             "variant1": {
                 "total_function_calls": v1_total,
                 "recipes_processed": v1_recipes,
                 "successful_runs": v1.get('successful_runs', 0),
                 "failed_runs": v1.get('failed_runs', 0),
+                # NEW METRICS
+                "functions_covered": v1_funcs_covered,
+                "coverage_breadth_pct": round(100.0 * v1_funcs_covered / total_functions, 1) if total_functions > 0 else 0,
+                "exclusive_functions": v1_only,
+                "calls_per_recipe": round(v1_total / v1_recipes, 2) if v1_recipes > 0 else 0,
             },
             "variant2": {
                 "total_function_calls": v2_total,
                 "recipes_processed": v2_recipes,
                 "successful_runs": v2.get('successful_runs', 0),
                 "failed_runs": v2.get('failed_runs', 0),
+                # NEW METRICS
+                "functions_covered": v2_funcs_covered,
+                "coverage_breadth_pct": round(100.0 * v2_funcs_covered / total_functions, 1) if total_functions > 0 else 0,
+                "exclusive_functions": v2_only,
+                "calls_per_recipe": round(v2_total / v2_recipes, 2) if v2_recipes > 0 else 0,
             },
             "function_comparison": function_comparison,
         })
     
     # Generate summary statistics
+    n = len(results) if results else 1
     summary = {
         "total_commits": len(results),
-        "avg_baseline_calls": sum(r['baseline']['total_function_calls'] for r in results) / len(results) if results else 0,
-        "avg_variant1_calls": sum(r['variant1']['total_function_calls'] for r in results) / len(results) if results else 0,
-        "avg_variant2_calls": sum(r['variant2']['total_function_calls'] for r in results) / len(results) if results else 0,
+        # Traditional metrics (can be gamed by iterations)
+        "avg_baseline_calls": sum(r['baseline']['total_function_calls'] for r in results) / n if results else 0,
+        "avg_variant1_calls": sum(r['variant1']['total_function_calls'] for r in results) / n if results else 0,
+        "avg_variant2_calls": sum(r['variant2']['total_function_calls'] for r in results) / n if results else 0,
+        # NEW: Coverage breadth (CAN'T be gamed - measures diversity)
+        "avg_baseline_coverage_pct": sum(r['baseline']['coverage_breadth_pct'] for r in results) / n if results else 0,
+        "avg_variant1_coverage_pct": sum(r['variant1']['coverage_breadth_pct'] for r in results) / n if results else 0,
+        "avg_variant2_coverage_pct": sum(r['variant2']['coverage_breadth_pct'] for r in results) / n if results else 0,
+        # NEW: Exclusive coverage (functions ONLY covered by this variant)
+        "total_baseline_exclusive": sum(r['baseline']['exclusive_functions'] for r in results) if results else 0,
+        "total_variant1_exclusive": sum(r['variant1']['exclusive_functions'] for r in results) if results else 0,
+        "total_variant2_exclusive": sum(r['variant2']['exclusive_functions'] for r in results) if results else 0,
+        # NEW: Efficiency (calls per recipe)
+        "avg_baseline_calls_per_recipe": sum(r['baseline']['calls_per_recipe'] for r in results) / n if results else 0,
+        "avg_variant1_calls_per_recipe": sum(r['variant1']['calls_per_recipe'] for r in results) / n if results else 0,
+        "avg_variant2_calls_per_recipe": sum(r['variant2']['calls_per_recipe'] for r in results) / n if results else 0,
     }
     
-    # Calculate ratios
+    # Calculate ratios (traditional)
     if summary['avg_baseline_calls'] > 0:
         summary['v1_vs_baseline_ratio'] = summary['avg_variant1_calls'] / summary['avg_baseline_calls']
         summary['v2_vs_baseline_ratio'] = summary['avg_variant2_calls'] / summary['avg_baseline_calls']
+    
+    # Determine winner for each metric
+    summary['winner_by_calls'] = max(['baseline', 'variant1', 'variant2'], 
+                                      key=lambda v: summary[f'avg_{v}_calls'])
+    summary['winner_by_coverage'] = max(['baseline', 'variant1', 'variant2'], 
+                                         key=lambda v: summary[f'avg_{v}_coverage_pct'])
+    summary['winner_by_exclusive'] = max(['baseline', 'variant1', 'variant2'], 
+                                          key=lambda v: summary[f'total_{v}_exclusive'])
     
     return {
         "status": "complete",
@@ -158,15 +217,36 @@ def print_summary(comparison: dict):
     if 'summary' in comparison:
         s = comparison['summary']
         print(f"Commits compared: {s['total_commits']}", file=sys.stderr)
-        print(f"Average function calls:", file=sys.stderr)
+        
+        print(f"\n📊 METRIC 1: Total Function Calls (can be inflated by iterations)", file=sys.stderr)
         print(f"  Baseline:  {s['avg_baseline_calls']:,.0f}", file=sys.stderr)
         print(f"  Variant1:  {s['avg_variant1_calls']:,.0f}", file=sys.stderr)
         print(f"  Variant2:  {s['avg_variant2_calls']:,.0f}", file=sys.stderr)
+        print(f"  🏆 Winner: {s.get('winner_by_calls', 'N/A')}", file=sys.stderr)
         
         if 'v1_vs_baseline_ratio' in s:
-            print(f"\nRatios vs Baseline:", file=sys.stderr)
-            print(f"  Variant1: {s['v1_vs_baseline_ratio']:.2f}x", file=sys.stderr)
-            print(f"  Variant2: {s['v2_vs_baseline_ratio']:.2f}x", file=sys.stderr)
+            print(f"\n  Ratios vs Baseline:", file=sys.stderr)
+            print(f"    Variant1: {s['v1_vs_baseline_ratio']:.2f}x", file=sys.stderr)
+            print(f"    Variant2: {s['v2_vs_baseline_ratio']:.2f}x", file=sys.stderr)
+        
+        print(f"\n📊 METRIC 2: Coverage Breadth % (CAN'T be gamed - measures diversity)", file=sys.stderr)
+        print(f"  Baseline:  {s.get('avg_baseline_coverage_pct', 0):.1f}%", file=sys.stderr)
+        print(f"  Variant1:  {s.get('avg_variant1_coverage_pct', 0):.1f}%", file=sys.stderr)
+        print(f"  Variant2:  {s.get('avg_variant2_coverage_pct', 0):.1f}%", file=sys.stderr)
+        print(f"  🏆 Winner: {s.get('winner_by_coverage', 'N/A')}", file=sys.stderr)
+        
+        print(f"\n📊 METRIC 3: Exclusive Functions (unique coverage not found by others)", file=sys.stderr)
+        print(f"  Baseline:  {s.get('total_baseline_exclusive', 0)}", file=sys.stderr)
+        print(f"  Variant1:  {s.get('total_variant1_exclusive', 0)}", file=sys.stderr)
+        print(f"  Variant2:  {s.get('total_variant2_exclusive', 0)}", file=sys.stderr)
+        print(f"  🏆 Winner: {s.get('winner_by_exclusive', 'N/A')}", file=sys.stderr)
+        
+        print(f"\n📊 METRIC 4: Calls per Recipe (efficiency)", file=sys.stderr)
+        print(f"  Baseline:  {s.get('avg_baseline_calls_per_recipe', 0):.1f}", file=sys.stderr)
+        print(f"  Variant1:  {s.get('avg_variant1_calls_per_recipe', 0):.1f}", file=sys.stderr)
+        print(f"  Variant2:  {s.get('avg_variant2_calls_per_recipe', 0):.1f}", file=sys.stderr)
+        
+        print("\n" + "="*70, file=sys.stderr)
     else:
         print(f"Status: {comparison.get('status', 'unknown')}", file=sys.stderr)
         print(f"Baseline commits: {comparison.get('baseline_commits', 0)}", file=sys.stderr)
