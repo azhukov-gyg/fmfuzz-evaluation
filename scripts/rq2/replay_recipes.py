@@ -51,15 +51,22 @@ def log(msg: str, flush: bool = True):
     print(f"[{timestamp}] {msg}", flush=flush)
 
 
-def extract_command_line_flags(test_path: str) -> str:
+def extract_test_directives(test_path: str) -> Tuple[str, Set[str]]:
     """
-    Extract COMMAND-LINE flags from test file header.
+    Extract COMMAND-LINE flags and DISABLE-TESTER directives from test file header.
     
     CVC5 regression tests use comments like:
     ; COMMAND-LINE: --flag1 --flag2
+    ; DISABLE-TESTER: proof
+    ; DISABLE-TESTER: model
     
-    Returns the flags as a string, or empty string if no COMMAND-LINE comment found.
+    Returns:
+        (command_line_flags, disabled_testers) where disabled_testers is a set
+        of disabled tester names (e.g., {'proof', 'model'})
     """
+    command_line = ""
+    disabled_testers: Set[str] = set()
+    
     try:
         with open(test_path, 'r') as f:
             for line in f:
@@ -67,12 +74,29 @@ def extract_command_line_flags(test_path: str) -> str:
                 stripped = line.lstrip()
                 if stripped.startswith(';') or stripped.startswith('%'):
                     line_content = stripped[1:].lstrip()
+                    
+                    # Check for COMMAND-LINE:
                     if line_content.startswith('COMMAND-LINE:'):
-                        flags = line_content[len('COMMAND-LINE:'):].strip()
-                        return flags
+                        command_line = line_content[len('COMMAND-LINE:'):].strip()
+                    
+                    # Check for DISABLE-TESTER:
+                    elif line_content.startswith('DISABLE-TESTER:'):
+                        tester = line_content[len('DISABLE-TESTER:'):].strip().lower()
+                        disabled_testers.add(tester)
+                
+                # Stop after first non-comment, non-empty line (directives are at top)
+                elif stripped and not stripped.startswith('('):
+                    break
     except Exception:
         pass
-    return ""
+    
+    return command_line, disabled_testers
+
+
+def extract_command_line_flags(test_path: str) -> str:
+    """Extract COMMAND-LINE flags from test file (legacy wrapper)."""
+    command_line, _ = extract_test_directives(test_path)
+    return command_line
 
 
 def load_changed_functions(changed_functions_file: str) -> Set[str]:
@@ -329,8 +353,16 @@ def process_seed_group(
         progress_queue.put(('skip', worker_id, seed_name, 'not found', len(group_recipes)))
         return 0, len(group_recipes), 0
     
-    # Extract test-specific flags from seed file header (like ; COMMAND-LINE: --flag)
-    test_flags = extract_command_line_flags(seed_path)
+    # Extract test-specific flags and DISABLE-TESTER directives from seed file header
+    test_flags, disabled_testers = extract_test_directives(seed_path)
+    
+    # Build base flags, respecting DISABLE-TESTER directives (like CVC5's regression system)
+    # Use --debug-check-models (not --check-models) like CVC5's ModelTester
+    base_flags = ["--debug-check-models", "--check-proofs", "--strings-exp"]
+    if 'proof' in disabled_testers:
+        base_flags = [f for f in base_flags if f != '--check-proofs']
+    if 'model' in disabled_testers:
+        base_flags = [f for f in base_flags if f != '--debug-check-models']
     
     # Initialize RNG and parse seed ONCE
     random.seed(rng_seed)
@@ -364,13 +396,8 @@ def process_seed_group(
                             mutant_path = f.name
                         
                         # Use same flags as fuzzing to trigger the same code paths
-                        # Base flags + any test-specific flags from seed header
-                        solver_cmd = [
-                            solver_path,
-                            "--check-models",
-                            "--check-proofs", 
-                            "--strings-exp",
-                        ]
+                        # Base flags (respecting DISABLE-TESTER) + any test-specific flags
+                        solver_cmd = [solver_path] + base_flags
                         # Add test-specific flags if any
                         if test_flags:
                             solver_cmd.extend(test_flags.split())

@@ -23,7 +23,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # Import shared InlineTypeFuzz and RecipeRecorder from scripts/rq2
 SCRIPT_DIR = Path(__file__).parent
@@ -1590,14 +1590,21 @@ class CoverageGuidedFuzzer:
     # Typefuzz Execution
     # -------------------------------------------------------------------------
     
-    def _extract_command_line_flags(self, test_path: Path) -> str:
-        """Extract COMMAND-LINE flags from test file (like CVC5's run_regression.py does).
+    def _extract_test_directives(self, test_path: Path) -> Tuple[str, Set[str]]:
+        """Extract COMMAND-LINE flags and DISABLE-TESTER directives from test file.
         
         CVC5 regression tests use comments like:
         ; COMMAND-LINE: --flag1 --flag2
+        ; DISABLE-TESTER: proof
+        ; DISABLE-TESTER: model
         
-        Returns the flags as a string, or empty string if no COMMAND-LINE comment found.
+        Returns:
+            (command_line_flags, disabled_testers) where disabled_testers is a set
+            of disabled tester names (e.g., {'proof', 'model'})
         """
+        command_line = ""
+        disabled_testers: Set[str] = set()
+        
         try:
             with open(test_path, 'r') as f:
                 for line in f:
@@ -1605,30 +1612,62 @@ class CoverageGuidedFuzzer:
                     stripped = line.lstrip()
                     if stripped.startswith(';') or stripped.startswith('%'):
                         line_content = stripped[1:].lstrip()
+                        
+                        # Check for COMMAND-LINE:
                         if line_content.startswith('COMMAND-LINE:'):
-                            flags = line_content[len('COMMAND-LINE:'):].strip()
-                            return flags
+                            command_line = line_content[len('COMMAND-LINE:'):].strip()
+                        
+                        # Check for DISABLE-TESTER:
+                        elif line_content.startswith('DISABLE-TESTER:'):
+                            tester = line_content[len('DISABLE-TESTER:'):].strip().lower()
+                            disabled_testers.add(tester)
+                    
+                    # Stop after first non-comment, non-empty line (directives are at top)
+                    elif stripped and not stripped.startswith('('):
+                        break
         except Exception as e:
-            print(f"[WARNING] Could not extract COMMAND-LINE flags from {test_path}: {e}", file=sys.stderr)
-        return ""
+            print(f"[WARNING] Could not extract directives from {test_path}: {e}", file=sys.stderr)
+        
+        return command_line, disabled_testers
+    
+    def _extract_command_line_flags(self, test_path: Path) -> str:
+        """Extract COMMAND-LINE flags from test file (legacy wrapper)."""
+        command_line, _ = self._extract_test_directives(test_path)
+        return command_line
     
     def _get_solver_clis(self, test_path: Optional[Path] = None) -> str:
         """Get solver CLI string for typefuzz (z3 + cvc5).
         
-        If test_path is provided, extracts COMMAND-LINE flags from test file
-        and appends them to the CVC5 command (matching CVC5 regression behavior).
+        Uses flags like CVC5's regression testers:
+        - --debug-check-models (like ModelTester, checks internal+user assertions)
+        - --check-proofs (like ProofTester)
+        - --strings-exp (feature flag)
+        
+        Respects DISABLE-TESTER directives from test headers.
         """
         solvers = [self.z3_cmd]
         
-        # Base CVC5 flags
-        base_flags = "--check-models --check-proofs --strings-exp"
+        # Base CVC5 flags - mimicking regression testers
+        # Use --debug-check-models (not --check-models) like CVC5's ModelTester
+        base_flags_list = ["--debug-check-models", "--check-proofs", "--strings-exp"]
         
-        # Extract COMMAND-LINE flags from test file if provided
+        # Extract directives from test file if provided
+        test_flags = ""
         if test_path and test_path.exists():
-            test_flags = self._extract_command_line_flags(test_path)
-            if test_flags:
-                # Append test-specific flags to base flags
-                base_flags = f"{base_flags} {test_flags}"
+            command_line, disabled_testers = self._extract_test_directives(test_path)
+            test_flags = command_line
+            
+            # Remove flags for disabled testers (like CVC5 regression system)
+            if 'proof' in disabled_testers:
+                base_flags_list = [f for f in base_flags_list if f != '--check-proofs']
+            if 'model' in disabled_testers:
+                base_flags_list = [f for f in base_flags_list if f != '--debug-check-models']
+            # Note: we don't add --check-unsat-cores by default, so no need to handle unsat-core
+        
+        # Combine base flags + test-specific flags
+        base_flags = " ".join(base_flags_list)
+        if test_flags:
+            base_flags = f"{base_flags} {test_flags}"
         
         solvers.append(f"{self.cvc5_path} {base_flags}")
         return ";".join(solvers)
@@ -2208,8 +2247,18 @@ class CoverageGuidedFuzzer:
                         exit_code, runtime = self._run_seed_calibration(test_path_obj, shm_id)
                         bug_files = []
                         mutant_files = []
-                        action = 'keep' if exit_code == 0 else 'remove'
-                        print(f"[WORKER {worker_id}] [CAL] {test_name} (runtime: {runtime:.1f}s)", flush=True)
+                        # Only exclude tests with unsupported operations or timeouts
+                        # Exit code 1 is common for many valid CVC5 tests (e.g., expected failures)
+                        # Match simple_commit_fuzzer behavior: only exclude on UNSUPPORTED (3) or timeout
+                        if exit_code == self.EXIT_CODE_UNSUPPORTED:
+                            action = 'remove'
+                            print(f"[WORKER {worker_id}] [CAL] {test_name} (runtime: {runtime:.1f}s) - exit code {exit_code} (unsupported)", flush=True)
+                        elif exit_code == -1:  # Timeout
+                            action = 'remove'
+                            print(f"[WORKER {worker_id}] [CAL] {test_name} (runtime: {runtime:.1f}s) - timeout", flush=True)
+                        else:
+                            action = 'keep'
+                            print(f"[WORKER {worker_id}] [CAL] {test_name} (runtime: {runtime:.1f}s) - exit code {exit_code}", flush=True)
                     else:
                         # Run typefuzz (inline or subprocess) with dynamic iterations
                         time_remaining = self._get_time_remaining()
@@ -2286,6 +2335,16 @@ class CoverageGuidedFuzzer:
                             avg_rt = self._get_avg_runtime_ms()
                             avg_cov = self._get_avg_coverage()
                             print(f"[INFO] Calibration complete: avg_runtime={avg_rt:.1f}ms, avg_coverage={avg_cov:.1f} edges", flush=True)
+                            
+                            # Warn if no coverage detected during calibration
+                            if avg_cov < 0.01:
+                                print(f"[WARNING] ⚠️  No coverage detected during calibration!", flush=True)
+                                print(f"[WARNING] This may indicate:", flush=True)
+                                print(f"[WARNING]   - Instrumented functions are not on the hot path for seed tests", flush=True)
+                                print(f"[WARNING]   - Tests may require specific flags that aren't being used", flush=True)
+                                print(f"[WARNING] AFL-style scoring will have limited effectiveness.", flush=True)
+                                print(f"[WARNING] Mutations may still discover coverage - continuing...", flush=True)
+                            
                             print(f"[INFO] Re-queuing {len(self._calibrated_seeds)} seeds with AFL-style scoring...", flush=True)
                     
                     # Periodic garbage collection to prevent memory bloat
