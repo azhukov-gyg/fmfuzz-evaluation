@@ -31,6 +31,14 @@ def merge_measurement_results(result_files: list, output_file: str) -> dict:
         "function_counts": {},
         "total_function_calls": 0,
         "changed_functions_tracked": 0,
+        # Line coverage
+        "line_coverage": {},
+        "lines_hit": 0,
+        "lines_total": 0,
+        # Branch coverage
+        "branch_coverage": {},
+        "branches_taken": 0,
+        "branches_total": 0,
         "elapsed_seconds": 0,
     }
     
@@ -56,12 +64,28 @@ def merge_measurement_results(result_files: list, output_file: str) -> dict:
             for func, count in data.get("function_counts", {}).items():
                 merged["function_counts"][func] = merged["function_counts"].get(func, 0) + count
             
+            # Merge line coverage (sum hit counts per line)
+            for line_key, hit_count in data.get("line_coverage", {}).items():
+                merged["line_coverage"][line_key] = merged["line_coverage"].get(line_key, 0) + hit_count
+            
+            # Merge branch coverage (sum taken counts per branch)
+            for branch_key, taken_count in data.get("branch_coverage", {}).items():
+                merged["branch_coverage"][branch_key] = merged["branch_coverage"].get(branch_key, 0) + taken_count
+            
             print(f"✓ Merged: {result_file} ({data.get('recipes_processed', 0)} recipes)")
             
         except Exception as e:
             print(f"⚠ Error reading {result_file}: {e}", file=sys.stderr)
     
     merged["total_function_calls"] = sum(merged["function_counts"].values())
+    
+    # Compute line coverage aggregates (unique lines hit vs total unique lines)
+    merged["lines_hit"] = sum(1 for v in merged["line_coverage"].values() if v > 0)
+    merged["lines_total"] = len(merged["line_coverage"])
+    
+    # Compute branch coverage aggregates (unique branches taken vs total unique branches)
+    merged["branches_taken"] = sum(1 for v in merged["branch_coverage"].values() if v > 0)
+    merged["branches_total"] = len(merged["branch_coverage"])
     
     # Calculate rate
     if merged["elapsed_seconds"] > 0:
@@ -71,9 +95,15 @@ def merge_measurement_results(result_files: list, output_file: str) -> dict:
     with open(output_file, 'w') as f:
         json.dump(merged, f, indent=2)
     
+    # Calculate percentages for display
+    lines_pct = 100.0 * merged["lines_hit"] / merged["lines_total"] if merged["lines_total"] > 0 else 0
+    branches_pct = 100.0 * merged["branches_taken"] / merged["branches_total"] if merged["branches_total"] > 0 else 0
+    
     print(f"\n✅ Merged {len(merged['source_files'])} result files")
     print(f"   Total recipes: {merged['recipes_processed']}")
     print(f"   Total function calls: {merged['total_function_calls']:,}")
+    print(f"   Lines hit: {merged['lines_hit']}/{merged['lines_total']} ({lines_pct:.1f}%)")
+    print(f"   Branches taken: {merged['branches_taken']}/{merged['branches_total']} ({branches_pct:.1f}%)")
     print(f"   Saved to: {output_file}")
     
     return merged
