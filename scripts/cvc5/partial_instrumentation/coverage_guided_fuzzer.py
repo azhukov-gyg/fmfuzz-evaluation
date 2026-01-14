@@ -2264,8 +2264,9 @@ class CoverageGuidedFuzzer:
                         dynamic_iterations = self._score_to_iterations(perf_score)
                     
                     # Log test pickup with AFL score factors
+                    # Log EVERY seed to see all decision points, but only some mutants
                     queue_size = self._get_queue_size()
-                    should_log = is_mutant or (generation == 0 and self._get_stat('tests_processed') % 10 == 0)
+                    should_log = (generation == 0) or is_mutant  # Log all seeds, all mutants
                     if should_log:
                         if is_calibration:
                             test_type = "seed[CAL]"
