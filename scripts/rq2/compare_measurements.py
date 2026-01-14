@@ -123,6 +123,22 @@ def compare_measurements(measurements_dir: str) -> dict:
                 "v2_vs_v1": v2_count - v1_count if v1_count > 0 else None,
             })
         
+        # Line coverage metrics
+        b_lines_hit = b.get('lines_hit', 0)
+        b_lines_total = b.get('lines_total', 0)
+        v1_lines_hit = v1.get('lines_hit', 0)
+        v1_lines_total = v1.get('lines_total', 0)
+        v2_lines_hit = v2.get('lines_hit', 0)
+        v2_lines_total = v2.get('lines_total', 0)
+        
+        # Branch coverage metrics
+        b_branches_taken = b.get('branches_taken', 0)
+        b_branches_total = b.get('branches_total', 0)
+        v1_branches_taken = v1.get('branches_taken', 0)
+        v1_branches_total = v1.get('branches_total', 0)
+        v2_branches_taken = v2.get('branches_taken', 0)
+        v2_branches_total = v2.get('branches_total', 0)
+        
         results.append({
             "commit": commit,
             "total_changed_functions": total_functions,
@@ -131,33 +147,57 @@ def compare_measurements(measurements_dir: str) -> dict:
                 "recipes_processed": b_recipes,
                 "successful_runs": b.get('successful_runs', 0),
                 "failed_runs": b.get('failed_runs', 0),
-                # NEW METRICS - can't be gamed by iterations
+                # Function coverage metrics
                 "functions_covered": b_funcs_covered,
                 "coverage_breadth_pct": round(100.0 * b_funcs_covered / total_functions, 1) if total_functions > 0 else 0,
-                "exclusive_functions": b_only,  # Functions ONLY baseline covers
+                "exclusive_functions": b_only,
                 "calls_per_recipe": round(b_total / b_recipes, 2) if b_recipes > 0 else 0,
+                # Line coverage
+                "lines_hit": b_lines_hit,
+                "lines_total": b_lines_total,
+                "line_coverage_pct": round(100.0 * b_lines_hit / b_lines_total, 1) if b_lines_total > 0 else 0,
+                # Branch coverage
+                "branches_taken": b_branches_taken,
+                "branches_total": b_branches_total,
+                "branch_coverage_pct": round(100.0 * b_branches_taken / b_branches_total, 1) if b_branches_total > 0 else 0,
             },
             "variant1": {
                 "total_function_calls": v1_total,
                 "recipes_processed": v1_recipes,
                 "successful_runs": v1.get('successful_runs', 0),
                 "failed_runs": v1.get('failed_runs', 0),
-                # NEW METRICS
+                # Function coverage metrics
                 "functions_covered": v1_funcs_covered,
                 "coverage_breadth_pct": round(100.0 * v1_funcs_covered / total_functions, 1) if total_functions > 0 else 0,
                 "exclusive_functions": v1_only,
                 "calls_per_recipe": round(v1_total / v1_recipes, 2) if v1_recipes > 0 else 0,
+                # Line coverage
+                "lines_hit": v1_lines_hit,
+                "lines_total": v1_lines_total,
+                "line_coverage_pct": round(100.0 * v1_lines_hit / v1_lines_total, 1) if v1_lines_total > 0 else 0,
+                # Branch coverage
+                "branches_taken": v1_branches_taken,
+                "branches_total": v1_branches_total,
+                "branch_coverage_pct": round(100.0 * v1_branches_taken / v1_branches_total, 1) if v1_branches_total > 0 else 0,
             },
             "variant2": {
                 "total_function_calls": v2_total,
                 "recipes_processed": v2_recipes,
                 "successful_runs": v2.get('successful_runs', 0),
                 "failed_runs": v2.get('failed_runs', 0),
-                # NEW METRICS
+                # Function coverage metrics
                 "functions_covered": v2_funcs_covered,
                 "coverage_breadth_pct": round(100.0 * v2_funcs_covered / total_functions, 1) if total_functions > 0 else 0,
                 "exclusive_functions": v2_only,
                 "calls_per_recipe": round(v2_total / v2_recipes, 2) if v2_recipes > 0 else 0,
+                # Line coverage
+                "lines_hit": v2_lines_hit,
+                "lines_total": v2_lines_total,
+                "line_coverage_pct": round(100.0 * v2_lines_hit / v2_lines_total, 1) if v2_lines_total > 0 else 0,
+                # Branch coverage
+                "branches_taken": v2_branches_taken,
+                "branches_total": v2_branches_total,
+                "branch_coverage_pct": round(100.0 * v2_branches_taken / v2_branches_total, 1) if v2_branches_total > 0 else 0,
             },
             "function_comparison": function_comparison,
         })
@@ -170,18 +210,26 @@ def compare_measurements(measurements_dir: str) -> dict:
         "avg_baseline_calls": sum(r['baseline']['total_function_calls'] for r in results) / n if results else 0,
         "avg_variant1_calls": sum(r['variant1']['total_function_calls'] for r in results) / n if results else 0,
         "avg_variant2_calls": sum(r['variant2']['total_function_calls'] for r in results) / n if results else 0,
-        # NEW: Coverage breadth (CAN'T be gamed - measures diversity)
+        # Function coverage breadth (CAN'T be gamed - measures diversity)
         "avg_baseline_coverage_pct": sum(r['baseline']['coverage_breadth_pct'] for r in results) / n if results else 0,
         "avg_variant1_coverage_pct": sum(r['variant1']['coverage_breadth_pct'] for r in results) / n if results else 0,
         "avg_variant2_coverage_pct": sum(r['variant2']['coverage_breadth_pct'] for r in results) / n if results else 0,
-        # NEW: Exclusive coverage (functions ONLY covered by this variant)
+        # Exclusive coverage (functions ONLY covered by this variant)
         "total_baseline_exclusive": sum(r['baseline']['exclusive_functions'] for r in results) if results else 0,
         "total_variant1_exclusive": sum(r['variant1']['exclusive_functions'] for r in results) if results else 0,
         "total_variant2_exclusive": sum(r['variant2']['exclusive_functions'] for r in results) if results else 0,
-        # NEW: Efficiency (calls per recipe)
+        # Efficiency (calls per recipe)
         "avg_baseline_calls_per_recipe": sum(r['baseline']['calls_per_recipe'] for r in results) / n if results else 0,
         "avg_variant1_calls_per_recipe": sum(r['variant1']['calls_per_recipe'] for r in results) / n if results else 0,
         "avg_variant2_calls_per_recipe": sum(r['variant2']['calls_per_recipe'] for r in results) / n if results else 0,
+        # Line coverage
+        "avg_baseline_line_coverage_pct": sum(r['baseline']['line_coverage_pct'] for r in results) / n if results else 0,
+        "avg_variant1_line_coverage_pct": sum(r['variant1']['line_coverage_pct'] for r in results) / n if results else 0,
+        "avg_variant2_line_coverage_pct": sum(r['variant2']['line_coverage_pct'] for r in results) / n if results else 0,
+        # Branch coverage
+        "avg_baseline_branch_coverage_pct": sum(r['baseline']['branch_coverage_pct'] for r in results) / n if results else 0,
+        "avg_variant1_branch_coverage_pct": sum(r['variant1']['branch_coverage_pct'] for r in results) / n if results else 0,
+        "avg_variant2_branch_coverage_pct": sum(r['variant2']['branch_coverage_pct'] for r in results) / n if results else 0,
     }
     
     # Calculate ratios (traditional)
@@ -196,6 +244,10 @@ def compare_measurements(measurements_dir: str) -> dict:
                                          key=lambda v: summary[f'avg_{v}_coverage_pct'])
     summary['winner_by_exclusive'] = max(['baseline', 'variant1', 'variant2'], 
                                           key=lambda v: summary[f'total_{v}_exclusive'])
+    summary['winner_by_line_coverage'] = max(['baseline', 'variant1', 'variant2'], 
+                                              key=lambda v: summary[f'avg_{v}_line_coverage_pct'])
+    summary['winner_by_branch_coverage'] = max(['baseline', 'variant1', 'variant2'], 
+                                                key=lambda v: summary[f'avg_{v}_branch_coverage_pct'])
     
     return {
         "status": "complete",
@@ -245,6 +297,18 @@ def print_summary(comparison: dict):
         print(f"  Baseline:  {s.get('avg_baseline_calls_per_recipe', 0):.1f}", file=sys.stderr)
         print(f"  Variant1:  {s.get('avg_variant1_calls_per_recipe', 0):.1f}", file=sys.stderr)
         print(f"  Variant2:  {s.get('avg_variant2_calls_per_recipe', 0):.1f}", file=sys.stderr)
+        
+        print(f"\n📊 METRIC 5: Line Coverage % (depth within changed functions)", file=sys.stderr)
+        print(f"  Baseline:  {s.get('avg_baseline_line_coverage_pct', 0):.1f}%", file=sys.stderr)
+        print(f"  Variant1:  {s.get('avg_variant1_line_coverage_pct', 0):.1f}%", file=sys.stderr)
+        print(f"  Variant2:  {s.get('avg_variant2_line_coverage_pct', 0):.1f}%", file=sys.stderr)
+        print(f"  🏆 Winner: {s.get('winner_by_line_coverage', 'N/A')}", file=sys.stderr)
+        
+        print(f"\n📊 METRIC 6: Branch Coverage % (decision paths)", file=sys.stderr)
+        print(f"  Baseline:  {s.get('avg_baseline_branch_coverage_pct', 0):.1f}%", file=sys.stderr)
+        print(f"  Variant1:  {s.get('avg_variant1_branch_coverage_pct', 0):.1f}%", file=sys.stderr)
+        print(f"  Variant2:  {s.get('avg_variant2_branch_coverage_pct', 0):.1f}%", file=sys.stderr)
+        print(f"  🏆 Winner: {s.get('winner_by_branch_coverage', 'N/A')}", file=sys.stderr)
         
         print("\n" + "="*70, file=sys.stderr)
     else:

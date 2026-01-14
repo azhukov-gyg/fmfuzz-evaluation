@@ -129,13 +129,31 @@ def load_changed_functions(changed_functions_file: str) -> Set[str]:
         return set()
 
 
-def extract_function_counts_fastcov(
+def extract_coverage_fastcov(
     build_dir: str,
     gcov_cmd: str,
     changed_functions: Set[str]
-) -> Dict[str, int]:
-    """Extract function call counts from gcov data using fastcov."""
-    counts = {}
+) -> Dict[str, any]:
+    """
+    Extract function, line, and branch coverage from gcov data using fastcov.
+    
+    Returns dict with:
+        - function_counts: {func_key: call_count}
+        - line_coverage: {file:line: hit_count} for lines in changed functions
+        - branch_coverage: {file:line:branch_id: taken_count}
+        - summary: {lines_hit, branches_taken, total_lines, total_branches}
+    """
+    result = {
+        "function_counts": {},
+        "line_coverage": {},
+        "branch_coverage": {},
+        "summary": {
+            "lines_hit": 0,
+            "lines_total": 0,
+            "branches_taken": 0,
+            "branches_total": 0,
+        }
+    }
     fastcov_output = None
     
     # Debug: count .gcda files
@@ -149,7 +167,7 @@ def extract_function_counts_fastcov(
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             fastcov_output = f.name
         
-        result = subprocess.run(
+        cmd_result = subprocess.run(
             [
                 "fastcov",
                 "--gcov", gcov_cmd,
@@ -164,11 +182,11 @@ def extract_function_counts_fastcov(
             timeout=300
         )
         
-        log(f"[GCOV DEBUG] fastcov return code: {result.returncode}")
-        if result.stderr:
-            log(f"[GCOV DEBUG] fastcov stderr: {result.stderr[:500]}")
+        log(f"[GCOV DEBUG] fastcov return code: {cmd_result.returncode}")
+        if cmd_result.stderr:
+            log(f"[GCOV DEBUG] fastcov stderr: {cmd_result.stderr[:500]}")
         
-        if result.returncode == 0 and os.path.exists(fastcov_output):
+        if cmd_result.returncode == 0 and os.path.exists(fastcov_output):
             with open(fastcov_output, 'r') as f:
                 fastcov_data = json.load(f)
             
@@ -198,6 +216,7 @@ def extract_function_counts_fastcov(
             # Parse changed_functions to extract file:line for matching
             # Format: "src/path/file.cpp:function_name:line_number"
             changed_file_lines = {}  # {(relative_path, line): full_function_key}
+            func_line_ranges = {}    # {relative_path: [(start_line, end_line, func_key), ...]}
             for func_key in changed_functions:
                 parts = func_key.rsplit(':', 2)
                 if len(parts) >= 2:
@@ -206,6 +225,10 @@ def extract_function_counts_fastcov(
                         file_path = parts[0].split(':')[0]  # Get file path before function name
                         # Use the relative path (e.g., "src/theory/arith/rewriter/addition.cpp")
                         changed_file_lines[(file_path, line_num)] = func_key
+                        # Track files with changed functions for line/branch filtering
+                        if file_path not in func_line_ranges:
+                            func_line_ranges[file_path] = []
+                        func_line_ranges[file_path].append((line_num, func_key))
                     except ValueError:
                         pass
             
@@ -223,6 +246,8 @@ def extract_function_counts_fastcov(
                 # fastcov structure: source_data['']['functions'] (empty string key!)
                 inner_data = source_data.get('', {})
                 funcs = inner_data.get('functions', {}) if isinstance(inner_data, dict) else {}
+                lines_data = inner_data.get('lines', {}) if isinstance(inner_data, dict) else {}
+                branches_data = inner_data.get('branches', []) if isinstance(inner_data, dict) else []
                 total_funcs_found += len(funcs)
                 
                 # Extract relative path from /cvc5/ (e.g., "src/theory/arith/...")
@@ -239,10 +264,18 @@ def extract_function_counts_fastcov(
                     sample_func = list(funcs.items())[0]
                     log(f"[GCOV DEBUG]   Sample func: {sample_func[0][:60]}")
                     log(f"[GCOV DEBUG]   Sample func_data: {sample_func[1]}")
+                    if lines_data:
+                        sample_lines = list(lines_data.items())[:3]
+                        log(f"[GCOV DEBUG]   Sample lines: {sample_lines}")
+                    if branches_data:
+                        log(f"[GCOV DEBUG]   Sample branches: {branches_data[:2]}")
                     sample_shown = True
                 
+                # Check if this is a target file with changed functions
+                is_target_file = source_relative in target_files
+                
                 # If this is one of our target files, show all its functions and lines
-                if source_relative in target_files:
+                if is_target_file:
                     log(f"[GCOV DEBUG] FOUND TARGET FILE: {source_relative}")
                     log(f"[GCOV DEBUG]   Full path: {source_file}")
                     log(f"[GCOV DEBUG]   Functions in file ({len(funcs)}):")
@@ -254,6 +287,7 @@ def extract_function_counts_fastcov(
                         marker = " <-- WANTED" if sl in wanted else ""
                         log(f"[GCOV DEBUG]     line {sl}: {ec} calls{marker}")
                 
+                # Extract function counts
                 for func_name, func_data in funcs.items():
                     exec_count = func_data.get('execution_count', 0)
                     start_line = func_data.get('start_line', 0)
@@ -265,12 +299,39 @@ def extract_function_counts_fastcov(
                     match_key = (source_relative, start_line)
                     if match_key in changed_file_lines:
                         full_key = changed_file_lines[match_key]
-                        counts[full_key] = counts.get(full_key, 0) + exec_count
+                        result["function_counts"][full_key] = result["function_counts"].get(full_key, 0) + exec_count
                         if exec_count > 0:
                             log(f"[GCOV DEBUG] MATCHED: {source_relative}:{start_line} -> {exec_count} calls")
+                
+                # Extract line coverage for target files
+                if is_target_file and lines_data:
+                    for line_num_str, hit_count in lines_data.items():
+                        try:
+                            line_num = int(line_num_str)
+                            line_key = f"{source_relative}:{line_num}"
+                            result["line_coverage"][line_key] = hit_count
+                            result["summary"]["lines_total"] += 1
+                            if hit_count > 0:
+                                result["summary"]["lines_hit"] += 1
+                        except (ValueError, TypeError):
+                            pass
+                
+                # Extract branch coverage for target files
+                # fastcov branch format: [[line, block_id, branch_id, taken_count], ...]
+                if is_target_file and branches_data:
+                    for branch_entry in branches_data:
+                        if isinstance(branch_entry, (list, tuple)) and len(branch_entry) >= 4:
+                            line_num, block_id, branch_id, taken_count = branch_entry[:4]
+                            branch_key = f"{source_relative}:{line_num}:{block_id}:{branch_id}"
+                            result["branch_coverage"][branch_key] = taken_count
+                            result["summary"]["branches_total"] += 1
+                            if taken_count > 0:
+                                result["summary"]["branches_taken"] += 1
             
             log(f"[GCOV DEBUG] Total functions found: {total_funcs_found}")
             log(f"[GCOV DEBUG] Found {len(all_funcs)} functions with >0 execution count")
+            log(f"[GCOV DEBUG] Line coverage: {result['summary']['lines_hit']}/{result['summary']['lines_total']} lines hit")
+            log(f"[GCOV DEBUG] Branch coverage: {result['summary']['branches_taken']}/{result['summary']['branches_total']} branches taken")
             # Show top 5 by execution count
             if all_funcs:
                 top_funcs = sorted(all_funcs, key=lambda x: -x[1])[:5]
@@ -280,7 +341,9 @@ def extract_function_counts_fastcov(
             log(f"[GCOV DEBUG] fastcov failed or no output")
         
     except Exception as e:
-        log(f"Error extracting function counts: {e}")
+        log(f"Error extracting coverage: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         if fastcov_output and os.path.exists(fastcov_output):
             try:
@@ -288,7 +351,7 @@ def extract_function_counts_fastcov(
             except:
                 pass
     
-    return counts
+    return result
 
 
 def reset_gcda_files(build_dir: str):
@@ -695,14 +758,23 @@ def replay_recipes_optimized(
     for p in processes:
         p.join()
     
-    # Extract function counts once at the end (all .gcda files have accumulated)
+    # Extract coverage once at the end (all .gcda files have accumulated)
     log("")
-    log("All workers finished. Extracting function counts...")
+    log("All workers finished. Extracting coverage (functions, lines, branches)...")
+    coverage_data = extract_coverage_fastcov(build_dir, gcov_cmd, changed_functions)
+    
+    # Initialize function counts with zeros for all tracked functions
     function_counts: Dict[str, int] = {fn: 0 for fn in changed_functions}
-    counts = extract_function_counts_fastcov(build_dir, gcov_cmd, changed_functions)
-    for func, count in counts.items():
+    for func, count in coverage_data["function_counts"].items():
         function_counts[func] = function_counts.get(func, 0) + count
+    
+    line_coverage = coverage_data["line_coverage"]
+    branch_coverage = coverage_data["branch_coverage"]
+    coverage_summary = coverage_data["summary"]
+    
     log(f"Total function calls: {sum(function_counts.values()):,}")
+    log(f"Line coverage: {coverage_summary['lines_hit']}/{coverage_summary['lines_total']} lines hit")
+    log(f"Branch coverage: {coverage_summary['branches_taken']}/{coverage_summary['branches_total']} branches taken")
     
     elapsed = time.time() - start_time
     
@@ -717,9 +789,19 @@ def replay_recipes_optimized(
         "total_mutations_generated": total_mutations,
         "unique_seeds": len(seed_groups_list),
         "num_workers": actual_workers,
+        # Function coverage
         "function_counts": function_counts,
         "total_function_calls": sum(function_counts.values()),
         "changed_functions_tracked": len(changed_functions),
+        # Line coverage (new)
+        "line_coverage": line_coverage,
+        "lines_hit": coverage_summary["lines_hit"],
+        "lines_total": coverage_summary["lines_total"],
+        # Branch coverage (new)
+        "branch_coverage": branch_coverage,
+        "branches_taken": coverage_summary["branches_taken"],
+        "branches_total": coverage_summary["branches_total"],
+        # Timing
         "elapsed_seconds": elapsed,
         "recipes_per_second": len(recipes) / elapsed if elapsed > 0 else 0
     }
@@ -741,7 +823,14 @@ def replay_recipes_optimized(
     log(f"Total mutations generated: {results['total_mutations_generated']}")
     log(f"Unique seeds: {results['unique_seeds']}")
     log(f"Workers used: {results['num_workers']}")
-    log(f"Total function calls: {results['total_function_calls']:,}")
+    log(f"")
+    log(f"COVERAGE METRICS:")
+    log(f"  Function calls: {results['total_function_calls']:,}")
+    lines_pct = 100.0 * results['lines_hit'] / results['lines_total'] if results['lines_total'] > 0 else 0
+    log(f"  Lines hit: {results['lines_hit']:,}/{results['lines_total']:,} ({lines_pct:.1f}%)")
+    branches_pct = 100.0 * results['branches_taken'] / results['branches_total'] if results['branches_total'] > 0 else 0
+    log(f"  Branches taken: {results['branches_taken']:,}/{results['branches_total']:,} ({branches_pct:.1f}%)")
+    log(f"")
     log(f"Time: {elapsed:.1f}s ({results['recipes_per_second']:.1f} recipes/sec)")
     log(f"\nTop 10 functions by call count:")
     sorted_funcs = sorted(function_counts.items(), key=lambda x: x[1], reverse=True)[:10]
@@ -759,8 +848,17 @@ def merge_results(result_files: List[str], output_file: str) -> dict:
         "recipes_processed": 0,
         "successful_runs": 0,
         "failed_runs": 0,
+        # Function coverage
         "function_counts": {},
         "total_function_calls": 0,
+        # Line coverage
+        "line_coverage": {},
+        "lines_hit": 0,
+        "lines_total": 0,
+        # Branch coverage
+        "branch_coverage": {},
+        "branches_taken": 0,
+        "branches_total": 0,
     }
     
     for result_file in result_files:
@@ -771,10 +869,24 @@ def merge_results(result_files: List[str], output_file: str) -> dict:
         merged["successful_runs"] += data.get("successful_runs", 0)
         merged["failed_runs"] += data.get("failed_runs", 0)
         
+        # Merge function counts (sum across runs)
         for func, count in data.get("function_counts", {}).items():
             merged["function_counts"][func] = merged["function_counts"].get(func, 0) + count
+        
+        # Merge line coverage (sum hit counts)
+        for line_key, hit_count in data.get("line_coverage", {}).items():
+            merged["line_coverage"][line_key] = merged["line_coverage"].get(line_key, 0) + hit_count
+        
+        # Merge branch coverage (sum taken counts)
+        for branch_key, taken_count in data.get("branch_coverage", {}).items():
+            merged["branch_coverage"][branch_key] = merged["branch_coverage"].get(branch_key, 0) + taken_count
     
+    # Compute aggregates
     merged["total_function_calls"] = sum(merged["function_counts"].values())
+    merged["lines_hit"] = sum(1 for v in merged["line_coverage"].values() if v > 0)
+    merged["lines_total"] = len(merged["line_coverage"])
+    merged["branches_taken"] = sum(1 for v in merged["branch_coverage"].values() if v > 0)
+    merged["branches_total"] = len(merged["branch_coverage"])
     
     with open(output_file, 'w') as f:
         json.dump(merged, f, indent=2)

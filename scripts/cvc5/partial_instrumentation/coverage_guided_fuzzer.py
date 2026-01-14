@@ -2198,14 +2198,23 @@ class CoverageGuidedFuzzer:
                         dynamic_iterations = 0  # No mutations during calibration
                     elif generation == 0:
                         # POST-CALIBRATION: Seeds re-queued with proper score
+                        # Use ACTUAL edges from calibration data, not average!
                         runtime_ms = runtime_priority * 1000  # Convert to ms
-                        estimated_edges = int(self._get_avg_coverage())
+                        
+                        # Look up actual edge count from calibration
+                        with self.calibration_data_lock:
+                            cal_data = self.calibration_data.get(test_path_str)
+                        if cal_data:
+                            actual_edges = cal_data[1]  # (runtime_sec, edges_hit, perf_score, weight)
+                        else:
+                            actual_edges = int(self._get_avg_coverage())  # Fallback
+                        
                         path_freq = self._get_test_path_frequency(test_path_str)
                         owned_edges = self._get_owned_edges_count(test_path_str)
                         
                         # Get individual factors for debug logging
                         S = self._get_speed_base(runtime_ms)
-                        C = self._get_coverage_multiplier(estimated_edges)
+                        C = self._get_coverage_multiplier(actual_edges)
                         N, _ = self._get_newcomer_multiplier(test_path_str)
                         D = self._get_depth_multiplier(generation)
                         F = self._get_rarity_multiplier(path_freq)
@@ -2213,15 +2222,23 @@ class CoverageGuidedFuzzer:
                         perf_score = S * C * N * D * F * U
                         dynamic_iterations = self._score_to_iterations(perf_score)
                     else:
-                        # Mutants: estimate score from previous runtime and average coverage
+                        # Mutants: use parent's edges from calibration if available, else average
                         runtime_ms = runtime_priority * 1000  # Convert to ms
-                        estimated_edges = int(self._get_avg_coverage())
+                        
+                        # Try to get actual edges from calibration (for mutants from known seeds)
+                        with self.calibration_data_lock:
+                            cal_data = self.calibration_data.get(test_path_str)
+                        if cal_data:
+                            actual_edges = cal_data[1]  # Has been calibrated
+                        else:
+                            actual_edges = int(self._get_avg_coverage())  # New mutant, use average
+                        
                         path_freq = self._get_test_path_frequency(test_path_str)
                         owned_edges = self._get_owned_edges_count(test_path_str)
                         
                         # Get individual factors for debug logging
                         S = self._get_speed_base(runtime_ms)
-                        C = self._get_coverage_multiplier(estimated_edges)
+                        C = self._get_coverage_multiplier(actual_edges)
                         N, _ = self._get_newcomer_multiplier(test_path_str)
                         D = self._get_depth_multiplier(generation)
                         F = self._get_rarity_multiplier(path_freq)
