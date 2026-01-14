@@ -269,7 +269,9 @@ def extract_coverage_fastcov(
                         sample_lines = list(lines_data.items())[:3]
                         log(f"[GCOV DEBUG]   Sample lines: {sample_lines}")
                     if branches_data:
-                        log(f"[GCOV DEBUG]   Sample branches: {branches_data[:2]}")
+                        # branches_data is a dict: {line_num_str: [branch_counts...]}
+                        sample_branches = list(branches_data.items())[:2]
+                        log(f"[GCOV DEBUG]   Sample branches: {sample_branches}")
                     sample_shown = True
                 
                 # Check if this is a target file with changed functions
@@ -318,16 +320,22 @@ def extract_coverage_fastcov(
                             pass
                 
                 # Extract branch coverage for target files
-                # fastcov branch format: [[line, block_id, branch_id, taken_count], ...]
-                if is_target_file and branches_data:
-                    for branch_entry in branches_data:
-                        if isinstance(branch_entry, (list, tuple)) and len(branch_entry) >= 4:
-                            line_num, block_id, branch_id, taken_count = branch_entry[:4]
-                            branch_key = f"{source_relative}:{line_num}:{block_id}:{branch_id}"
-                            result["branch_coverage"][branch_key] = taken_count
-                            result["summary"]["branches_total"] += 1
-                            if taken_count > 0:
-                                result["summary"]["branches_taken"] += 1
+                # fastcov branch format with --branch-coverage: {line_num_str: [taken_count, taken_count, ...]}
+                # Each pair of values represents taken/not-taken for a branch
+                if is_target_file and branches_data and isinstance(branches_data, dict):
+                    for line_num_str, branch_counts in branches_data.items():
+                        try:
+                            line_num = int(line_num_str)
+                            # branch_counts is a list of taken counts for all branches on this line
+                            # Process pairs: branch_counts[0::2] are one direction, [1::2] are other
+                            for branch_idx, taken_count in enumerate(branch_counts):
+                                branch_key = f"{source_relative}:{line_num}:{branch_idx}"
+                                result["branch_coverage"][branch_key] = taken_count
+                                result["summary"]["branches_total"] += 1
+                                if taken_count > 0:
+                                    result["summary"]["branches_taken"] += 1
+                        except (ValueError, TypeError):
+                            pass
             
             log(f"[GCOV DEBUG] Total functions found: {total_funcs_found}")
             log(f"[GCOV DEBUG] Found {len(all_funcs)} functions with >0 execution count")
