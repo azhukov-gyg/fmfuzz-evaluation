@@ -172,6 +172,7 @@ def extract_coverage_fastcov(
                 "fastcov",
                 "--gcov", gcov_cmd,
                 "--search-directory", build_dir,
+                "--branch-coverage",  # Enable branch coverage collection
                 "--output", fastcov_output,
                 "--exclude", "/usr/include/*",
                 "--exclude", "*/deps/*",
