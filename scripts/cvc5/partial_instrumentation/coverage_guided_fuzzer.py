@@ -349,6 +349,10 @@ class CoverageGuidedFuzzer:
         """
         avg_cov = self._get_avg_coverage()
         
+        # Prevent division by zero
+        if avg_cov <= 0:
+            return 1.0
+        
         ratio = edges_hit / avg_cov
         
         # Big bonuses for high coverage, NO penalty for low coverage
@@ -968,7 +972,16 @@ class CoverageGuidedFuzzer:
         self._queue_push_batch(items_to_queue)
         
         favored_count = sum(1 for _, _, _, _, p in items_to_queue if self.test_favored.get(p, False))
+        
+        # Debug: show calibration data statistics
+        with self.calibration_data_lock:
+            cal_size = len(self.calibration_data)
+            nonzero_edges = sum(1 for data in self.calibration_data.values() if data[1] > 0)
+            max_edges = max((data[1] for data in self.calibration_data.values()), default=0)
+            edges_list = sorted([data[1] for data in self.calibration_data.values() if data[1] > 0], reverse=True)[:5]
+        
         print(f"[INFO] Re-queued {len(items_to_queue)} calibrated seeds ({favored_count} favored, {slow_tests_count} slow) for fuzzing")
+        print(f"[DEBUG-CAL] calibration_data: {cal_size} entries, {nonzero_edges} with edges>0, max={max_edges}, top5={edges_list}")
 
     def _buffer_mutants(self, mutant_items: list):
         """Buffer mutant queue items to be flushed in sorted order by main loop."""
@@ -2207,7 +2220,9 @@ class CoverageGuidedFuzzer:
                         if cal_data:
                             actual_edges = cal_data[1]  # (runtime_sec, edges_hit, perf_score, weight)
                         else:
-                            actual_edges = int(self._get_avg_coverage())  # Fallback
+                            # Seed not found in calibration_data - use avg_coverage as fallback
+                            # Use max(1, round()) to avoid 0 edges which would make C=1.0
+                            actual_edges = max(1, int(round(self._get_avg_coverage())))
                         
                         path_freq = self._get_test_path_frequency(test_path_str)
                         owned_edges = self._get_owned_edges_count(test_path_str)
@@ -2231,7 +2246,9 @@ class CoverageGuidedFuzzer:
                         if cal_data:
                             actual_edges = cal_data[1]  # Has been calibrated
                         else:
-                            actual_edges = int(self._get_avg_coverage())  # New mutant, use average
+                            # New mutant without calibration - use avg_coverage directly
+                            # Don't convert to int (which would round 0.6 to 0)
+                            actual_edges = max(1, int(round(self._get_avg_coverage())))  # At least 1
                         
                         path_freq = self._get_test_path_frequency(test_path_str)
                         owned_edges = self._get_owned_edges_count(test_path_str)
@@ -2255,8 +2272,8 @@ class CoverageGuidedFuzzer:
                             print(f"[W{worker_id}] {test_type} {test_name} iter=0 q={queue_size}", flush=True)
                         else:
                             test_type = f"gen{generation}" if is_mutant else "seed"
-                            # Show AFL score factors: S(speed) C(cov) N(new) D(depth) F(rare) U(own)
-                            print(f"[W{worker_id}] {test_type} {test_name} S={S} C={C:.1f} N={N:.0f} D={D} F={F:.1f} U={U:.1f} → score={perf_score:.0f} iter={dynamic_iterations} q={queue_size}", flush=True)
+                            # Show AFL score factors: S(speed) C(cov) N(new) D(depth) F(rare) U(own) + actual edges (e)
+                            print(f"[W{worker_id}] {test_type} {test_name} e={actual_edges} S={S} C={C:.1f} N={N:.0f} D={D} F={F:.1f} U={U:.1f} → score={perf_score:.0f} iter={dynamic_iterations} q={queue_size}", flush=True)
                     
                     # Mark worker as busy
                     self.worker_status[worker_id] = test_name
