@@ -255,6 +255,7 @@ class CoverageGuidedFuzzer:
         # Newcomer tracking: test_path -> bonus value (decremented each time processed)
         # New tests start with bonus=4 for initial boost
         self.test_newcomer = self.manager.dict()
+        self.newcomer_proc_count = self.manager.dict()  # Track processing count for slower decay
         self.newcomer_lock = multiprocessing.Lock()
         
         # Path frequency tracking (AFL's n_fuzz): coverage_hash -> times_seen
@@ -387,13 +388,29 @@ class CoverageGuidedFuzzer:
             return 1.0, False     # No boost
     
     def _decrement_newcomer(self, test_path: str):
-        """Decrement newcomer bonus after processing."""
+        """
+        Decrement newcomer bonus after processing (slower decay for slow targets).
+        
+        For slow targets (120s timeout), we only decay every 3rd processing.
+        This keeps rare new-coverage discoverers prioritized longer since
+        we process fewer tests per hour than fast binary targets.
+        """
         with self.newcomer_lock:
             bonus = self.test_newcomer.get(test_path, 0)
-            if bonus >= 8:
-                self.test_newcomer[test_path] = bonus - 4  # 8 -> 4
-            elif bonus >= 4:
-                self.test_newcomer[test_path] = bonus - 4  # 4 -> 0
+            if bonus <= 0:
+                return
+            
+            # Track processing count for this test
+            proc_count = self.newcomer_proc_count.get(test_path, 0) + 1
+            self.newcomer_proc_count[test_path] = proc_count
+            
+            # Only decay every 3rd processing (slower decay for slow targets)
+            if proc_count % 3 != 0:
+                return
+            
+            # Gentler decay: -2 for high bonus, -1 for low
+            if bonus >= 6:
+                self.test_newcomer[test_path] = bonus - 2
             elif bonus > 0:
                 self.test_newcomer[test_path] = bonus - 1
     
@@ -404,17 +421,21 @@ class CoverageGuidedFuzzer:
     
     def _get_depth_multiplier(self, generation: int) -> float:
         """
-        AFL-style depth factor.
+        AFL-style depth factor (adjusted for slow targets with 120s timeout).
         Deeper tests (more mutations from original) get higher multiplier
         because they represent productive lineages worth exploring further.
         
-        Returns multiplier in [1, 5].
+        Original AFL thresholds (gen 4+ for bonus) are too high for slow targets
+        where we rarely reach gen 4 in 1-hour budget. Lowered to give bonus
+        starting at gen 2.
+        
+        Returns multiplier in [1.0, 4.5].
         """
-        if generation <= 3:   return 1
-        if generation <= 7:   return 2
-        if generation <= 13:  return 3
-        if generation <= 25:  return 4
-        return 5
+        if generation <= 1:   return 1.0   # seed + first mutations
+        if generation <= 3:   return 1.8   # early interesting depth
+        if generation <= 6:   return 2.5
+        if generation <= 10:  return 3.5
+        return 4.5
     
     def _hash_coverage(self, trace_bits: bytes) -> str:
         """
@@ -765,6 +786,66 @@ class CoverageGuidedFuzzer:
             self.pending_favored.value = pending
         
         print(f"[CULL] Marked {len(favored_tests)} tests as favored ({pending} pending)", flush=True)
+    
+    def _recalculate_queue_weights(self):
+        """
+        Recalculate weights for all queued items using current averages.
+        
+        AFL++ does this every iteration. We do it every 10 tests or 5 minutes
+        since Python is slower. This ensures:
+        - Running averages affect existing queue items
+        - Favored status changes propagate
+        - Parent success rate (when implemented) affects queue
+        
+        Cost: O(n log n) where n = queue size. ~50ms for n=200.
+        """
+        # Drain the current queue
+        items = []
+        drained = 0
+        while not self._queue_empty():
+            item = self._queue_pop(timeout=0.01)
+            if item:
+                items.append(item)
+                drained += 1
+            else:
+                break
+        
+        if not items:
+            return
+        
+        # Recalculate scores with current state
+        new_items = []
+        for runtime_priority, new_cov_rank, generation, seq, path in items:
+            # Get calibration data if available
+            with self.calibration_data_lock:
+                cal_data = self.calibration_data.get(path)
+            
+            if cal_data:
+                runtime_ms = cal_data[0] * 1000
+                edges = cal_data[1]
+            else:
+                # Use current averages for uncalibrated items
+                runtime_ms = self._get_avg_runtime_ms()
+                edges = max(1, int(self._get_avg_coverage()))
+            
+            # Recalculate score with current averages and state
+            path_freq = self._get_test_path_frequency(path)
+            owned_edges = self._get_owned_edges_count(path)
+            new_score = self._calculate_perf_score(
+                runtime_ms, edges, generation, path, path_freq, owned_edges
+            )
+            
+            # Convert score to priority (lower = higher priority)
+            # Invert score: high score -> low runtime_priority -> picked first
+            new_runtime_priority = 1.0 / max(1.0, new_score / 100.0)
+            
+            new_items.append((new_runtime_priority, new_cov_rank, generation, seq, path))
+        
+        # Re-sort and push back
+        new_items.sort()
+        self._queue_push_batch(new_items)
+        
+        print(f"[RECALC] Recalculated weights for {len(new_items)} queued items", flush=True)
     
     def _weighted_random_select(self, tests: list, count: int) -> list:
         """
@@ -2479,6 +2560,11 @@ class CoverageGuidedFuzzer:
                             if mutant_files:
                                 print(f"[WORKER {worker_id}] [MUTANT] No coverage at all, discarding {len(mutant_files)} mutant(s)")
                                 self._inc_stat('mutants_discarded_no_coverage', len(mutant_files))
+                                
+                                # DIAGNOSTIC: Log zero coverage timing to evaluate two-stage timeout
+                                # If runtime is close to timeout (>100s), two-stage timeout would help
+                                print(f"[ZERO-COV] parent={test_name} runtime={runtime:.1f}s mutants={len(mutant_files)}", flush=True)
+                                
                             for mutant_file in mutant_files:
                                 try:
                                     mutant_file.unlink()
@@ -2545,6 +2631,10 @@ class CoverageGuidedFuzzer:
                                         self._inc_stat('mutants_with_new_coverage')
                                     else:
                                         self._inc_stat('mutants_with_existing_coverage')
+                                    
+                                    # DIAGNOSTIC: Log parent success rate for analysis
+                                    # This helps evaluate if certain parents consistently produce valid mutants
+                                    print(f"[PARENT-STAT] parent={test_name} valid={len(mutants_to_queue)} cov_type={coverage_type}", flush=True)
 
                                     # Sort by (runtime, new_cov_rank, generation, seq, path).
                                     mutants_to_queue.sort()
@@ -2674,6 +2764,12 @@ class CoverageGuidedFuzzer:
             last_status_log = time.time()
             status_log_interval = 30  # Log status every 30 seconds
             
+            # Periodic weight recalculation (AFL++ does every iteration, we do every 10 tests or 5 min)
+            last_recalc_time = time.time()
+            last_recalc_tests = 0
+            recalc_test_interval = 10   # Recalculate every 10 tests
+            recalc_time_interval = 300  # Or every 5 minutes
+            
             while not self.shutdown_event.is_set():
                 # Check timeout
                 if end_time and time.time() >= end_time:
@@ -2707,6 +2803,19 @@ class CoverageGuidedFuzzer:
                     if (not self._seed_phase_flushed) and self.seed_phase_done.is_set():
                         self._flush_seed_phase_mutants()
                         self._seed_phase_flushed = True
+                    
+                    # Periodic weight recalculation (AFL++ style, but less frequent)
+                    # This ensures queue priorities reflect current averages and state
+                    if self.calibration_done.is_set():
+                        tests_processed = self._get_stat('tests_processed')
+                        tests_since_recalc = tests_processed - last_recalc_tests
+                        time_since_recalc = current_time - last_recalc_time
+                        
+                        if tests_since_recalc >= recalc_test_interval or time_since_recalc >= recalc_time_interval:
+                            self._recalculate_queue_weights()
+                            self._cull_queue()
+                            last_recalc_tests = tests_processed
+                            last_recalc_time = current_time
 
                     # IMPORTANT: during calibration phase, do NOT refill seeds (we want exactly one pass).
                     if self.calibration_done.is_set() and self._queue_empty() and idle_workers > 0:
