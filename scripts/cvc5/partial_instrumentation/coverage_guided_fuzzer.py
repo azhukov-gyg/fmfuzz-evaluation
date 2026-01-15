@@ -964,7 +964,7 @@ class CoverageGuidedFuzzer:
             print(f"[QUEUE] Refilling with {len(items)} tests ({favored_count} favored, {skipped_count} excluded)")
         else:
             # Initial calibration - uniform ordering
-        items = [(0.0, 2, 0, self._next_seq(), name) for name in filtered_tests]
+            items = [(0.0, 2, 0, self._next_seq(), name) for name in filtered_tests]
         
         queue_size_before = self._get_queue_size()
         self._queue_push_batch(items)
