@@ -150,7 +150,7 @@ class CoverageGuidedFuzzer:
         self._validate_solvers()
         self.bugs_folder.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Multiprocessing primitives - use Queue instead of Manager.list for better performance
         self.manager = multiprocessing.Manager()
         
@@ -964,7 +964,7 @@ class CoverageGuidedFuzzer:
             print(f"[QUEUE] Refilling with {len(items)} tests ({favored_count} favored, {skipped_count} excluded)")
         else:
             # Initial calibration - uniform ordering
-            items = [(0.0, 2, 0, self._next_seq(), name) for name in filtered_tests]
+        items = [(0.0, 2, 0, self._next_seq(), name) for name in filtered_tests]
         
         queue_size_before = self._get_queue_size()
         self._queue_push_batch(items)
@@ -977,7 +977,7 @@ class CoverageGuidedFuzzer:
         if len(excluded_list) > 0:
             print(f"[QUEUE] [DEBUG] Excluded list has {len(excluded_list)} items: {excluded_list[:3]}...")
         sys.stdout.flush()
-
+    
     def _seed_phase_buffer_mutants(self, mutant_items: list):
         """Buffer gen1 mutant queue items during seed phase; flushed once seeds are done."""
         if not mutant_items:
@@ -1772,8 +1772,8 @@ class CoverageGuidedFuzzer:
         
         # Combine base flags + test-specific flags
         base_flags = " ".join(base_flags_list)
-        if test_flags:
-            base_flags = f"{base_flags} {test_flags}"
+            if test_flags:
+                base_flags = f"{base_flags} {test_flags}"
         
         solvers.append(f"{self.cvc5_path} {base_flags}")
         return ";".join(solvers)
@@ -1865,7 +1865,7 @@ class CoverageGuidedFuzzer:
         mutator = InlineTypeFuzz(test_path)
         if not mutator.parse():
             return (0, [], time.time() - start_time, [])
-        
+
         env = os.environ.copy()
         env['__AFL_SHM_ID'] = shm_id
         env['LLVM_PROFILE_FILE'] = str(self.profraw_dir / f"worker_{worker_id}_%p_%m.profraw")
@@ -1919,8 +1919,8 @@ class CoverageGuidedFuzzer:
                 random_suffix = uuid.uuid4().hex[:8]
                 bug_filename = f"{bug_type}-cvc5-{seed_name}-{random_suffix}.smt2"
                 bug_path = bugs_folder / bug_filename
-                shutil.copy(mutant_path, bug_path)
-                bug_files.append(bug_path)
+                    shutil.copy(mutant_path, bug_path)
+                    bug_files.append(bug_path)
                 self._inc_stat('bugs_found')
                 # Match yinyang behavior: stop mutating this seed when bug found
                 # to avoid finding duplicate/similar bugs from same seed
@@ -1932,10 +1932,10 @@ class CoverageGuidedFuzzer:
                 break
 
             # Read coverage from shared memory (trace_bits) for this mutant execution.
-            try:
+                try:
                 shm.seek(0)
                 trace_bits = shm.read(AFL_MAP_SIZE)
-            except Exception:
+                except Exception:
                 trace_bits = b'\x00' * AFL_MAP_SIZE
 
             edges_hit = sum(1 for b in trace_bits if b != 0)
@@ -1978,7 +1978,7 @@ class CoverageGuidedFuzzer:
 
             # Queue the mutant: (runtime, new_cov_rank, generation, seq, path_str)
             pending_name = f"gen{generation+1}_w{worker_id}_iter{i}_{mutant_path.name}"
-            pending_path = self.pending_mutants_dir / pending_name
+                pending_path = self.pending_mutants_dir / pending_name
             try:
                 shutil.move(str(mutant_path), str(pending_path))
             except Exception:
@@ -2007,6 +2007,10 @@ class CoverageGuidedFuzzer:
             
             # Update running averages for score calculation
             self._update_running_averages(runtime_i * 1000, edges_hit)
+            
+            # Store calibration data for mutant so it has accurate C (coverage) factor
+            # when processed later. Without this, mutants fall back to avg_coverage.
+            self._store_calibration_data(str(pending_path), runtime_i, edges_hit)
 
             mutant_item = (runtime_i, cov_rank, generation + 1, self._next_seq(), str(pending_path))
 
@@ -2391,28 +2395,28 @@ class CoverageGuidedFuzzer:
                     else:
                         # Run typefuzz (inline or subprocess) with dynamic iterations
                         time_remaining = self._get_time_remaining()
-                        
-                        if self.use_inline_mode:
+                    
+                    if self.use_inline_mode:
                             # Inline mode handles coverage per-mutant and queues directly
-                            exit_code, bug_files, runtime, mutant_files = self._run_inline_typefuzz(
+                        exit_code, bug_files, runtime, mutant_files = self._run_inline_typefuzz(
                                 test_path_obj, worker_id, scratch_folder, bugs_folder,
                                 generation, shm_id, shm, global_coverage_map, coverage_map_lock,
                                 timeout=self.per_test_timeout,
                                 iterations=dynamic_iterations,
                                 recipe_recorder=recipe_recorder,
-                            )
-                        else:
-                            exit_code, bug_files, runtime, mutant_files = self._run_typefuzz(
-                                test_path_obj, worker_id, scratch_folder, log_folder, bugs_folder, shm_id,
-                                per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
-                                keep_mutants=True,
+                        )
+                    else:
+                        exit_code, bug_files, runtime, mutant_files = self._run_typefuzz(
+                            test_path_obj, worker_id, scratch_folder, log_folder, bugs_folder, shm_id,
+                            per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
+                            keep_mutants=True,
                                 iterations=dynamic_iterations,
-                            )
-                        
-                        # Handle exit code
-                        action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
-                    self._inc_stat('tests_processed')
+                        )
                     
+                    # Handle exit code
+                    action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
+                    self._inc_stat('tests_processed')
+
                     # Track fuzz_level for AFL++ probabilistic skipping
                     # Increment only after actual fuzzing (not calibration)
                     if not is_calibration:
@@ -2572,79 +2576,84 @@ class CoverageGuidedFuzzer:
                                     pass
                             # Skip to next test
                             coverage_type = None
-                        
+                    
                         # Process mutants if they hit any coverage
-                        if coverage_type is not None and mutant_files:
-                            # Check disk space before queuing (TOP PRIORITY)
-                            can_queue = self._can_queue_mutants(len(mutant_files))
+                    if coverage_type is not None and mutant_files:
+                        # Check disk space before queuing (TOP PRIORITY)
+                        can_queue = self._can_queue_mutants(len(mutant_files))
+                        
+                        if not can_queue:
+                            # Disk space or pending limit exceeded
+                            free_mb = self._get_free_disk_space_mb()
+                            pending = self._count_pending_mutants()
+                            
+                            if coverage_type == "NEW":
+                                # For new coverage, try cleanup first
+                                self._cleanup_old_pending_mutants(self.max_pending_mutants // 2)
+                                can_queue = self._can_queue_mutants(len(mutant_files))
                             
                             if not can_queue:
-                                # Disk space or pending limit exceeded
-                                free_mb = self._get_free_disk_space_mb()
-                                pending = self._count_pending_mutants()
-                                
-                                if coverage_type == "NEW":
-                                    # For new coverage, try cleanup first
-                                    self._cleanup_old_pending_mutants(self.max_pending_mutants // 2)
-                                    can_queue = self._can_queue_mutants(len(mutant_files))
-                                
-                                if not can_queue:
-                                    print(f"[WORKER {worker_id}] [DISK] Cannot queue mutants: free={free_mb:.0f}MB, pending={pending}, discarding {len(mutant_files)}")
-                                    self._inc_stat('mutants_discarded_disk_space', len(mutant_files))
-                                    for mutant_file in mutant_files:
-                                        try:
-                                            mutant_file.unlink()
-                                        except Exception:
-                                            pass
-                                    coverage_type = None  # Skip queuing
-                            
-                            if coverage_type is not None:
-                                mutants_to_queue = []
+                                print(f"[WORKER {worker_id}] [DISK] Cannot queue mutants: free={free_mb:.0f}MB, pending={pending}, discarding {len(mutant_files)}")
+                                self._inc_stat('mutants_discarded_disk_space', len(mutant_files))
+                                for mutant_file in mutant_files:
+                                    try:
+                                        mutant_file.unlink()
+                                    except Exception:
+                                        pass
+                                coverage_type = None  # Skip queuing
+                        
+                        if coverage_type is not None:
+                            mutants_to_queue = []
                                 # Only log mutant processing for new coverage
                                 if coverage_type == "NEW":
                                     print(f"[W{worker_id}] +{len(mutant_files)} mutants ({coverage_type})")
-                                
-                                for mutant_file in mutant_files:
-                                    try:
-                                        pending_name = f"gen{generation+1}_w{worker_id}_{mutant_file.name}"
-                                        pending_path = self.pending_mutants_dir / pending_name
-                                        shutil.move(str(mutant_file), str(pending_path))
+                            
+                            for mutant_file in mutant_files:
+                                try:
+                                    pending_name = f"gen{generation+1}_w{worker_id}_{mutant_file.name}"
+                                    pending_path = self.pending_mutants_dir / pending_name
+                                    shutil.move(str(mutant_file), str(pending_path))
                                         
                                         # Set newcomer bonus for new mutants
                                         # NEW coverage gets big bonus (8x) to encourage exploration
                                         newcomer_bonus = 8 if coverage_type == "NEW" else 2
                                         self._set_newcomer(str(pending_path), newcomer_bonus)
                                         
-                                        # Queue item: (runtime, new_cov_rank, generation, seq, path_str)
-                                        mutants_to_queue.append(
+                                        # Store calibration data for mutant using parent's runtime/edges
+                                        # as estimate. Better than falling back to avg_coverage.
+                                        # (In non-inline mode, mutants aren't measured individually)
+                                        self._store_calibration_data(str(pending_path), runtime_sort, edges_hit)
+                                        
+                                    # Queue item: (runtime, new_cov_rank, generation, seq, path_str)
+                                    mutants_to_queue.append(
                                             (runtime_sort, cov_rank, generation + 1, self._next_seq(), str(pending_path))
-                                        )
-                                        self._inc_stat('mutants_created')
-                                    except Exception as e:
-                                        print(f"[WORKER {worker_id}] Warning: Failed to move mutant {mutant_file}: {e}", file=sys.stderr)
-                                
+                                    )
+                                    self._inc_stat('mutants_created')
+                                except Exception as e:
+                                    print(f"[WORKER {worker_id}] Warning: Failed to move mutant {mutant_file}: {e}", file=sys.stderr)
+                            
                                 # Update running averages for score calculation
                                 self._update_running_averages(runtime * 1000, edges_hit)
                                 
-                                if mutants_to_queue:
-                                    if coverage_type == "NEW":
-                                        self._inc_stat('mutants_with_new_coverage')
-                                    else:
-                                        self._inc_stat('mutants_with_existing_coverage')
+                            if mutants_to_queue:
+                                if coverage_type == "NEW":
+                                    self._inc_stat('mutants_with_new_coverage')
+                                else:
+                                    self._inc_stat('mutants_with_existing_coverage')
                                     
                                     # DIAGNOSTIC: Log parent success rate for analysis
                                     # This helps evaluate if certain parents consistently produce valid mutants
                                     print(f"[PARENT-STAT] parent={test_name} valid={len(mutants_to_queue)} cov_type={coverage_type}", flush=True)
 
-                                    # Sort by (runtime, new_cov_rank, generation, seq, path).
-                                    mutants_to_queue.sort()
+                                # Sort by (runtime, new_cov_rank, generation, seq, path).
+                                mutants_to_queue.sort()
 
-                                    # Seed phase: buffer gen1 mutants and only enqueue after all seeds are done.
-                                    if generation == 0 and not self.seed_phase_done.is_set():
-                                        self._seed_phase_buffer_mutants(mutants_to_queue)
-                                    else:
-                                        # Buffer and let main loop flush in sorted order across ALL workers.
-                                        self._buffer_mutants(mutants_to_queue)
+                                # Seed phase: buffer gen1 mutants and only enqueue after all seeds are done.
+                                if generation == 0 and not self.seed_phase_done.is_set():
+                                    self._seed_phase_buffer_mutants(mutants_to_queue)
+                                else:
+                                    # Buffer and let main loop flush in sorted order across ALL workers.
+                                    self._buffer_mutants(mutants_to_queue)
                     
                     # Delete executed mutant if it's from pending folder
                     test_path_obj = test_path if isinstance(test_path, Path) else Path(test_path)
@@ -2798,12 +2807,12 @@ class CoverageGuidedFuzzer:
                     if (not self._calibration_seeds_requeued) and self.calibration_done.is_set():
                         self._requeue_calibrated_seeds()
                         self._calibration_seeds_requeued = True
-                    
+
                     # After the initial seed-only phase completes, flush buffered gen1 mutants once.
                     if (not self._seed_phase_flushed) and self.seed_phase_done.is_set():
                         self._flush_seed_phase_mutants()
                         self._seed_phase_flushed = True
-                    
+
                     # Periodic weight recalculation (AFL++ style, but less frequent)
                     # This ensures queue priorities reflect current averages and state
                     if self.calibration_done.is_set():
