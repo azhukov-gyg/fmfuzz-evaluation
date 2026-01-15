@@ -1772,8 +1772,8 @@ class CoverageGuidedFuzzer:
         
         # Combine base flags + test-specific flags
         base_flags = " ".join(base_flags_list)
-            if test_flags:
-                base_flags = f"{base_flags} {test_flags}"
+        if test_flags:
+            base_flags = f"{base_flags} {test_flags}"
         
         solvers.append(f"{self.cvc5_path} {base_flags}")
         return ";".join(solvers)
@@ -1919,8 +1919,8 @@ class CoverageGuidedFuzzer:
                 random_suffix = uuid.uuid4().hex[:8]
                 bug_filename = f"{bug_type}-cvc5-{seed_name}-{random_suffix}.smt2"
                 bug_path = bugs_folder / bug_filename
-                    shutil.copy(mutant_path, bug_path)
-                    bug_files.append(bug_path)
+                shutil.copy(mutant_path, bug_path)
+                bug_files.append(bug_path)
                 self._inc_stat('bugs_found')
                 # Match yinyang behavior: stop mutating this seed when bug found
                 # to avoid finding duplicate/similar bugs from same seed
@@ -1932,10 +1932,10 @@ class CoverageGuidedFuzzer:
                 break
 
             # Read coverage from shared memory (trace_bits) for this mutant execution.
-                try:
+            try:
                 shm.seek(0)
                 trace_bits = shm.read(AFL_MAP_SIZE)
-                except Exception:
+            except Exception:
                 trace_bits = b'\x00' * AFL_MAP_SIZE
 
             edges_hit = sum(1 for b in trace_bits if b != 0)
@@ -1978,7 +1978,7 @@ class CoverageGuidedFuzzer:
 
             # Queue the mutant: (runtime, new_cov_rank, generation, seq, path_str)
             pending_name = f"gen{generation+1}_w{worker_id}_iter{i}_{mutant_path.name}"
-                pending_path = self.pending_mutants_dir / pending_name
+            pending_path = self.pending_mutants_dir / pending_name
             try:
                 shutil.move(str(mutant_path), str(pending_path))
             except Exception:
@@ -2604,37 +2604,37 @@ class CoverageGuidedFuzzer:
                         
                         if coverage_type is not None:
                             mutants_to_queue = []
-                                # Only log mutant processing for new coverage
-                                if coverage_type == "NEW":
-                                    print(f"[W{worker_id}] +{len(mutant_files)} mutants ({coverage_type})")
+                            # Only log mutant processing for new coverage
+                            if coverage_type == "NEW":
+                                print(f"[W{worker_id}] +{len(mutant_files)} mutants ({coverage_type})")
                             
                             for mutant_file in mutant_files:
                                 try:
                                     pending_name = f"gen{generation+1}_w{worker_id}_{mutant_file.name}"
                                     pending_path = self.pending_mutants_dir / pending_name
                                     shutil.move(str(mutant_file), str(pending_path))
-                                        
-                                        # Set newcomer bonus for new mutants
-                                        # NEW coverage gets big bonus (8x) to encourage exploration
-                                        newcomer_bonus = 8 if coverage_type == "NEW" else 2
-                                        self._set_newcomer(str(pending_path), newcomer_bonus)
-                                        
-                                        # Store calibration data for mutant using parent's runtime/edges
-                                        # as estimate. Better than falling back to avg_coverage.
-                                        # (In non-inline mode, mutants aren't measured individually)
-                                        self._store_calibration_data(str(pending_path), runtime_sort, edges_hit)
-                                        
+                                    
+                                    # Set newcomer bonus for new mutants
+                                    # NEW coverage gets big bonus (8x) to encourage exploration
+                                    newcomer_bonus = 8 if coverage_type == "NEW" else 2
+                                    self._set_newcomer(str(pending_path), newcomer_bonus)
+                                    
+                                    # Store calibration data for mutant using parent's runtime/edges
+                                    # as estimate. Better than falling back to avg_coverage.
+                                    # (In non-inline mode, mutants aren't measured individually)
+                                    self._store_calibration_data(str(pending_path), runtime_sort, edges_hit)
+                                    
                                     # Queue item: (runtime, new_cov_rank, generation, seq, path_str)
                                     mutants_to_queue.append(
-                                            (runtime_sort, cov_rank, generation + 1, self._next_seq(), str(pending_path))
+                                        (runtime_sort, cov_rank, generation + 1, self._next_seq(), str(pending_path))
                                     )
                                     self._inc_stat('mutants_created')
                                 except Exception as e:
                                     print(f"[WORKER {worker_id}] Warning: Failed to move mutant {mutant_file}: {e}", file=sys.stderr)
                             
-                                # Update running averages for score calculation
-                                self._update_running_averages(runtime * 1000, edges_hit)
-                                
+                            # Update running averages for score calculation
+                            self._update_running_averages(runtime * 1000, edges_hit)
+                            
                             if mutants_to_queue:
                                 if coverage_type == "NEW":
                                     self._inc_stat('mutants_with_new_coverage')
