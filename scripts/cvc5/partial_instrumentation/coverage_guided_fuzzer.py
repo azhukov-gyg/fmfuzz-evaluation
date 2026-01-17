@@ -184,15 +184,24 @@ class CoverageGuidedFuzzer:
         self._queue_seq = multiprocessing.Value('L', 0)
         self._queue_seq_lock = multiprocessing.Lock()
         
-        # Single work queue (items are enqueued in sorted order during buffer flushes).
-        # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
-        #   - runtime (ascending): fast tests first
+        # Work queue with weighted random selection
+        # Queue item format: (perf_score, new_cov_rank, generation, seq, path_str)
+        #   - perf_score: AFL-style score = S×C×N×D×F×U (higher = better)
+        #     S: speed [2-300], C: coverage [1-5], N: newcomer [1-8]
+        #     D: depth [1-4.5], F: rarity [0.25-4], U: owned edges [1-4]
         #   - new_cov_rank: 0=new coverage, 1=existing coverage, 2=seed
         #   - generation: 0=seed, 1+=mutant
         #   - seq: monotonic sequence for stable ordering
         #   - path_str: test path as string
-        self._work_queue = Queue()
+        # 
+        # Weighted random selection: probability ∝ perf_score
+        # This prevents starvation of lower-scored but potentially interesting tests
+        self._work_queue_list = self.manager.list()
+        self._work_queue_lock = multiprocessing.Lock()
         self._queue_size = multiprocessing.Value('i', 0)
+        
+        # Fallback Queue for calibration phase (strict FIFO needed)
+        self._calibration_queue = Queue()
         
         self.bugs_lock = multiprocessing.Lock()
         self.shutdown_event = multiprocessing.Event()
@@ -798,63 +807,55 @@ class CoverageGuidedFuzzer:
     
     def _recalculate_queue_weights(self):
         """
-        Recalculate weights for all queued items using current averages.
+        Recalculate perf_score for all queued items using current averages.
         
-        AFL++ does this every iteration. We do it every 10 tests or 5 minutes
-        since Python is slower. This ensures:
-        - Running averages affect existing queue items
-        - Favored status changes propagate
-        - Parent success rate (when implemented) affects queue
+        This ensures:
+        - Running averages affect existing queue items (S and C factors)
+        - Favored status changes propagate (U factor)
+        - Path frequency changes propagate (F factor)
         
-        Cost: O(n log n) where n = queue size. ~50ms for n=200.
+        Cost: O(n) where n = queue size.
         """
-        # Drain the current queue
-        items = []
-        drained = 0
-        while not self._queue_empty():
-            item = self._queue_pop(timeout=0.01)
-            if item:
-                items.append(item)
-                drained += 1
-            else:
-                break
-        
-        if not items:
+        if not self.calibration_done.is_set():
+            # Don't recalculate during calibration
             return
         
-        # Recalculate scores with current state
-        new_items = []
-        for runtime_priority, new_cov_rank, generation, seq, path in items:
-            # Get calibration data if available
-            with self.calibration_data_lock:
-                cal_data = self.calibration_data.get(path)
+        with self._work_queue_lock:
+            if len(self._work_queue_list) == 0:
+                return
             
-            if cal_data:
-                runtime_ms = cal_data[0] * 1000
-                edges = cal_data[1]
-            else:
-                # Use current averages for uncalibrated items
-                runtime_ms = self._get_avg_runtime_ms()
-                edges = max(1, int(self._get_avg_coverage()))
+            items = list(self._work_queue_list)
             
-            # Recalculate score with current averages and state
-            path_freq = self._get_test_path_frequency(path)
-            owned_edges = self._get_owned_edges_count(path)
-            new_score = self._calculate_perf_score(
-                runtime_ms, edges, generation, path, path_freq, owned_edges
-            )
+            # Recalculate scores with current state (all 6 factors: S×C×N×D×F×U)
+            new_items = []
+            for old_score, new_cov_rank, generation, seq, path in items:
+                # Get calibration data if available
+                with self.calibration_data_lock:
+                    cal_data = self.calibration_data.get(path)
+                
+                if cal_data:
+                    runtime_ms = cal_data[0] * 1000
+                    edges = cal_data[1]
+                else:
+                    # Use current averages for uncalibrated items
+                    runtime_ms = self._get_avg_runtime_ms()
+                    edges = max(1, int(self._get_avg_coverage()))
+                
+                # Recalculate full perf_score with current averages and state
+                path_freq = self._get_test_path_frequency(path)
+                owned_edges = self._get_owned_edges_count(path)
+                new_score = self._calculate_perf_score(
+                    runtime_ms, edges, generation, path, path_freq, owned_edges
+                )
+                
+                # Queue item format: (perf_score, cov_rank, generation, seq, path)
+                new_items.append((new_score, new_cov_rank, generation, seq, path))
             
-            # Convert score to priority (lower = higher priority)
-            # Invert score: high score -> low runtime_priority -> picked first
-            new_runtime_priority = 1.0 / max(1.0, new_score / 100.0)
-            
-            new_items.append((new_runtime_priority, new_cov_rank, generation, seq, path))
+            # Sort by score DESCENDING and replace queue contents
+            new_items.sort(reverse=True)
+            self._work_queue_list[:] = new_items
         
-        # Re-sort and push back
-        new_items.sort()
-        self._queue_push_batch(new_items)
-        
-        print(f"[RECALC] Recalculated weights for {len(new_items)} queued items", flush=True)
+        print(f"[RECALC] Recalculated perf_score for {len(new_items)} queued items", flush=True)
     
     def _weighted_random_select(self, tests: list, count: int) -> list:
         """
@@ -911,32 +912,50 @@ class CoverageGuidedFuzzer:
             self.calibration_data[test_path] = (runtime_sec, edges_hit, perf_score, weight)
     
     # -------------------------------------------------------------------------
-    # Work queue helpers (sorted FIFO enqueue via periodic buffer flush)
+    # Work queue helpers with weighted random selection
     # -------------------------------------------------------------------------
     
-    def _queue_push(self, item: tuple):
-        """Push item to work queue. Item is a sortable tuple."""
-        self._work_queue.put(item)
+    def _queue_push(self, item: tuple, use_calibration_queue: bool = False):
+        """
+        Push item to work queue.
+        
+        Item format: (score, new_cov_rank, generation, seq, path_str)
+        - score: higher = better (used for weighted selection)
+        
+        During calibration phase, use strict FIFO queue.
+        After calibration, use weighted random selection from list.
+        """
+        if use_calibration_queue or not self.calibration_done.is_set():
+            self._calibration_queue.put(item)
+        else:
+            with self._work_queue_lock:
+                self._work_queue_list.append(item)
         with self._queue_size.get_lock():
             self._queue_size.value += 1
     
-    def _queue_push_batch(self, items: list):
+    def _queue_push_batch(self, items: list, use_calibration_queue: bool = False):
         """Push multiple items efficiently."""
-        for item in items:
-            self._work_queue.put(item)
+        if use_calibration_queue or not self.calibration_done.is_set():
+            for item in items:
+                self._calibration_queue.put(item)
+        else:
+            with self._work_queue_lock:
+                for item in items:
+                    self._work_queue_list.append(item)
         with self._queue_size.get_lock():
             self._queue_size.value += len(items)
     
     def _queue_push_initial(self, test_name: str):
-        """Push initial test (seed)."""
-        # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
-        self._queue_push((0.0, 2, 0, self._next_seq(), test_name))
+        """Push initial test (seed) with default score."""
+        # Queue item format: (perf_score, new_cov_rank, generation, seq, path_str)
+        # Default score 100.0 for uncalibrated seeds
+        self._queue_push((100.0, 2, 0, self._next_seq(), test_name))
     
     def _queue_push_initial_batch(self, test_names: list, use_calibration: bool = True):
         """
         Push multiple initial tests efficiently, filtering out excluded tests.
         
-        If use_calibration=True (after calibration), uses stored runtime data and
+        If use_calibration=True (after calibration), uses stored perf_score for
         weighted selection. If False (initial calibration), uses uniform weights.
         """
         excluded_list = list(self.excluded_tests)
@@ -956,24 +975,27 @@ class CoverageGuidedFuzzer:
                     cal_data = self.calibration_data.get(name)
                 
                 if cal_data:
-                    runtime_sec, edges_hit, perf_score, weight = cal_data
-                    is_favored = self.test_favored.get(name, False)
-                    # Favored tests get priority (runtime=0), others use actual runtime
-                    effective_runtime = 0.0 if is_favored else runtime_sec
+                    runtime_sec, edges_hit, stored_score, weight = cal_data
+                    # Recalculate perf_score with current state (F and U may have changed)
+                    runtime_ms = runtime_sec * 1000
+                    path_freq = self._get_test_path_frequency(name)
+                    owned_edges = self._get_owned_edges_count(name)
+                    perf_score = self._calculate_perf_score(runtime_ms, edges_hit, 0, name, path_freq, owned_edges)
                 else:
-                    # No calibration data - use default
-                    effective_runtime = 0.0
+                    # No calibration data - use default score
+                    perf_score = 100.0
                 
-                items.append((effective_runtime, 2, 0, self._next_seq(), name))
+                # Queue item format: (perf_score, cov_rank, generation, seq, path)
+                items.append((perf_score, 2, 0, self._next_seq(), name))
             
-            # Sort by runtime (favored first, then fast)
-            items.sort()
+            # Sort by perf_score DESCENDING (high score = higher priority)
+            items.sort(reverse=True)
             
             favored_count = sum(1 for _, _, _, _, p in items if self.test_favored.get(p, False))
             print(f"[QUEUE] Refilling with {len(items)} tests ({favored_count} favored, {skipped_count} excluded)")
         else:
-            # Initial calibration - uniform ordering
-            items = [(0.0, 2, 0, self._next_seq(), name) for name in filtered_tests]
+            # Initial calibration - uniform ordering with default score
+            items = [(100.0, 2, 0, self._next_seq(), name) for name in filtered_tests]
         
         queue_size_before = self._get_queue_size()
         self._queue_push_batch(items)
@@ -996,14 +1018,15 @@ class CoverageGuidedFuzzer:
                 self._seed_phase_mutants.append(item)
 
     def _flush_seed_phase_mutants(self):
-        """Flush buffered gen1 mutants after seed phase completes, sorted by priority."""
+        """Flush buffered gen1 mutants after seed phase completes, sorted by perf_score."""
         with self._seed_phase_lock:
             buffered = list(self._seed_phase_mutants)
             if buffered:
                 self._seed_phase_mutants[:] = []
         if not buffered:
             return
-        buffered.sort()
+        # Sort by perf_score DESCENDING (high score = higher priority)
+        buffered.sort(reverse=True)
         self._queue_push_batch(buffered)
         print(f"[INFO] Flushed {len(buffered)} gen1 mutants from seed phase buffer")
 
@@ -1028,20 +1051,19 @@ class CoverageGuidedFuzzer:
                 slow_tests_count += 1
             
             # Calculate perf_score using calibrated averages and path frequency
+            # Score = S×C×N×D×F×U (all 6 factors)
             runtime_ms = runtime * 1000
             path_freq = self._get_test_path_frequency(test_path_str)
             owned_edges = self._get_owned_edges_count(test_path_str)
             perf_score = self._calculate_perf_score(runtime_ms, edges_hit, 0, test_path_str, path_freq, owned_edges)
-            iterations = self._score_to_iterations(perf_score)
             
             # NOTE: Do NOT set newcomer bonus for seeds.
             # Seeds are known inputs, not discoveries. Newcomer bonus (N factor)
             # is only for mutants that find new coverage.
-            # Previously this caused all seeds to get iter=250 due to N=4 boost.
             
-            # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
-            # Use runtime as sort key so fast seeds are processed first
-            items_to_queue.append((runtime, 2, 0, self._next_seq(), test_path_str))
+            # Queue item format: (perf_score, new_cov_rank, generation, seq, path_str)
+            # Higher score = higher weight for weighted random selection
+            items_to_queue.append((perf_score, 2, 0, self._next_seq(), test_path_str))
         
         if slow_tests_count > 0:
             print(f"[INFO] {slow_tests_count} slow tests (>{self.SLOW_TEST_THRESHOLD_S}s) will get minimum iterations ({self.MIN_SLOW_TEST_ITERATIONS})")
@@ -1049,16 +1071,10 @@ class CoverageGuidedFuzzer:
         # Mark favored tests based on edge ownership (AFL's cull_queue)
         self._cull_queue()
         
-        # Sort by runtime (fast first), but also prioritize favored tests
-        # Favored tests get runtime=0 to be processed first
-        def sort_key(item):
-            runtime, rank, gen, seq, path = item
-            is_favored = self.test_favored.get(path, False)
-            # Favored tests: use 0.0 runtime, non-favored: use actual runtime
-            effective_runtime = 0.0 if is_favored else runtime
-            return (effective_runtime, rank, gen, seq)
-        
-        items_to_queue.sort(key=sort_key)
+        # Sort by perf_score DESCENDING (high score = higher priority)
+        # Note: With weighted random selection, order doesn't strictly matter,
+        # but we keep high scores first for deterministic tie-breaking
+        items_to_queue.sort(reverse=True)
         self._queue_push_batch(items_to_queue)
         
         favored_count = sum(1 for _, _, _, _, p in items_to_queue if self.test_favored.get(p, False))
@@ -1082,25 +1098,83 @@ class CoverageGuidedFuzzer:
                 self._mutant_buffer.append(item)
 
     def _flush_mutant_buffer(self):
-        """Flush buffered mutants, sorted by priority (ascending)."""
+        """Flush buffered mutants, sorted by perf_score descending."""
         with self._mutant_buffer_lock:
             buffered = list(self._mutant_buffer)
             if buffered:
                 self._mutant_buffer[:] = []
         if not buffered:
             return
-        buffered.sort()
+        # Sort by perf_score DESCENDING (high score = higher priority)
+        buffered.sort(reverse=True)
         self._queue_push_batch(buffered)
 
     def _queue_pop(self, timeout: float = 1.0) -> Optional[tuple]:
-        """Pop item from queue."""
-        try:
-            item = self._work_queue.get(timeout=timeout)
-            with self._queue_size.get_lock():
-                self._queue_size.value -= 1
-            return item
-        except:
-            return None
+        """
+        Pop item from queue using weighted random selection.
+        
+        During calibration: strict FIFO from calibration queue.
+        After calibration: weighted random selection where P(item) ∝ perf_score.
+        
+        Uses the FULL perf_score (S×C×N×D×F×U) directly as weight, ensuring
+        all AFL-style scoring factors affect selection probability.
+        
+        This prevents starvation - even low-scored tests get occasional attention,
+        while high-scored tests are selected more frequently.
+        """
+        # During calibration, use strict FIFO
+        if not self.calibration_done.is_set():
+            try:
+                item = self._calibration_queue.get(timeout=timeout)
+                with self._queue_size.get_lock():
+                    self._queue_size.value -= 1
+                return item
+            except:
+                return None
+        
+        # After calibration, use weighted random selection
+        with self._work_queue_lock:
+            if len(self._work_queue_list) == 0:
+                return None
+            
+            # Extract items for weighted selection
+            # Item format: (perf_score, new_cov_rank, generation, seq, path_str)
+            # perf_score = S×C×N×D×F×U (already includes all factors)
+            items = list(self._work_queue_list)
+            
+            if len(items) == 1:
+                # Only one item - just take it
+                selected_idx = 0
+            else:
+                # Weighted random selection: P(item) ∝ perf_score
+                # perf_score already includes: S(speed), C(coverage), N(newcomer),
+                # D(depth), F(rarity), U(owned edges)
+                weights = []
+                for item in items:
+                    perf_score = item[0]
+                    # Use perf_score directly as weight (minimum 1.0 to prevent zero weight)
+                    weights.append(max(1.0, perf_score))
+                
+                # Weighted random selection (roulette wheel)
+                total_weight = sum(weights)
+                r = random.random() * total_weight
+                cumulative = 0
+                selected_idx = 0
+                for i, w in enumerate(weights):
+                    cumulative += w
+                    if r <= cumulative:
+                        selected_idx = i
+                        break
+            
+            # Remove selected item and return it
+            selected_item = items[selected_idx]
+            # Remove from Manager.list (O(n) but queue is typically small)
+            del self._work_queue_list[selected_idx]
+        
+        with self._queue_size.get_lock():
+            self._queue_size.value -= 1
+        
+        return selected_item
     
     def _queue_empty(self) -> bool:
         """Check if queue is empty."""
@@ -1109,6 +1183,22 @@ class CoverageGuidedFuzzer:
     def _get_queue_size(self) -> int:
         """Get total queue size."""
         return self._queue_size.value
+    
+    def _get_queue_stats(self) -> dict:
+        """Get queue statistics for debugging."""
+        with self._work_queue_lock:
+            items = list(self._work_queue_list)
+        
+        if not items:
+            return {"size": 0, "min_score": 0, "max_score": 0, "avg_score": 0}
+        
+        scores = [item[0] for item in items]
+        return {
+            "size": len(items),
+            "min_score": min(scores),
+            "max_score": max(scores),
+            "avg_score": sum(scores) / len(scores)
+        }
 
     def _next_seq(self) -> int:
         """Monotonic sequence number used for total ordering in queue items."""
@@ -2067,7 +2157,17 @@ class CoverageGuidedFuzzer:
             # Store calibration data for scoring (S and C factors)
             self._store_calibration_data(str(pending_path), runtime_i, edges_hit)
 
-            mutant_item = (runtime_i, cov_rank, generation + 1, self._next_seq(), str(pending_path))
+            # Calculate full perf_score = S×C×N×D×F×U for this mutant
+            mutant_path_str = str(pending_path)
+            runtime_ms = runtime_i * 1000
+            path_freq = self._get_test_path_frequency(mutant_path_str)
+            owned_edges = self._get_owned_edges_count(mutant_path_str)
+            perf_score = self._calculate_perf_score(
+                runtime_ms, edges_hit, generation + 1, mutant_path_str, path_freq, owned_edges
+            )
+            
+            # Queue item format: (perf_score, cov_rank, generation, seq, path)
+            mutant_item = (perf_score, cov_rank, generation + 1, self._next_seq(), mutant_path_str)
 
             # Buffer mutants: seed phase or regular buffer
             if generation == 0 and not self.seed_phase_done.is_set():
@@ -2323,8 +2423,8 @@ class CoverageGuidedFuzzer:
                         time.sleep(self.RESOURCE_CONFIG['pause_duration'])
                         continue
                     
-                    # Parse test item: (runtime, new_cov_rank, generation, seq, test_path_str)
-                    runtime_priority, new_cov_rank, generation, seq, test_path = test_item
+                    # Parse test item: (perf_score, new_cov_rank, generation, seq, test_path_str)
+                    stored_perf_score, new_cov_rank, generation, seq, test_path = test_item
                     original_test_path = test_path  # Keep original for re-queueing
                     
                     # Handle string paths:
@@ -2343,25 +2443,24 @@ class CoverageGuidedFuzzer:
                     
                     # ---------------------------------------------------------------
                     # AFL-style scoring: calculate iterations based on perf_score
+                    # Queue item already contains perf_score = S×C×N×D×F×U
                     # ---------------------------------------------------------------
                     if is_calibration:
                         # CALIBRATION PHASE: Run seed directly (no mutations!)
                         # Just execute CVC5 to get timing and coverage baseline
                         perf_score = 100.0  # Neutral score for calibration
                         dynamic_iterations = 0  # No mutations during calibration
+                        S = C = N = D = F = U = 1.0  # Placeholder factors for logging
                     elif generation == 0:
                         # POST-CALIBRATION: Seeds re-queued with proper score
-                        # Use ACTUAL edges from calibration data, not average!
-                        runtime_ms = runtime_priority * 1000  # Convert to ms
-                        
-                        # Look up actual edge count from calibration
+                        # Recalculate to get individual factors for logging
                         with self.calibration_data_lock:
                             cal_data = self.calibration_data.get(test_path_str)
                         if cal_data:
-                            actual_edges = cal_data[1]  # (runtime_sec, edges_hit, perf_score, weight)
+                            runtime_sec, actual_edges, _, _ = cal_data
+                            runtime_ms = runtime_sec * 1000
                         else:
-                            # Seed not found in calibration_data - use avg_coverage as fallback
-                            # Use max(1, round()) to avoid 0 edges which would make C=1.0
+                            runtime_ms = self._get_avg_runtime_ms()
                             actual_edges = max(1, int(round(self._get_avg_coverage())))
                         
                         path_freq = self._get_test_path_frequency(test_path_str)
@@ -2377,18 +2476,16 @@ class CoverageGuidedFuzzer:
                         perf_score = S * C * N * D * F * U
                         dynamic_iterations = self._score_to_iterations(perf_score)
                     else:
-                        # Mutants: use parent's edges from calibration if available, else average
-                        runtime_ms = runtime_priority * 1000  # Convert to ms
-                        
-                        # Try to get actual edges from calibration (for mutants from known seeds)
+                        # Mutants: use stored perf_score or recalculate if needed
+                        # Get calibration data for individual factors
                         with self.calibration_data_lock:
                             cal_data = self.calibration_data.get(test_path_str)
                         if cal_data:
-                            actual_edges = cal_data[1]  # Has been calibrated
+                            runtime_sec, actual_edges, _, _ = cal_data
+                            runtime_ms = runtime_sec * 1000
                         else:
-                            # New mutant without calibration - use avg_coverage directly
-                            # Don't convert to int (which would round 0.6 to 0)
-                            actual_edges = max(1, int(round(self._get_avg_coverage())))  # At least 1
+                            runtime_ms = self._get_avg_runtime_ms()
+                            actual_edges = max(1, int(round(self._get_avg_coverage())))
                         
                         path_freq = self._get_test_path_frequency(test_path_str)
                         owned_edges = self._get_owned_edges_count(test_path_str)
@@ -2695,9 +2792,18 @@ class CoverageGuidedFuzzer:
                                         # Store calibration data for scoring (S and C factors)
                                         self._store_calibration_data(str(pending_path), runtime_sort, edges_hit)
                                         
-                                        # Queue item: (runtime, new_cov_rank, generation, seq, path_str)
+                                        # Calculate full perf_score = S×C×N×D×F×U for this mutant
+                                        mutant_path_str = str(pending_path)
+                                        runtime_ms = runtime_sort * 1000
+                                        path_freq = self._get_test_path_frequency(mutant_path_str)
+                                        owned_edges = self._get_owned_edges_count(mutant_path_str)
+                                        perf_score = self._calculate_perf_score(
+                                            runtime_ms, edges_hit, generation + 1, mutant_path_str, path_freq, owned_edges
+                                        )
+                                        
+                                        # Queue item: (perf_score, new_cov_rank, generation, seq, path_str)
                                         mutants_to_queue.append(
-                                            (runtime_sort, cov_rank, generation + 1, self._next_seq(), str(pending_path))
+                                            (perf_score, cov_rank, generation + 1, self._next_seq(), mutant_path_str)
                                         )
                                         self._inc_stat('mutants_created')
                                     except Exception as e:
