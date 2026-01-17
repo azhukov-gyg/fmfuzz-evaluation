@@ -340,31 +340,40 @@ class CoverageGuidedFuzzer:
     # AFL-style Scoring System (adapted from AFL++ calculate_score)
     # -------------------------------------------------------------------------
     
-    def _get_speed_base(self, runtime_ms: float) -> int:
+    def _get_speed_multiplier(self, runtime_ms: float) -> float:
         """
-        AFL-style speed-based starting score.
-        Faster tests get higher base score (more iterations).
-        Very slow tests (>10s) get minimal score to ensure ~5 iterations.
+        Speed multiplier based on ABSOLUTE runtime.
+        Works like other multipliers (C, N, D, F, U) - applied to base score.
         
-        Returns base score in [2, 300].
+        Fast tests get SIGNIFICANTLY more iterations.
+        Slow tests get SIGNIFICANTLY fewer iterations.
+        
+        Returns multiplier in [0.1, 3.0]:
+          - <0.5s:  3.0   (very fast - 3x bonus)
+          - 0.5-1s: 2.0   (fast - 2x bonus)
+          - 1-2s:   1.0   (baseline - no adjustment)
+          - 2-5s:   0.5   (slow - half)
+          - 5-10s:  0.2   (very slow - 1/5th)
+          - >10s:   0.1   (extremely slow - 1/10th)
         """
-        avg_runtime = self._get_avg_runtime_ms()
+        runtime_s = runtime_ms / 1000.0
         
-        # VERY SLOW tests (>10s absolute) get minimal iterations regardless of average
-        # Score of 2 gives ~5 iterations after _score_to_iterations calculation
-        if runtime_ms > self.SLOW_TEST_THRESHOLD_S * 1000:
-            return 2  # Minimal score for extremely slow tests
-        
-        ratio = runtime_ms / avg_runtime
-        
-        if ratio > 10:    return 10    # Very slow: minimal iterations
-        if ratio > 4:     return 25
-        if ratio > 2:     return 50
-        if ratio > 1.33:  return 75
-        if ratio < 0.25:  return 300   # Very fast: maximum iterations
-        if ratio < 0.33:  return 200
-        if ratio < 0.5:   return 150
-        return 100                      # Average speed
+        if runtime_s < 0.5:
+            return 3.0    # Very fast: 3x bonus
+        if runtime_s < 1.0:
+            return 2.0    # Fast: 2x bonus
+        if runtime_s < 2.0:
+            return 1.0    # Normal: baseline
+        if runtime_s < 5.0:
+            return 0.5    # Slow: half
+        if runtime_s < 10.0:
+            return 0.2    # Very slow: 1/5th
+        return 0.1        # Extremely slow: 1/10th
+    
+    # Keep old name as alias for compatibility
+    def _get_speed_base(self, runtime_ms: float) -> float:
+        """Alias for _get_speed_multiplier (for compatibility)."""
+        return self._get_speed_multiplier(runtime_ms) * 100  # Scale to old range
     
     def _get_coverage_multiplier(self, edges_hit: int) -> float:
         """
@@ -600,61 +609,77 @@ class CoverageGuidedFuzzer:
     ) -> float:
         """
         Calculate AFL-style performance score.
-        Higher score = more iterations deserved.
+        Higher score = more iterations deserved AND higher selection probability.
         
-        Score = S(speed) × C(coverage) × N(newcomer) × D(depth) × F(rarity) × U(owned)
+        Score = BASE × S(speed) × C(coverage) × N(newcomer) × D(depth) × F(rarity) × U(owned)
         
-        Factors:
-          S: [10, 300]   - base score from speed (fast=300, slow=10)
-          C: [1.0, 5.0]  - coverage relative to average (no penalty, only bonus)
-          N: [1.0, 8.0]  - newcomer bonus (8x for NEW coverage, decays over processing)
-          D: [1, 5]      - depth/generation bonus (deep lineages get more)
-          F: [0.5, 4.0]  - path rarity (rare paths get priority)
-          U: [1.0, 4.0]  - owned edges (favored tests get bonus, no penalty)
+        BASE = 100 (constant baseline)
         
-        Theoretical range: [1.0, 288000], but clamped to [10, 1600] for iteration mapping.
-        Typical scores: 
-          - Bad test (slow, common, no edges): 5-15
-          - Average test: 100-300
-          - Good newcomer: 500-2000
-          - Exceptional newcomer: 2000+
+        Factors (all are multipliers now):
+          S: [0.1, 3.0]  - speed multiplier based on ABSOLUTE runtime
+                           <0.5s → 3.0, 0.5-1s → 2.0, 1-2s → 1.0,
+                           2-5s → 0.5, 5-10s → 0.2, >10s → 0.1
+          C: [1.0, 5.0]  - coverage relative to average
+          N: [1.0, 8.0]  - newcomer bonus (decays)
+          D: [1, 5]      - depth/generation bonus
+          F: [0.5, 4.0]  - path rarity
+          U: [1.0, 4.0]  - owned edges
+        
+        Score ranges (mapped to iterations [5, 500]):
+          - Very slow (>10s): 10-800 → 5-100 iterations
+          - Slow (5-10s): 20-1600 → 5-200 iterations
+          - Normal (1-2s): 100-8000 → 30-500 iterations
+          - Fast (<0.5s): 300-24000 → 100-500 iterations
         """
-        S = self._get_speed_base(runtime_ms)
+        BASE = 100  # Baseline score
+        S = self._get_speed_multiplier(runtime_ms)
         C = self._get_coverage_multiplier(edges_hit)
         N, _ = self._get_newcomer_multiplier(test_path)
         D = self._get_depth_multiplier(generation)
         F = self._get_rarity_multiplier(path_frequency)
         U = self._get_owned_edges_multiplier(owned_edges)
         
-        return S * C * N * D * F * U
+        return BASE * S * C * N * D * F * U
     
     def _score_to_iterations(self, score: float) -> int:
         """
-        Map AFL-style perf_score to iteration count.
+        Map AFL-style perf_score to iteration count [5, 500].
         
-        For ≤1.5h budget: [25, 500] iterations (increased min for more recipes)
-        For >1.5h budget: [25, 500] iterations
+        Score ranges (with new BASE × S × multipliers):
+          - Very slow (>10s, S=0.1): ~10-80
+          - Slow (5-10s, S=0.2): ~20-160
+          - Normal (1-2s, S=1.0): ~100-800
+          - Fast (0.5-1s, S=2.0): ~200-1600
+          - Very fast (<0.5s, S=3.0): ~300-2400+
         
-        Linear mapping: low score → few iterations, high score → many iterations.
-        Very low scores (≤5) are treated as slow tests and get MIN_SLOW_TEST_ITERATIONS.
+        Mapping:
+          - score ≤ 10: 5 iterations (minimum for very slow tests)
+          - score 10-100: 5-50 iterations (slow tests)
+          - score 100-500: 50-200 iterations (normal tests)
+          - score 500-2000: 200-400 iterations (fast tests)
+          - score ≥ 2000: 500 iterations (very fast with bonuses)
         """
-        # Increased minimum from 5 to 25 to generate more recipes
-        # This ensures even low-scoring tests contribute to recipe count
-        if self.hours_budget <= 1.5:
-            min_iter, max_iter = 25, 500
-        else:
-            min_iter, max_iter = 25, 500
+        # Absolute minimum and maximum
+        MIN_ITER = 5
+        MAX_ITER = 500
         
-        # Very low scores (slow tests) get minimum iterations
-        if score <= 5:
-            return self.MIN_SLOW_TEST_ITERATIONS
+        # Very low scores (extremely slow tests) get minimum
+        if score <= 10:
+            return MIN_ITER
         
-        # Clamp score to expected range [10, 1600]
-        score = max(10, min(score, 1600))
+        # Very high scores get maximum
+        if score >= 2000:
+            return MAX_ITER
         
-        # Linear map: score 10 → min_iter, score 1600 → max_iter
-        normalized = (score - 10) / (1600 - 10)
-        return int(min_iter + normalized * (max_iter - min_iter))
+        # Use log-scale mapping for better distribution
+        # log(10) ≈ 2.3, log(2000) ≈ 7.6
+        import math
+        log_score = math.log(score)
+        log_min = math.log(10)
+        log_max = math.log(2000)
+        
+        normalized = (log_score - log_min) / (log_max - log_min)
+        return int(MIN_ITER + normalized * (MAX_ITER - MIN_ITER))
     
     def _update_running_averages(self, runtime_ms: float, edges_hit: int):
         """Update running averages for score calculation (AFL-style: total/count)."""
