@@ -1,0 +1,449 @@
+name: Z3 RQ2 Measurement - Baseline
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_commit_hash:
+        description: 'Debug: Specific commit hash to measure. If provided, only this commit will be measured.'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run: Skip S3 uploads (default: false)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  # ============================================================
+  # PHASE 1: Generate commit matrix from available recipes
+  # ============================================================
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      commit_matrix: ${{ steps.generate-matrix.outputs.commit_matrix }}
+      total_commits: ${{ steps.generate-matrix.outputs.total_commits }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: pip install boto3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Generate commit matrix from recipes
+        id: generate-matrix
+        env:
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          if [ -n "${{ inputs.debug_commit_hash }}" ]; then
+            echo "🔍 Debug mode: Using specific commit ${{ inputs.debug_commit_hash }}"
+            DEBUG_COMMIT="${{ inputs.debug_commit_hash }}"
+            COMMIT_MATRIX=$(python3 -c "import json; print(json.dumps({'include': [{'commit': '$DEBUG_COMMIT'}]}, separators=(',', ':')))")
+            TOTAL_COMMITS=1
+          else
+            # List commits that have baseline recipes
+            prefix="evaluation/rq2/z3/fuzzing-recipes/baseline/"
+            commits=$(aws s3 ls s3://${{ secrets.AWS_S3_BUCKET }}/$prefix --recursive | \
+              grep "recipes-" | \
+              sed 's/.*recipes-\(.*\)\.jsonl\.gz/\1/' | \
+              sort -u)
+            
+            commit_count=$(echo "$commits" | grep -c . || echo 0)
+            echo "✅ Found $commit_count commits with baseline recipes"
+            
+            # Generate matrix
+            echo "[]" > /tmp/matrix_entries.json
+            for commit in $commits; do
+              jq --arg commit "$commit" '. + [{"commit": $commit}]' /tmp/matrix_entries.json > /tmp/matrix_entries_new.json
+              mv /tmp/matrix_entries_new.json /tmp/matrix_entries.json
+            done
+            
+            COMMIT_MATRIX=$(jq -c '{include: .}' /tmp/matrix_entries.json)
+            TOTAL_COMMITS=$commit_count
+          fi
+          
+          echo "commit_matrix=$COMMIT_MATRIX" >> $GITHUB_OUTPUT
+          echo "total_commits=$TOTAL_COMMITS" >> $GITHUB_OUTPUT
+
+  # ============================================================
+  # PHASE 2: Prepare measurement - split recipes into 4 jobs per commit
+  # ============================================================
+  prepare-measurement:
+    needs: generate-matrix
+    if: needs.generate-matrix.outputs.total_commits != '' && needs.generate-matrix.outputs.total_commits != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.commit_matrix) }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Download recipes from S3
+        run: |
+          COMMIT_HASH="${{ matrix.commit }}"
+          S3_KEY="evaluation/rq2/z3/fuzzing-recipes/baseline/recipes-${COMMIT_HASH}.jsonl.gz"
+          
+          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY recipes.jsonl.gz
+          gunzip recipes.jsonl.gz
+          
+          RECIPE_COUNT=$(wc -l < recipes.jsonl)
+          echo "✅ Downloaded $RECIPE_COUNT recipes for baseline measurement"
+      
+      - name: Split recipes into 4 jobs (by seed boundaries)
+        run: |
+          # Split by seed boundaries to keep all iterations of a seed in the same job
+          python3 scripts/rq2/split_recipes_for_measurement.py \
+            recipes.jsonl \
+            --num-jobs 4 \
+            --output measurement_matrix.json
+          
+          echo "=== Measurement Matrix ==="
+          cat measurement_matrix.json | python3 -m json.tool
+          
+          # Create combined matrix with commit
+          jq -c --arg commit "${{ matrix.commit }}" '{
+            "include": (.matrix.include | map({
+              "commit": $commit,
+              "job_id": .job_id,
+              "recipe_count": .recipe_count,
+              "seed_count": .seed_count,
+              "seeds_file": .seeds_file
+            }))
+          }' measurement_matrix.json > combined_matrix.json
+          
+          echo "=== Combined Matrix ==="
+          cat combined_matrix.json | python3 -m json.tool
+      
+      - name: Upload combined matrix, seeds files, and recipes
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-measurement-matrix-${{ matrix.commit }}
+          path: |
+            combined_matrix.json
+            seeds_job_*.json
+            recipes.jsonl
+          if-no-files-found: error
+
+  # ============================================================
+  # PHASE 3: Collect all matrices into one
+  # ============================================================
+  collect-matrices:
+    needs: [generate-matrix, prepare-measurement]
+    if: always() && needs.prepare-measurement.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      measurement_matrix: ${{ steps.merge-matrices.outputs.measurement_matrix }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      
+      - name: Download all combined matrices
+        uses: actions/download-artifact@v4
+        with:
+          path: matrices
+          pattern: baseline-measurement-matrix-*
+          merge-multiple: false
+      
+      - name: Merge all matrices
+        id: merge-matrices
+        run: |
+          # Use Python script for reliable matrix merging
+          TOTAL_JOBS=$(python3 scripts/merge_fuzzing_matrices.py \
+            measurement_matrix.json \
+            "matrices/baseline-measurement-matrix-*/combined_matrix.json" \
+            --minimal-output measurement_matrix_minimal.json)
+          
+          MINIMAL_MATRIX=$(cat measurement_matrix_minimal.json)
+          echo "measurement_matrix=$MINIMAL_MATRIX" >> $GITHUB_OUTPUT
+          echo "total_jobs=$TOTAL_JOBS" >> $GITHUB_OUTPUT
+          echo "✅ Merged $TOTAL_JOBS measurement jobs"
+      
+      - name: Upload merged matrix
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-measurement-matrix-full
+          path: measurement_matrix.json
+          retention-days: 1
+
+  # ============================================================
+  # PHASE 4: Run measurement jobs (4 per commit, in parallel)
+  # ============================================================
+  measurement-jobs:
+    needs: [generate-matrix, prepare-measurement, collect-matrices]
+    if: needs.collect-matrices.outputs.measurement_matrix != '' && needs.collect-matrices.outputs.measurement_matrix != '{"include":[]}'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.collect-matrices.outputs.measurement_matrix) }}
+    timeout-minutes: 360
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      
+      - name: Download matrix and seeds files for this commit
+        uses: actions/download-artifact@v4
+        with:
+          name: baseline-measurement-matrix-${{ matrix.commit }}
+          path: matrix-data
+      
+      - name: Extract job parameters
+        id: job-params
+        run: |
+          # Get seeds file for this job
+          SEEDS_FILE="matrix-data/seeds_job_${{ matrix.job_id }}.json"
+          
+          if [ ! -f "$SEEDS_FILE" ]; then
+            echo "❌ Seeds file not found: $SEEDS_FILE"
+            ls -la matrix-data/
+            exit 1
+          fi
+          
+          # Extract info
+          SEED_COUNT=$(jq '.seed_keys | length' "$SEEDS_FILE" 2>/dev/null || jq '.seeds | length' "$SEEDS_FILE")
+          
+          echo "seeds_file=$SEEDS_FILE" >> $GITHUB_OUTPUT
+          echo "seed_count=$SEED_COUNT" >> $GITHUB_OUTPUT
+          
+          echo "📊 Job ${{ matrix.job_id }}: $SEED_COUNT seeds"
+      
+      - name: Install GCC 14 (for gcov)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-14 g++-14
+          sudo update-alternatives --install /usr/bin/gcov gcov /usr/bin/gcov-14 60
+          pip install fastcov
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: |
+          pip install antlr4-python3-runtime==4.9.2
+          pip install z3-solver
+          pip install psutil
+          git clone https://github.com/testsmt/yinyang.git
+          cd yinyang && pip install -e . && cd ..
+      
+      - name: Clone Z3 repository
+        run: |
+          git clone https://github.com/Z3Prover/z3.git z3
+      
+      - name: Checkout commit
+        working-directory: z3
+        run: |
+          git fetch origin
+          git checkout ${{ matrix.commit }}
+          echo "Checked out commit: $(git rev-parse HEAD)"
+      
+      - name: Get full commit hash
+        id: get-commit
+        working-directory: z3
+        run: |
+          FULL_HASH=$(git rev-parse HEAD)
+          echo "commit_hash=$FULL_HASH" >> $GITHUB_OUTPUT
+      
+      - name: Clone z3test repository (for test files)
+        run: |
+          git clone https://github.com/z3prover/z3test.git z3test
+      
+      - name: Clean up git repositories
+        run: rm -rf z3/.git z3test/.git yinyang/.git || true
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Use recipes from artifact
+        run: |
+          cp matrix-data/recipes.jsonl recipes.jsonl
+          
+          RECIPE_COUNT=$(wc -l < recipes.jsonl)
+          echo "✅ Using $RECIPE_COUNT recipes from artifact"
+      
+      - name: Download gcov binary from S3
+        run: |
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/z3/builds/coverage/${COMMIT_HASH}.tar.gz"
+          
+          mkdir -p artifacts
+          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY artifacts/artifacts.tar.gz
+          echo "✅ Downloaded gcov binary for $COMMIT_HASH"
+      
+      - name: Extract gcov binary
+        run: |
+          ./scripts/z3/extract_build_artifacts.sh artifacts/artifacts.tar.gz z3/build true
+          echo "✅ Extracted build artifacts"
+          
+          # Verify gcno files exist
+          GCNO_COUNT=$(find z3/build -name "*.gcno" | wc -l)
+          echo "Found $GCNO_COUNT .gcno files"
+      
+      - name: Download changed functions from S3
+        run: |
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/z3/changed-functions/changed_functions-${COMMIT_HASH}.json.gz"
+          
+          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY changed_functions.json.gz
+          gunzip changed_functions.json.gz
+          
+          FUNC_COUNT=$(jq '.changed_functions | length' changed_functions.json 2>/dev/null || echo "unknown")
+          echo "✅ Downloaded changed functions: $FUNC_COUNT functions"
+      
+      - name: Verify solver binary
+        run: |
+          z3/build/z3 --version
+      
+      - name: Run recipe replay for measurement
+        working-directory: z3
+        run: |
+          SEEDS_FILE="${{ github.workspace }}/${{ steps.job-params.outputs.seeds_file }}"
+          
+          echo "=== Starting recipe replay for job ${{ matrix.job_id }} ==="
+          echo "    Seeds file: $SEEDS_FILE"
+          echo "    Seeds count: ${{ steps.job-params.outputs.seed_count }}"
+          
+          # Run from z3/ directory so seed paths in recipes resolve correctly
+          python3 ${{ github.workspace }}/scripts/z3/rq2/replay_recipes.py \
+            ../recipes.jsonl \
+            --solver ./build/z3 \
+            --build-dir ./build \
+            --changed-functions ../changed_functions.json \
+            --output ../measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}.json \
+            --gcov gcov-14 \
+            --timeout 120 \
+            --num-workers 4 \
+            --seeds-file "$SEEDS_FILE"
+          
+          echo "=== Measurement complete for job ${{ matrix.job_id }} ==="
+      
+      - name: Show job measurement results
+        if: always()
+        run: |
+          RESULT_FILE="measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}.json"
+          if [ -f "$RESULT_FILE" ]; then
+            echo "=== MEASUREMENT RESULTS (Job ${{ matrix.job_id }}) ==="
+            cat "$RESULT_FILE" | python3 -m json.tool
+          else
+            echo "⚠️ Measurement results file not found"
+          fi
+      
+      - name: Upload job result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-measurement-result-${{ matrix.commit }}-job${{ matrix.job_id }}
+          path: measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}.json
+          if-no-files-found: ignore
+
+  # ============================================================
+  # PHASE 5: Merge results and upload to S3
+  # ============================================================
+  merge-and-upload-results:
+    needs: [generate-matrix, prepare-measurement, measurement-jobs]
+    if: always() && needs.prepare-measurement.result == 'success'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.commit_matrix) }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Download job result artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: results-artifacts
+          pattern: baseline-measurement-result-${{ matrix.commit }}-job*
+          merge-multiple: false
+      
+      - name: List downloaded artifacts
+        run: |
+          echo "=== Downloaded artifacts ==="
+          find results-artifacts -type f -name "*.json" | sort
+      
+      - name: Merge job results
+        run: |
+          RESULT_FILES=$(find results-artifacts -name "measurement_result_*.json" | sort)
+          FILE_COUNT=$(echo "$RESULT_FILES" | grep -c . || echo 0)
+          
+          echo "Found $FILE_COUNT result files to merge"
+          
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "⚠️ No result files found"
+            exit 0
+          fi
+          
+          python3 scripts/rq2/merge_measurement_results.py \
+            merged_measurement_${{ matrix.commit }}.json \
+            $RESULT_FILES
+          
+          echo ""
+          echo "=== MERGED MEASUREMENT RESULTS ==="
+          cat merged_measurement_${{ matrix.commit }}.json | python3 -m json.tool
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Upload merged results to S3
+        if: always() && !inputs.dry_run
+        run: |
+          COMMIT_HASH="${{ matrix.commit }}"
+          S3_KEY="evaluation/rq2/z3/measurement-results/baseline/measurement-${COMMIT_HASH}.json.gz"
+          
+          if [ ! -f "merged_measurement_${{ matrix.commit }}.json" ]; then
+            echo "⚠️ Merged measurement results file not found"
+            exit 0
+          fi
+          
+          gzip -c "merged_measurement_${{ matrix.commit }}.json" > measurement_${COMMIT_HASH}.json.gz
+          
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body measurement_${COMMIT_HASH}.json.gz
+          
+          echo "✅ Uploaded baseline measurement results to S3: $S3_KEY"
