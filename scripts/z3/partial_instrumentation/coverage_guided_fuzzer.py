@@ -242,6 +242,15 @@ class CoverageGuidedFuzzer:
         self.stats_total_new_edges = multiprocessing.Value('i', 0)
         self.stats_generations_completed = multiprocessing.Value('i', 0)
         
+        # Phase-aware stats: track mutations separately from calibration
+        self.stats_mutations_generated = multiprocessing.Value('i', 0)  # Total mutations (not tests)
+        self.calibration_end_time = multiprocessing.Value('d', 0.0)  # When calibration ended
+        
+        # Selection tracking: last N selections for debugging
+        self._selection_history = self.manager.list()  # [(score, prob%, path_name), ...]
+        self._selection_history_lock = multiprocessing.Lock()
+        self.MAX_SELECTION_HISTORY = 20
+        
         # Track excluded tests (unsupported/timeout) so we don't re-add them on queue refill
         self.excluded_tests = self.manager.list()
         
@@ -1159,6 +1168,8 @@ class CoverageGuidedFuzzer:
             if len(items) == 1:
                 # Only one item - just take it
                 selected_idx = 0
+                selection_prob = 100.0
+                total_weight = items[0][0]
             else:
                 # Weighted random selection: P(item) ∝ perf_score
                 # perf_score already includes: S(speed), C(coverage), N(newcomer),
@@ -1179,9 +1190,22 @@ class CoverageGuidedFuzzer:
                     if r <= cumulative:
                         selected_idx = i
                         break
+                
+                # Calculate selection probability for the selected item
+                selection_prob = (weights[selected_idx] / total_weight) * 100.0
             
             # Remove selected item and return it
             selected_item = items[selected_idx]
+            selected_score = selected_item[0]
+            selected_path = Path(selected_item[4]).name if selected_item[4] else "unknown"
+            
+            # Track selection history (for debugging/statistics)
+            with self._selection_history_lock:
+                self._selection_history.append((selected_score, selection_prob, selected_path))
+                # Keep only last N selections
+                while len(self._selection_history) > self.MAX_SELECTION_HISTORY:
+                    del self._selection_history[0]
+            
             # Remove from Manager.list (O(n) but queue is typically small)
             del self._work_queue_list[selected_idx]
         
@@ -1199,19 +1223,56 @@ class CoverageGuidedFuzzer:
         return self._queue_size.value
     
     def _get_queue_stats(self) -> dict:
-        """Get queue statistics for debugging."""
+        """Get detailed queue statistics for debugging."""
         with self._work_queue_lock:
             items = list(self._work_queue_list)
         
         if not items:
-            return {"size": 0, "min_score": 0, "max_score": 0, "avg_score": 0}
+            return {
+                "size": 0, "seeds": 0, "mutants": 0,
+                "min_score": 0, "max_score": 0, "avg_score": 0,
+                "p25_score": 0, "p50_score": 0, "p75_score": 0
+            }
         
-        scores = [item[0] for item in items]
+        scores = sorted([item[0] for item in items])
+        seeds = sum(1 for item in items if item[2] == 0)  # generation == 0
+        mutants = len(items) - seeds
+        
+        # Percentiles
+        n = len(scores)
+        p25 = scores[n // 4] if n >= 4 else scores[0]
+        p50 = scores[n // 2] if n >= 2 else scores[0]
+        p75 = scores[3 * n // 4] if n >= 4 else scores[-1]
+        
         return {
             "size": len(items),
-            "min_score": min(scores),
-            "max_score": max(scores),
-            "avg_score": sum(scores) / len(scores)
+            "seeds": seeds,
+            "mutants": mutants,
+            "min_score": scores[0],
+            "max_score": scores[-1],
+            "avg_score": sum(scores) / len(scores),
+            "p25_score": p25,
+            "p50_score": p50,
+            "p75_score": p75
+        }
+    
+    def _get_selection_history_stats(self) -> dict:
+        """Get statistics about recent selections."""
+        with self._selection_history_lock:
+            history = list(self._selection_history)
+        
+        if not history:
+            return {"count": 0, "avg_prob": 0, "min_prob": 0, "max_prob": 0}
+        
+        probs = [h[1] for h in history]
+        scores = [h[0] for h in history]
+        return {
+            "count": len(history),
+            "avg_score": sum(scores) / len(scores),
+            "avg_prob": sum(probs) / len(probs),
+            "min_prob": min(probs),
+            "max_prob": max(probs),
+            "last_5": [(f"{h[0]:.0f}", f"{h[1]:.1f}%", h[2][:20]) for h in history[-5:]]
         }
 
     def _next_seq(self) -> int:
@@ -1693,12 +1754,31 @@ class CoverageGuidedFuzzer:
         tests_per_min = (self._get_stat('tests_processed') / elapsed * 60) if elapsed > 0 else 0
         edges_per_min = (self._get_stat('total_new_edges') / elapsed * 60) if elapsed > 0 else 0
         
+        # Phase-aware mutation rate (excluding calibration)
+        cal_end = self.calibration_end_time.value
+        if cal_end > 0 and self.calibration_done.is_set():
+            fuzzing_time = time.time() - cal_end
+            mutations = self._get_stat('mutants_created')
+            mutations_per_min = (mutations / fuzzing_time * 60) if fuzzing_time > 0 else 0
+        else:
+            fuzzing_time = 0
+            mutations_per_min = 0
+        
+        # Get detailed queue stats
+        queue_stats = self._get_queue_stats()
+        selection_stats = self._get_selection_history_stats()
+        
         # Print status block
         print()
         print(f"[STATUS] ═══════════════════════════════════════════════════════")
         print(f"[STATUS] Time: {elapsed:.0f}s elapsed, {remaining:.0f}s remaining ({elapsed/60:.1f}m / {(elapsed+remaining)/60:.1f}m)")
         print(f"[STATUS] Resources: CPU {cpu_avg:.1f}%, Mem {mem_used_gb:.1f}GB used / {mem_avail_gb:.1f}GB avail [{resource_status}]")
-        print(f"[STATUS] Queue: {queue_size} total")
+        
+        # Enhanced queue stats
+        print(f"[STATUS] Queue: {queue_stats['size']} total ({queue_stats['seeds']} seeds, {queue_stats['mutants']} mutants)")
+        if queue_stats['size'] > 0:
+            print(f"[STATUS]   Scores: min={queue_stats['min_score']:.0f}, p25={queue_stats['p25_score']:.0f}, p50={queue_stats['p50_score']:.0f}, p75={queue_stats['p75_score']:.0f}, max={queue_stats['max_score']:.0f}")
+        
         # Check actual process alive status
         workers_alive = 0
         workers_dead = 0
@@ -1726,7 +1806,18 @@ class CoverageGuidedFuzzer:
         print(f"[STATUS] Favored: {self.pending_favored.value} pending, {sum(1 for v in self.test_favored.values() if v)} total")
         print(f"[STATUS] Generations: {self._get_stat('generations_completed')} completed")
         print(f"[STATUS] Bugs: {self._get_stat('bugs_found')} found")
-        print(f"[STATUS] Rate: {tests_per_min:.1f} tests/min, {edges_per_min:.1f} new edges/min")
+        
+        # Enhanced rates with phase-aware mutation rate
+        if cal_end > 0:
+            print(f"[STATUS] Rate: {tests_per_min:.1f} tests/min overall | {mutations_per_min:.1f} mutations/min (post-cal)")
+        else:
+            print(f"[STATUS] Rate: {tests_per_min:.1f} tests/min (calibrating...)")
+        
+        # Selection history (last 5 selections with probability)
+        if selection_stats['count'] > 0:
+            print(f"[STATUS] Selection: avg_prob={selection_stats['avg_prob']:.1f}%, range=[{selection_stats['min_prob']:.1f}%-{selection_stats['max_prob']:.1f}%]")
+            print(f"[STATUS]   Last 5: {' | '.join(f'{s[0]}({s[1]})' for s in selection_stats['last_5'])}")
+        
         print(f"[STATUS] ═══════════════════════════════════════════════════════")
         print()
         sys.stdout.flush()
@@ -2580,6 +2671,7 @@ class CoverageGuidedFuzzer:
                         
                         if remaining == 0:
                             self.calibration_done.set()
+                            self.calibration_end_time.value = time.time()  # Record when calibration ended
                             avg_rt = self._get_avg_runtime_ms()
                             avg_cov = self._get_avg_coverage()
                             print(f"[INFO] Calibration complete: avg_runtime={avg_rt:.1f}ms, avg_coverage={avg_cov:.1f} edges", flush=True)
