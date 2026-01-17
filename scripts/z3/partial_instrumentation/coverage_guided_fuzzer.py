@@ -2056,7 +2056,16 @@ class CoverageGuidedFuzzer:
         consecutive_timeouts = 0
         MAX_CONSECUTIVE_TIMEOUTS = 3
         
+        # Per-test time budget: prevent slow tests from monopolizing workers
+        # Even if assigned many iterations, stop after this time limit
+        MAX_TEST_TIME_SECONDS = 60.0  # 60s max per test
+        test_start_time = time.time()
+        
         for i in range(num_iterations):
+            # Check per-test time budget
+            if time.time() - test_start_time > MAX_TEST_TIME_SECONDS:
+                print(f"[WORKER {worker_id}] [INLINE] {test_path.name}: time limit ({MAX_TEST_TIME_SECONDS}s) at iter={i}/{num_iterations}", flush=True)
+                break
             formula_str, success = mutator.mutate()
             if not success:
                 continue
