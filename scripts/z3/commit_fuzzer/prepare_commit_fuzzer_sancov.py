@@ -618,36 +618,59 @@ class PrepareCommitAnalyzer:
             funcs: List[FunctionInfo] = []
 
             def visit(n):
-                if n.kind in [clang.cindex.CursorKind.FUNCTION_DECL, clang.cindex.CursorKind.CXX_METHOD] and n.is_definition():
-                    sig = self.get_function_signature(n)
-                    node_file = str(n.location.file) if n.location and n.location.file else None
-                    if sig and node_file and self.is_z3_function(sig):
-                        nf = normpath(node_file)
-                        exp = normpath(abs_path)
-                        if nf.endswith(exp):
-                            # Extract mangled name for sancov allowlist
-                            # Note: mangled_name may not exist for all functions (e.g., static functions)
-                            # It's a property in libclang Python bindings that returns the mangled symbol name
-                            mangled = None
-                            try:
-                                if hasattr(n, 'mangled_name'):
-                                    mangled = n.mangled_name
-                                    # Verify it's actually mangled (starts with _Z for Itanium ABI)
-                                    if mangled and not (mangled.startswith('_Z') or mangled.startswith('__Z')):
-                                        # Might be a C function or unmangled, skip for allowlist
-                                        mangled = None
-                            except (AttributeError, TypeError):
-                                pass
-                            
-                            funcs.append(FunctionInfo(
-                                signature=sig,
-                                start=n.extent.start.line,
-                                end=n.extent.end.line,
-                                file=node_file,
-                                mangled_name=str(mangled) if mangled else None
-                            ))
-                for c in n.get_children():
-                    visit(c)
+                try:
+                    # Handle unknown cursor kinds gracefully (version mismatch between libclang and bindings)
+                    try:
+                        cursor_kind = n.kind
+                    except ValueError:
+                        # Unknown cursor kind - skip this node but continue visiting children
+                        try:
+                            for c in n.get_children():
+                                visit(c)
+                        except Exception:
+                            pass
+                        return
+                    
+                    if cursor_kind in [clang.cindex.CursorKind.FUNCTION_DECL, clang.cindex.CursorKind.CXX_METHOD]:
+                        try:
+                            is_def = n.is_definition()
+                        except Exception:
+                            is_def = False
+                        
+                        if is_def:
+                            sig = self.get_function_signature(n)
+                            node_file = str(n.location.file) if n.location and n.location.file else None
+                            if sig and node_file and self.is_z3_function(sig):
+                                nf = normpath(node_file)
+                                exp = normpath(abs_path)
+                                if nf.endswith(exp):
+                                    # Extract mangled name for sancov allowlist
+                                    mangled = None
+                                    try:
+                                        if hasattr(n, 'mangled_name'):
+                                            mangled = n.mangled_name
+                                            # Verify it's actually mangled (starts with _Z for Itanium ABI)
+                                            if mangled and not (mangled.startswith('_Z') or mangled.startswith('__Z')):
+                                                mangled = None
+                                    except (AttributeError, TypeError):
+                                        pass
+                                    
+                                    funcs.append(FunctionInfo(
+                                        signature=sig,
+                                        start=n.extent.start.line,
+                                        end=n.extent.end.line,
+                                        file=node_file,
+                                        mangled_name=str(mangled) if mangled else None
+                                    ))
+                except Exception:
+                    pass  # Handle any other errors silently
+                
+                # Visit children (even if this node had errors)
+                try:
+                    for c in n.get_children():
+                        visit(c)
+                except Exception:
+                    pass
 
             visit(tu.cursor)
             return funcs
