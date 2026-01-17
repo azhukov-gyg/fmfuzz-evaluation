@@ -803,7 +803,7 @@ class SimpleCommitFuzzer:
                     mutant_path = Path(f.name)
                 
                 # Run differential testing
-                is_bug, bug_type = fuzzer.run_solvers_differential(
+                is_bug, bug_type, _ = fuzzer.run_solvers_differential(
                     mutant_path, 
                     [z3_cmd, cvc5_cmd],
                     timeout=120,

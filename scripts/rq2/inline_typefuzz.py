@@ -211,7 +211,7 @@ class InlineTypeFuzz:
             return "", str(e), 1
     
     def run_solvers_differential(self, mutant_path: Path, solvers: List[str],
-                                 timeout: int, env: Optional[dict] = None) -> Tuple[bool, str]:
+                                 timeout: int, env: Optional[dict] = None) -> Tuple[bool, str, bool]:
         """
         Run multiple solvers for differential testing (matches yinyang logic).
         
@@ -222,28 +222,34 @@ class InlineTypeFuzz:
             env: Optional environment dict
             
         Returns:
-            (is_bug, bug_type) - bug_type is "crash", "segfault", "soundness", or ""
+            (is_bug, bug_type, all_timeout) - bug_type is "crash", "segfault", "soundness", or ""
+            all_timeout is True if all solvers timed out
         """
         oracle = None
+        all_timeout = True  # Track if all solvers timed out
         
         for cmd in solvers:
             stdout, stderr, exitcode = self.run_solver(mutant_path, cmd, timeout, env)
             
             # Check crash_list patterns
             if self._in_list(stdout, stderr, self.crash_list):
-                return True, "crash"
+                return True, "crash", False
             
             # Check ignore_list - skip this solver
             if self._in_list(stdout, stderr, self.ignore_list):
+                all_timeout = False  # At least one solver didn't timeout
                 continue
             
             # Check segfault
             if exitcode == -11 or exitcode == 245:
-                return True, "segfault"
+                return True, "segfault", False
             
             # Check timeout - skip this solver
             if exitcode == 137:
-                continue
+                continue  # Keep all_timeout = True if all timeout
+            
+            # If we get here, this solver didn't timeout
+            all_timeout = False
             
             # Get all results (for incremental benchmarks)
             results = self._grep_results(stdout)
@@ -259,9 +265,9 @@ class InlineTypeFuzz:
             if oracle is None:
                 oracle = results
             elif not self._results_equal(oracle, results):
-                return True, "soundness"
+                return True, "soundness", False
         
-        return False, ""
+        return False, "", all_timeout
 
 
 def regenerate_mutation(seed_path: str, iteration: int, rng_seed: int,

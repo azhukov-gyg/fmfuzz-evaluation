@@ -1880,6 +1880,10 @@ class CoverageGuidedFuzzer:
         discarded_no_cov = 0
         new_edges_total = 0
         
+        # Track consecutive timeouts to stop early if test keeps timing out
+        consecutive_timeouts = 0
+        MAX_CONSECUTIVE_TIMEOUTS = 3
+        
         for i in range(num_iterations):
             formula_str, success = mutator.mutate()
             if not success:
@@ -1909,9 +1913,18 @@ class CoverageGuidedFuzzer:
                 pass
 
             t0 = time.time()
-            is_bug, bug_type = mutator.run_solvers_differential(mutant_path, [z3_cmd, cvc5_cmd], timeout, env)
+            is_bug, bug_type, all_timeout = mutator.run_solvers_differential(mutant_path, [z3_cmd, cvc5_cmd], timeout, env)
             t1 = time.time()
             runtime_i = t1 - t0
+            
+            # Track consecutive timeouts
+            if all_timeout:
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+                    print(f"[WORKER {worker_id}] [INLINE] Stopping {test_path.name} early: {consecutive_timeouts} consecutive timeouts (iter={iteration}/{num_iterations})", flush=True)
+                    break
+            else:
+                consecutive_timeouts = 0  # Reset counter on successful run
 
             if is_bug:
                 # Match typefuzz naming: {bugtype}-{solver}-{seed}-{random}.smt2
