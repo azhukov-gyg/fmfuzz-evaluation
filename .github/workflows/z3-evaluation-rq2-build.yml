@@ -2,6 +2,16 @@ name: Z3 RQ2 Binary Building
 
 on:
   workflow_dispatch:
+    inputs:
+      debug_commit_hash:
+        description: 'Debug: Specific commit hash to build. If provided, only this commit will be built.'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run: Skip S3 uploads (default: false)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   generate-matrix:
@@ -38,11 +48,24 @@ jobs:
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
-          # Get commits from generate_build_matrix.py
-          COMMITS_JSON=$(python3 scripts/rq2/generate_build_matrix.py z3)
-          
-          # Expand to include both build types for each commit
-          MATRIX=$(echo "$COMMITS_JSON" | python3 -c "
+          if [ -n "${{ inputs.debug_commit_hash }}" ]; then
+            echo "🔍 Debug mode: Using specific commit ${{ inputs.debug_commit_hash }}"
+            DEBUG_COMMIT="${{ inputs.debug_commit_hash }}"
+            # Single commit, both build types
+            MATRIX=$(python3 -c "
+          import json
+          commits = ['$DEBUG_COMMIT']
+          build_types = ['fuzzing', 'instrumented']
+          include = [{'commit': c, 'build_type': b} for c in commits for b in build_types]
+          print(json.dumps({'include': include}, separators=(',', ':')))
+          ")
+            TOTAL_JOBS=2
+          else
+            # Get commits from generate_build_matrix.py
+            COMMITS_JSON=$(python3 scripts/rq2/generate_build_matrix.py z3)
+            
+            # Expand to include both build types for each commit
+            MATRIX=$(echo "$COMMITS_JSON" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
           commits = [entry['commit'] for entry in data['include']]
@@ -50,7 +73,8 @@ jobs:
           include = [{'commit': c, 'build_type': b} for c in commits for b in build_types]
           print(json.dumps({'include': include}, separators=(',', ':')))
           ")
-          TOTAL_JOBS=$(echo "$MATRIX" | python3 -c "import sys, json; print(len(json.load(sys.stdin)['include']))")
+            TOTAL_JOBS=$(echo "$MATRIX" | python3 -c "import sys, json; print(len(json.load(sys.stdin)['include']))")
+          fi
           
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
           echo "total_commits=$TOTAL_JOBS" >> $GITHUB_OUTPUT
@@ -186,6 +210,7 @@ jobs:
           ls -la /tmp/artifacts.tar.gz
       
       - name: Configure AWS credentials
+        if: ${{ !inputs.dry_run }}
         uses: aws-actions/configure-aws-credentials@v5.1.0
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -193,6 +218,7 @@ jobs:
           aws-region: ${{ secrets.AWS_REGION }}
       
       - name: Upload binary to S3
+        if: ${{ !inputs.dry_run }}
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
           BUILD_TYPE="${{ matrix.build_type }}"
@@ -209,4 +235,14 @@ jobs:
             --body /tmp/artifacts.tar.gz
           
           echo "✅ Uploaded ${BUILD_TYPE} binary to S3: $S3_KEY"
+      
+      - name: Dry run - Skip S3 upload
+        if: ${{ inputs.dry_run }}
+        run: |
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          BUILD_TYPE="${{ matrix.build_type }}"
+          echo "🔍 DRY RUN: Would upload ${BUILD_TYPE} binary to S3"
+          echo "   Commit: $COMMIT_HASH"
+          echo "   Path: evaluation/rq2/z3/builds/${BUILD_TYPE}/${COMMIT_HASH}.tar.gz"
+          ls -la /tmp/artifacts.tar.gz
 
