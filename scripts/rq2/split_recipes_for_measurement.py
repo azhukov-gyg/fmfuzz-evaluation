@@ -58,9 +58,11 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
         print("0")
         return
     
-    # Load recipes and group by seed
+    # Load recipes and group by seed (including chain for deterministic replay)
     recipes: List[dict] = []
-    seed_groups: Dict[Tuple[str, int], List[int]] = OrderedDict()  # (seed_path, rng_seed) -> [recipe_indices]
+    # Group key: (seed_path, rng_seed, chain_tuple)
+    # Chain is important: recipes with different chains are different mutation lineages
+    seed_groups: Dict[Tuple[str, int, Tuple[int, ...]], List[int]] = OrderedDict()
     parse_errors = 0
     
     def parse_jsonl(f):
@@ -75,11 +77,13 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
                 recipe_idx = len(recipes)
                 recipes.append(recipe)
                 
-                # Group by (seed_path, rng_seed)
+                # Group by (seed_path, rng_seed, chain)
                 # NOTE: Default rng_seed must match replay_recipes.py (42)
+                # Chain is a list of iterations that led to the parent seed
                 seed_path = recipe.get('seed_path', '')
                 rng_seed = recipe.get('rng_seed', 42)
-                key = (seed_path, rng_seed)
+                chain = tuple(recipe.get('chain', []))  # Convert to tuple for hashability
+                key = (seed_path, rng_seed, chain)
                 
                 if key not in seed_groups:
                     seed_groups[key] = []
@@ -135,7 +139,8 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
     sorted_seeds = sorted(seed_groups.items(), key=lambda x: -len(x[1]))
     
     # Greedy bin packing: assign each seed to the job with fewest recipes
-    job_seeds: List[List[Tuple[str, int]]] = [[] for _ in range(num_jobs)]
+    # Key is now (seed_path, rng_seed, chain)
+    job_seeds: List[List[Tuple[str, int, Tuple[int, ...]]]] = [[] for _ in range(num_jobs)]
     job_counts: List[int] = [0] * num_jobs
     
     for seed_key, indices in sorted_seeds:
@@ -154,13 +159,18 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
         
         # Collect all recipe indices for this job's seeds
         job_recipe_indices = []
-        # Store (seed_path, rng_seed) tuples to ensure correct filtering
+        # Store (seed_path, rng_seed, chain) info for precise filtering
         job_seed_keys = []
         for seed_key in job_seeds[job_id]:
             job_recipe_indices.extend(seed_groups[seed_key])
-            job_seed_keys.append({"seed_path": seed_key[0], "rng_seed": seed_key[1]})
+            # seed_key is (seed_path, rng_seed, chain_tuple)
+            job_seed_keys.append({
+                "seed_path": seed_key[0],
+                "rng_seed": seed_key[1],
+                "chain": list(seed_key[2])  # Convert tuple back to list for JSON
+            })
         
-        # Write seeds file for this job (includes rng_seed for precise filtering)
+        # Write seeds file for this job (includes rng_seed and chain for precise filtering)
         seeds_file = output_dir / f"seeds_job_{job_id}.json"
         with open(seeds_file, 'w') as f:
             json.dump({"seed_keys": job_seed_keys, "job_id": job_id}, f, indent=2)

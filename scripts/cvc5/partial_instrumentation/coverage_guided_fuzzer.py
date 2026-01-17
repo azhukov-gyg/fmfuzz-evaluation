@@ -297,6 +297,15 @@ class CoverageGuidedFuzzer:
         # Track fuzz_level per test (how many times it's been fuzzed)
         self.test_fuzz_level = self.manager.dict()  # test_path -> int
         
+        # Track lineage for each mutant (for recipe recording with chain replay)
+        # mutant_path -> {"original": original_seed_path, "chain": [iter1, iter2, ...]}
+        # - "original": The original test file from the corpus
+        # - "chain": List of iterations that led to this mutant
+        #   For gen1 at iter 10: {"original": "seed.smt2", "chain": [10]}
+        #   For gen2 at iter 10->20: {"original": "seed.smt2", "chain": [10, 20]}
+        # This allows replay to regenerate intermediate mutants without calling solvers.
+        self.seed_lineage_map = self.manager.dict()
+        
         # Slow test handling - don't skip, but give very few iterations
         # Tests slower than this get minimum iterations (5) instead of being excluded
         self.SLOW_TEST_THRESHOLD_S = 10.0  # seconds - tests slower than this get min iterations
@@ -1898,7 +1907,19 @@ class CoverageGuidedFuzzer:
             
             # Record recipe ONLY for mutations where solver actually runs
             if recipe_recorder:
-                recipe_recorder.record(str(test_path), iteration)
+                # Look up lineage if test_path is a mutant from pending_mutants
+                lineage = self.seed_lineage_map.get(str(test_path))
+                if lineage:
+                    # Parent is a mutant - use its original seed and chain
+                    original_seed = lineage["original"]
+                    chain = lineage["chain"]
+                else:
+                    # Parent is original seed
+                    original_seed = str(test_path)
+                    chain = []
+                recipe_recorder.record(str(test_path), iteration, 
+                                      original_seed_path=original_seed,
+                                      mutation_chain=chain)
 
             mutant_path = scratch_folder / f"mutant_{worker_id}_{i}.smt2"
             with open(mutant_path, 'w') as f:
@@ -1989,13 +2010,35 @@ class CoverageGuidedFuzzer:
                     pass
                 continue
 
-            # Queue the mutant: (runtime, new_cov_rank, generation, seq, path_str)
-            pending_name = f"gen{generation+1}_w{worker_id}_iter{i}_{mutant_path.name}"
+            # Get parent's lineage info (or create new for original seeds)
+            parent_lineage = self.seed_lineage_map.get(str(test_path))
+            if parent_lineage:
+                # Parent is a mutant - inherit its original and extend chain
+                original_seed = parent_lineage["original"]
+                parent_chain = parent_lineage["chain"]
+            else:
+                # Parent is original seed - use it as original, empty chain
+                original_seed = str(test_path)
+                parent_chain = []
+            
+            # Extract original seed stem for filename (like typefuzz does)
+            original_stem = Path(original_seed).stem
+            
+            # Queue the mutant with typefuzz-style naming: gen_worker_iter_originalseed.smt2
+            pending_name = f"gen{generation+1}_w{worker_id}_iter{i}_{original_stem}.smt2"
             pending_path = self.pending_mutants_dir / pending_name
             try:
                 shutil.move(str(mutant_path), str(pending_path))
             except Exception:
                 continue
+
+            # Track lineage: original seed + chain extended with current iteration
+            # The iteration that created THIS mutant is 'i' (0-indexed), recipe uses 1-indexed
+            new_chain = parent_chain + [i + 1]  # 1-indexed for consistency with recipes
+            self.seed_lineage_map[str(pending_path)] = {
+                "original": original_seed,
+                "chain": new_chain
+            }
 
             self._inc_stat('mutants_created')
             if cov_rank == 0:
@@ -2622,9 +2665,27 @@ class CoverageGuidedFuzzer:
                                 
                                 for mutant_file in mutant_files:
                                     try:
-                                        pending_name = f"gen{generation+1}_w{worker_id}_{mutant_file.name}"
+                                        # In subprocess mode, we don't have iteration numbers
+                                        # So we can only track original seed, not full chain
+                                        test_path_str = str(test_path) if not isinstance(test_path, str) else test_path
+                                        parent_lineage = self.seed_lineage_map.get(test_path_str)
+                                        if parent_lineage:
+                                            original_seed = parent_lineage["original"]
+                                        else:
+                                            original_seed = test_path_str
+                                        
+                                        # Use original seed stem in filename for consistency
+                                        original_stem = Path(original_seed).stem
+                                        pending_name = f"gen{generation+1}_w{worker_id}_{original_stem}_{mutant_file.stem}.smt2"
                                         pending_path = self.pending_mutants_dir / pending_name
                                         shutil.move(str(mutant_file), str(pending_path))
+                                        
+                                        # Track lineage (subprocess mode: no chain, just original)
+                                        # NOTE: Recipe recording not supported in subprocess mode
+                                        self.seed_lineage_map[str(pending_path)] = {
+                                            "original": original_seed,
+                                            "chain": []  # Unknown in subprocess mode
+                                        }
                                         
                                         # Set newcomer bonus for new mutants
                                         # NEW coverage gets big bonus (8x) to encourage exploration

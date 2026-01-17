@@ -66,7 +66,9 @@ class RecipeRecorder:
         self._file.flush()
     
     def record(self, seed_path: str, iteration: int, 
-               extra_data: Optional[dict] = None) -> None:
+               extra_data: Optional[dict] = None,
+               original_seed_path: Optional[str] = None,
+               mutation_chain: Optional[List[int]] = None) -> None:
         """
         Record a single mutation recipe.
         
@@ -74,14 +76,24 @@ class RecipeRecorder:
             seed_path: Full path to the seed file that was mutated
             iteration: Which iteration of mutation (1-indexed)
             extra_data: Optional additional data (e.g., coverage info, bug found)
+            original_seed_path: Original test file path (for coverage-guided fuzzing
+                               where mutants can be seeds). If None, seed_path is used.
+            mutation_chain: List of iterations that produced the parent seed.
+                           For gen1: [] (empty, seed is original)
+                           For gen2: [10] (parent was gen1 created at iter 10)
+                           For gen3: [10, 20] (gen1 at 10, gen2 at 20)
         """
         recipe = {
-            "seed_path": str(seed_path),
+            "seed_path": str(original_seed_path or seed_path),
             "iteration": iteration,
             "rng_seed": self.rng_seed,
             "worker_id": self.worker_id,
             "timestamp": time.time() - self._start_time,
         }
+        
+        # Only include chain if non-empty (saves space for gen1 recipes)
+        if mutation_chain:
+            recipe["chain"] = mutation_chain
         
         if extra_data:
             recipe.update(extra_data)

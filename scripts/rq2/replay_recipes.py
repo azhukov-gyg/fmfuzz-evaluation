@@ -2,9 +2,15 @@
 """
 Recipe Replay - Regenerates mutations from recipes and measures function calls using gcov.
 
-OPTIMIZED: Recipes are grouped by (seed_path, rng_seed) and processed sequentially.
+OPTIMIZED: Recipes are grouped by (seed_path, rng_seed, chain) and processed sequentially.
 - Before: O(N²) - for each recipe, regenerate all previous iterations
 - After: O(N) - parse seed once, generate mutations in order, reuse RNG state
+
+CHAIN SUPPORT: Recipes may include a 'chain' field for multi-generation mutations.
+- chain=[] : Direct mutation from original seed (gen0)
+- chain=[10] : Mutation of a gen1 mutant (created at iter 10 of original seed)
+- chain=[10, 20] : Mutation of gen2 (gen1 at iter 10, gen2 at iter 20)
+- Chains are regenerated WITHOUT solver calls (dry mutations) before measuring
 
 PARALLEL: Multiple workers process different seed groups simultaneously.
 - Workers share the same build directory (gcda files accumulate)
@@ -375,17 +381,25 @@ def reset_gcda_files(build_dir: str):
     return count
 
 
-def group_recipes_by_seed(recipes: List[dict]) -> Dict[Tuple[str, int], List[dict]]:
+def group_recipes_by_seed(recipes: List[dict]) -> Dict[Tuple[str, int, Tuple[int, ...]], List[dict]]:
     """
-    Group recipes by (seed_path, rng_seed) and sort each group by iteration.
+    Group recipes by (seed_path, rng_seed, chain) and sort each group by iteration.
+    
+    Chain support:
+    - Recipes with 'chain' field contain the mutation lineage
+    - chain=[10] means parent was gen1 created at iteration 10
+    - chain=[10, 20] means gen1 at iter 10, gen2 at iter 20
+    - Empty or missing chain means fuzzing directly from original seed
     """
     groups = defaultdict(list)
     
     for recipe in recipes:
         seed_path = recipe.get('seed_path')
         rng_seed = recipe.get('rng_seed', 42)
+        # Convert chain list to tuple for hashability (empty list becomes empty tuple)
+        chain = tuple(recipe.get('chain', []))
         if seed_path:
-            key = (seed_path, rng_seed)
+            key = (seed_path, rng_seed, chain)
             groups[key].append(recipe)
     
     # Sort each group by iteration
@@ -395,9 +409,83 @@ def group_recipes_by_seed(recipes: List[dict]) -> Dict[Tuple[str, int], List[dic
     return dict(groups)
 
 
+def regenerate_chain_content(
+    seed_path: str,
+    rng_seed: int,
+    chain: Tuple[int, ...],
+    worker_id: int
+) -> Optional[str]:
+    """
+    Regenerate intermediate mutant content by replaying the mutation chain.
+    
+    Args:
+        seed_path: Path to original seed file
+        rng_seed: RNG seed used for mutations
+        chain: Tuple of iterations, e.g., (10, 20) means gen1 at iter 10, gen2 at iter 20
+        worker_id: For logging
+    
+    Returns:
+        The content of the final mutant in the chain, or None if regeneration fails.
+        For empty chain, returns the original seed content.
+    """
+    # Read original seed content
+    try:
+        with open(seed_path, 'r') as f:
+            content = f.read()
+    except Exception as e:
+        log(f"[W{worker_id}] Failed to read seed {seed_path}: {e}")
+        return None
+    
+    # If no chain, return original content
+    if not chain:
+        return content
+    
+    # Replay each step in the chain (dry mutations - no solver calls)
+    for step_idx, target_iter in enumerate(chain):
+        # Initialize RNG fresh for each chain step (same as during fuzzing)
+        random.seed(rng_seed)
+        
+        # Create fuzzer from current content
+        try:
+            # InlineTypeFuzz can accept content string directly via from_string
+            fuzzer = InlineTypeFuzz.from_string(content) if hasattr(InlineTypeFuzz, 'from_string') else None
+            if fuzzer is None:
+                # Fallback: write to temp file and parse
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
+                    f.write(content)
+                    temp_path = f.name
+                try:
+                    fuzzer = InlineTypeFuzz(Path(temp_path))
+                    if not fuzzer.parse():
+                        log(f"[W{worker_id}] Chain step {step_idx}: parse failed")
+                        return None
+                finally:
+                    try:
+                        os.unlink(temp_path)
+                    except:
+                        pass
+        except Exception as e:
+            log(f"[W{worker_id}] Chain step {step_idx}: failed to create fuzzer: {e}")
+            return None
+        
+        # Generate mutations up to target_iter (dry - no solver)
+        for i in range(1, target_iter + 1):
+            mutant, success = fuzzer.mutate()
+            if i == target_iter:
+                if success and mutant:
+                    content = mutant
+                else:
+                    log(f"[W{worker_id}] Chain step {step_idx}: mutation {target_iter} failed")
+                    return None
+    
+    return content
+
+
 def process_seed_group(
     seed_path: str,
     rng_seed: int,
+    chain: Tuple[int, ...],
     group_recipes: List[dict],
     solver_path: str,
     build_dir: str,
@@ -406,14 +494,20 @@ def process_seed_group(
     progress_queue: multiprocessing.Queue
 ) -> Tuple[int, int, int]:
     """
-    Process all recipes for a single seed group.
+    Process all recipes for a single seed group (with optional chain).
     Returns (successful_runs, failed_runs, mutations_generated).
+    
+    Chain support:
+    - Empty chain: fuzz directly from original seed
+    - chain=(10,): regenerate gen1 at iter 10, then fuzz from that
+    - chain=(10, 20): regenerate gen1->gen2, then fuzz from gen2
     """
     successful = 0
     failed = 0
     mutations = 0
     
     seed_name = Path(seed_path).name
+    chain_str = f" chain={list(chain)}" if chain else ""
     
     # Don't set GCOV_PREFIX - let gcov use embedded absolute paths
     # The binary was compiled with absolute paths, and we're running on the same CI
@@ -424,6 +518,18 @@ def process_seed_group(
     if not os.path.exists(seed_path):
         progress_queue.put(('skip', worker_id, seed_name, 'not found', len(group_recipes)))
         return 0, len(group_recipes), 0
+    
+    # Regenerate chain content if needed (dry mutations - no solver)
+    if chain:
+        log(f"[W{worker_id}] {seed_name}: regenerating chain {list(chain)}")
+        start_content = regenerate_chain_content(seed_path, rng_seed, chain, worker_id)
+        if start_content is None:
+            progress_queue.put(('skip', worker_id, seed_name, f'chain regeneration failed{chain_str}', len(group_recipes)))
+            return 0, len(group_recipes), 0
+        # Count chain mutations (not counted toward solver runs)
+        mutations += sum(chain)
+    else:
+        start_content = None  # Will read from file directly
     
     # Extract test-specific flags and DISABLE-TESTER directives from seed file header
     test_flags, disabled_testers = extract_test_directives(seed_path)
@@ -436,13 +542,38 @@ def process_seed_group(
     if 'model' in disabled_testers:
         base_flags = [f for f in base_flags if f != '--debug-check-models']
     
-    # Initialize RNG and parse seed ONCE
+    # Initialize RNG and create fuzzer
     random.seed(rng_seed)
-    fuzzer = InlineTypeFuzz(Path(seed_path))
     
-    if not fuzzer.parse():
-        progress_queue.put(('skip', worker_id, seed_name, 'parse failed', len(group_recipes)))
-        return 0, len(group_recipes), 0
+    # Create fuzzer from chain content or original file
+    if start_content is not None:
+        # We have regenerated chain content - use it
+        try:
+            fuzzer = InlineTypeFuzz.from_string(start_content) if hasattr(InlineTypeFuzz, 'from_string') else None
+            if fuzzer is None:
+                # Fallback: write to temp file
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
+                    f.write(start_content)
+                    temp_path = f.name
+                try:
+                    fuzzer = InlineTypeFuzz(Path(temp_path))
+                    if not fuzzer.parse():
+                        progress_queue.put(('skip', worker_id, seed_name, f'chain content parse failed{chain_str}', len(group_recipes)))
+                        return 0, len(group_recipes), 0
+                finally:
+                    try:
+                        os.unlink(temp_path)
+                    except:
+                        pass
+        except Exception as e:
+            progress_queue.put(('skip', worker_id, seed_name, f'chain fuzzer init failed: {e}', len(group_recipes)))
+            return 0, len(group_recipes), 0
+    else:
+        # No chain - parse original file
+        fuzzer = InlineTypeFuzz(Path(seed_path))
+        if not fuzzer.parse():
+            progress_queue.put(('skip', worker_id, seed_name, 'parse failed', len(group_recipes)))
+            return 0, len(group_recipes), 0
     
     # Process iterations sequentially
     current_iteration = 0
@@ -524,22 +655,22 @@ def process_seed_group(
 
 def worker_process(
     worker_id: int,
-    seed_groups_chunk: List[Tuple[Tuple[str, int], List[dict]]],
+    seed_groups_chunk: List[Tuple[Tuple[str, int, Tuple[int, ...]], List[dict]]],
     solver_path: str,
     build_dir: str,
     timeout: int,
     progress_queue: multiprocessing.Queue,
     result_queue: multiprocessing.Queue
 ):
-    """Worker that processes a chunk of seed groups."""
+    """Worker that processes a chunk of seed groups (with chain support)."""
     total_successful = 0
     total_failed = 0
     total_mutations = 0
     seeds_done = 0
     
-    for (seed_path, rng_seed), group_recipes in seed_groups_chunk:
+    for (seed_path, rng_seed, chain), group_recipes in seed_groups_chunk:
         successful, failed, mutations = process_seed_group(
-            seed_path, rng_seed, group_recipes,
+            seed_path, rng_seed, chain, group_recipes,
             solver_path, build_dir, timeout,
             worker_id, progress_queue
         )
@@ -595,10 +726,11 @@ def replay_recipes_optimized(
     
     # Load allowed seed keys if provided
     # Can be either:
-    #   - Dict with seed_keys (new format): {"seed_keys": [{"seed_path": "...", "rng_seed": 42}, ...]}
+    #   - Dict with seed_keys (new format with chain): {"seed_keys": [{"seed_path": "...", "rng_seed": 42, "chain": [10, 20]}, ...]}
+    #   - Dict with seed_keys (old format): {"seed_keys": [{"seed_path": "...", "rng_seed": 42}, ...]}
     #   - List of seed paths (old format): ["path1", "path2"]
     #   - Dict with seeds list (old format): {"seeds": ["path1", "path2"]}
-    allowed_seed_keys: Optional[Set[Tuple[str, int]]] = None
+    allowed_seed_keys: Optional[Set[Tuple[str, int, Tuple[int, ...]]]] = None
     allowed_seed_paths: Optional[Set[str]] = None
     
     if seeds_file:
@@ -607,11 +739,12 @@ def replay_recipes_optimized(
             seeds_data = json.load(f)
         
         if isinstance(seeds_data, dict) and 'seed_keys' in seeds_data:
-            # New format: list of {seed_path, rng_seed} objects
+            # New format: list of {seed_path, rng_seed, chain} objects
             allowed_seed_keys = set()
             for sk in seeds_data['seed_keys']:
-                allowed_seed_keys.add((sk['seed_path'], sk['rng_seed']))
-            log(f"Filtering to {len(allowed_seed_keys)} seed groups (path + rng_seed)")
+                chain = tuple(sk.get('chain', []))  # Default to empty chain for backward compat
+                allowed_seed_keys.add((sk['seed_path'], sk['rng_seed'], chain))
+            log(f"Filtering to {len(allowed_seed_keys)} seed groups (path + rng_seed + chain)")
         elif isinstance(seeds_data, list):
             # Old format: list of seed paths (no rng_seed filtering)
             allowed_seed_paths = set(seeds_data)
@@ -629,9 +762,10 @@ def replay_recipes_optimized(
     
     # Apply filtering
     if allowed_seed_keys is not None:
-        # Filter by (seed_path, rng_seed) tuples - precise filtering
-        recipes = [r for r in all_recipes 
-                   if (r.get('seed_path'), r.get('rng_seed', 42)) in allowed_seed_keys]
+        # Filter by (seed_path, rng_seed, chain) tuples - precise filtering with chain
+        def recipe_to_key(r):
+            return (r.get('seed_path'), r.get('rng_seed', 42), tuple(r.get('chain', [])))
+        recipes = [r for r in all_recipes if recipe_to_key(r) in allowed_seed_keys]
         log(f"After seed filter: {len(recipes)} recipes")
     elif allowed_seed_paths is not None:
         # Legacy: filter by seed_path only
@@ -671,7 +805,7 @@ def replay_recipes_optimized(
     log(f"Found {len(seed_groups_list)} unique seed groups")
     
     # Show sample of groups
-    for (seed_path, rng_seed), group_recipes in seed_groups_list[:3]:
+    for (seed_path, rng_seed, chain), group_recipes in seed_groups_list[:3]:
         seed_name = Path(seed_path).name
         iterations = [r.get('iteration', 0) for r in group_recipes]
         log(f"  - {seed_name}: {len(group_recipes)} recipes, iterations {min(iterations)}-{max(iterations)}")
