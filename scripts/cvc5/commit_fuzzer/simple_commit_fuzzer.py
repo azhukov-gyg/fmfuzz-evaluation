@@ -815,7 +815,15 @@ class SimpleCommitFuzzer:
                     bug_dest = bugs_folder / f"bug_{bug_type}_{int(time.time())}_{iteration}.smt2"
                     shutil.copy(str(mutant_path), str(bug_dest))
                     bug_files.append(bug_dest)
-                    print(f"[WORKER {worker_id}] Found {bug_type} bug at iteration {iteration}", file=sys.stderr)
+                    print(f"[WORKER {worker_id}] Found {bug_type} bug at iteration {iteration} - stopping iterations on this seed", file=sys.stderr)
+                    # Stop iterating on this seed (like typefuzz does)
+                    # The seed will be requeued for the next cycle
+                    if mutant_path and mutant_path.exists():
+                        try:
+                            mutant_path.unlink()
+                        except:
+                            pass
+                    break
                     
             except Exception as e:
                 pass
