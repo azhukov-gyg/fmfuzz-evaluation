@@ -7,10 +7,16 @@ A "recipe" captures the minimal information needed to reproduce a mutation:
 - iteration: Which iteration of mutation (1-indexed)
 - rng_seed: The random seed used for this mutation sequence
 - worker_id: Which parallel worker generated this recipe
+- content_hash: MD5 hash of the mutant content (for determinism validation)
 
 This enables fair comparison of fuzzing strategies by:
 1. Recording recipes during fuzzing (with strategy-specific overhead)
 2. Replaying ALL recipes on the SAME measurement binary (identical overhead)
+
+Determinism validation:
+- During fuzzing: calculate MD5 hash of mutant content and store in recipe
+- During replay: regenerate mutation and compare hash
+- Mismatches indicate non-determinism (different yinyang versions, PYTHONHASHSEED, etc.)
 
 Parallel support:
 - Each fuzzing worker records to its own file: recipes_worker_0.jsonl, recipes_worker_1.jsonl, etc.
@@ -23,12 +29,18 @@ Used by:
 - Variant2: coverage_guided_fuzzer.py
 """
 
+import hashlib
 import json
 import os
 import threading
 import time
 from pathlib import Path
 from typing import Optional, TextIO, List
+
+
+def compute_content_hash(content: str) -> str:
+    """Compute MD5 hash of content string for determinism validation."""
+    return hashlib.md5(content.encode('utf-8', errors='replace')).hexdigest()[:16]
 
 
 class RecipeRecorder:
@@ -68,7 +80,8 @@ class RecipeRecorder:
     def record(self, seed_path: str, iteration: int, 
                extra_data: Optional[dict] = None,
                original_seed_path: Optional[str] = None,
-               mutation_chain: Optional[List[int]] = None) -> None:
+               mutation_chain: Optional[List[int]] = None,
+               content_hash: Optional[str] = None) -> None:
         """
         Record a single mutation recipe.
         
@@ -82,6 +95,8 @@ class RecipeRecorder:
                            For gen1: [] (empty, seed is original)
                            For gen2: [10] (parent was gen1 created at iter 10)
                            For gen3: [10, 20] (gen1 at 10, gen2 at 20)
+            content_hash: MD5 hash (16 chars) of mutant content for determinism validation.
+                         Use compute_content_hash(content) to generate.
         """
         recipe = {
             "seed_path": str(original_seed_path or seed_path),
@@ -94,6 +109,10 @@ class RecipeRecorder:
         # Only include chain if non-empty (saves space for gen1 recipes)
         if mutation_chain:
             recipe["chain"] = mutation_chain
+        
+        # Include content hash for determinism validation
+        if content_hash:
+            recipe["hash"] = content_hash
         
         if extra_data:
             recipe.update(extra_data)

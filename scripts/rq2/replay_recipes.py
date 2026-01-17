@@ -37,7 +37,7 @@ SCRIPT_DIR = Path(__file__).parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from recipe_recorder import RecipeReader
+from recipe_recorder import RecipeReader, compute_content_hash
 
 # Try to import yinyang components
 YINYANG_AVAILABLE = False
@@ -591,6 +591,15 @@ def process_seed_group(
             
             if current_iteration == target_iteration:
                 if success and mutant:
+                    # Validate content hash if available (determinism check)
+                    expected_hash = recipe.get('hash')
+                    if expected_hash:
+                        actual_hash = compute_content_hash(mutant)
+                        if actual_hash != expected_hash:
+                            progress_queue.put(('hash_mismatch', worker_id, seed_name, 
+                                              current_iteration, expected_hash, actual_hash))
+                            # Continue anyway but log the mismatch
+                    
                     # Run solver
                     mutant_path = None
                     try:
@@ -879,6 +888,9 @@ def replay_recipes_optimized(
                 elif msg[0] == 'timeout':
                     _, worker_id, seed_name, iteration, remaining, total = msg
                     log(f"[W{worker_id}] TIMEOUT {seed_name} iter {iteration} ({remaining} remaining of {total})")
+                elif msg[0] == 'hash_mismatch':
+                    _, worker_id, seed_name, iteration, expected, actual = msg
+                    log(f"[W{worker_id}] ⚠️ HASH MISMATCH {seed_name} iter {iteration}: expected={expected} actual={actual}")
                 elif msg[0] == 'error':
                     _, worker_id, seed_name, error_msg = msg
                     log(f"[W{worker_id}] ERROR {seed_name}: {error_msg}")

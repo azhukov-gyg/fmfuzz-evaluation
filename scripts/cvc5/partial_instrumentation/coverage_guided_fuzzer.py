@@ -43,14 +43,16 @@ except ImportError as e:
 _RecipeRecorder = None
 _get_worker_recipe_path = None
 _merge_recipe_files = None
+_compute_content_hash = None
 
 def _import_recipes():
-    global _RecipeRecorder, _get_worker_recipe_path, _merge_recipe_files
+    global _RecipeRecorder, _get_worker_recipe_path, _merge_recipe_files, _compute_content_hash
     if _RecipeRecorder is None:
-        from recipe_recorder import RecipeRecorder, get_worker_recipe_path, merge_recipe_files
+        from recipe_recorder import RecipeRecorder, get_worker_recipe_path, merge_recipe_files, compute_content_hash
         _RecipeRecorder = RecipeRecorder
         _get_worker_recipe_path = get_worker_recipe_path
         _merge_recipe_files = merge_recipe_files
+        _compute_content_hash = compute_content_hash
     return _RecipeRecorder, _get_worker_recipe_path, _merge_recipe_files
 
 
@@ -2132,9 +2134,12 @@ class CoverageGuidedFuzzer:
                     # Parent is original seed
                     original_seed = str(test_path)
                     chain = []
+                # Compute content hash for determinism validation during replay
+                content_hash = _compute_content_hash(formula_str) if _compute_content_hash else None
                 recipe_recorder.record(str(test_path), iteration, 
                                       original_seed_path=original_seed,
-                                      mutation_chain=chain)
+                                      mutation_chain=chain,
+                                      content_hash=content_hash)
 
             mutant_path = scratch_folder / f"mutant_{worker_id}_{i}.smt2"
             with open(mutant_path, 'w') as f:
