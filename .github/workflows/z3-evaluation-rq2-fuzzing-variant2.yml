@@ -1,0 +1,565 @@
+name: Z3 RQ2 Fuzzing - Variant2 (Coverage-Guided)
+
+on:
+  workflow_dispatch:
+    inputs:
+      fuzzing_duration_minutes:
+        description: 'Fuzzing duration in minutes (default: 60)'
+        required: false
+        type: number
+        default: 60
+      debug_commit_hash:
+        description: 'Debug: Specific commit hash to test. If provided, only this commit will be fuzzed.'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run: Skip S3 uploads (default: false)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  generate-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      commit_matrix: ${{ steps.generate-matrix.outputs.commit_matrix }}
+      total_commits: ${{ steps.generate-matrix.outputs.total_commits }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      - name: Install dependencies
+        run: pip install boto3
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Generate commit matrix
+        id: generate-matrix
+        env:
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          if [ -n "${{ inputs.debug_commit_hash }}" ]; then
+            echo "🔍 Debug mode: Using specific commit ${{ inputs.debug_commit_hash }}"
+            DEBUG_COMMIT="${{ inputs.debug_commit_hash }}"
+            COMMIT_MATRIX=$(python3 -c "import json; print(json.dumps({'include': [{'commit': '$DEBUG_COMMIT'}]}, separators=(',', ':')))")
+            TOTAL_COMMITS=1
+          else
+            RESULT=$(python3 scripts/rq2/generate_fuzzing_matrix.py z3)
+            COMMIT_MATRIX=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(json.dumps({'include': data['include']}, separators=(',', ':')))")
+            TOTAL_COMMITS=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['total_commits'])")
+          fi
+          
+          echo "commit_matrix=$COMMIT_MATRIX" >> $GITHUB_OUTPUT
+          echo "total_commits=$TOTAL_COMMITS" >> $GITHUB_OUTPUT
+          echo "✅ Generated matrix: $TOTAL_COMMITS commits"
+
+  prepare-commit-fuzzer:
+    needs: generate-matrix
+    if: needs.generate-matrix.outputs.total_commits != '' && needs.generate-matrix.outputs.total_commits != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.commit_matrix) }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      
+      - name: Install LLVM/Clang 17
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '17'
+
+      - name: Add LLVM to PATH
+        run: echo "${{ env.LLVM_PATH }}/bin" >> $GITHUB_PATH
+
+      - name: Export LIBCLANG_PATH
+        run: echo "LIBCLANG_PATH=${{ env.LLVM_PATH }}/lib" >> $GITHUB_ENV
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential libc6-dev gcc g++ binutils \
+            libstdc++-14-dev libc++-dev libc++abi-dev zlib1g zlib1g-dev
+
+      - name: Install Python dependencies
+        run: pip install gitpython unidiff "libclang==17.0.6"
+
+      - name: Clone Z3 repository
+        run: |
+          if [ ! -d "z3" ]; then
+            git clone https://github.com/Z3Prover/z3.git z3
+          fi
+
+      - name: Checkout specific commit
+        working-directory: z3
+        run: |
+          COMMIT_HASH="${{ matrix.commit }}"
+          git fetch origin
+          git checkout $COMMIT_HASH
+          echo "Checked out commit: $(git rev-parse HEAD)"
+
+      - name: Get Z3 commit hash
+        id: get-commit
+        working-directory: z3
+        run: |
+          COMMIT_HASH=$(git rev-parse HEAD)
+          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+          echo "Z3 commit hash: $COMMIT_HASH"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download coverage mapping from S3
+        run: |
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/z3/coverage-mappings/variant1/coverage_mapping-${COMMIT_HASH}.json.gz"
+          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY coverage_mapping.json.gz
+          gunzip coverage_mapping.json.gz
+          echo "✅ Downloaded coverage mapping"
+
+      - name: Download coverage binary from S3 (for compile_commands.json)
+        run: |
+          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/z3/builds/coverage/${COMMIT_HASH}.tar.gz"
+          
+          mkdir -p artifacts
+          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY artifacts/artifacts.tar.gz
+          echo "✅ Downloaded coverage binary for $COMMIT_HASH"
+
+      - name: Extract coverage binary
+        run: |
+          mkdir -p z3/build
+          ./scripts/z3/extract_build_artifacts.sh artifacts/artifacts.tar.gz z3/build true
+          echo "✅ Extracted build artifacts (includes compile_commands.json)"
+
+      - name: Run prepare commit fuzzer
+        id: prepare
+        working-directory: z3
+        env:
+          SKIP_COVERAGE_ENFORCEMENT: "true"
+          MAX_JOBS: 4
+        run: |
+          python3 ${{ github.workspace }}/scripts/z3/commit_fuzzer/prepare_commit_fuzzer.py \
+            ${{ steps.get-commit.outputs.commit_hash }} \
+            --coverage-json ../coverage_mapping.json \
+            --compile-commands build \
+            --output-matrix ../fuzzer_matrix.json \
+            --output-changed-functions ../changed_functions.json \
+            --max-jobs 4
+          
+          echo "changed_functions_file=changed_functions.json" >> $GITHUB_OUTPUT
+          
+          if [ -f "../fuzzer_matrix.json" ]; then
+            TOTAL_TESTS=$(jq -r '.total_tests' ../fuzzer_matrix.json)
+            echo "total_tests=$TOTAL_TESTS" >> $GITHUB_OUTPUT
+            
+            jq -c --arg commit "${{ matrix.commit }}" '{
+              "include": (.matrix.include | map({
+                "commit": $commit,
+                "fuzzer_job": .
+              }))
+            }' ../fuzzer_matrix.json > ../combined_matrix.json
+          else
+            echo "total_tests=0" >> $GITHUB_OUTPUT
+            echo "{\"include\":[]}" > ../combined_matrix.json
+          fi
+
+      - name: Generate allowlists (sancov only, no PGO)
+        id: generate-allowlists
+        run: |
+          if [ -f "changed_functions.json" ]; then
+            python3 ${{ github.workspace }}/scripts/z3/partial_instrumentation/generate_allowlists.py \
+              --input changed_functions.json \
+              --output-sancov sancov_allowlist.txt \
+              --output-pgo pgo_allowlist.txt
+            
+            if [ -f "sancov_allowlist.txt" ]; then
+              echo "sancov_allowlist=sancov_allowlist.txt" >> $GITHUB_OUTPUT
+              echo "✅ Generated sancov allowlist with $(grep -c '^fun:' sancov_allowlist.txt || echo 0) functions"
+            fi
+          else
+            echo "⚠️ changed_functions.json not found"
+          fi
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: changed-functions-${{ matrix.commit }}
+          path: |
+            changed_functions.json
+            fuzzer_matrix.json
+            sancov_allowlist.txt
+          if-no-files-found: ignore
+      
+      - name: Upload combined matrix
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-matrix-${{ matrix.commit }}
+          path: combined_matrix.json
+          if-no-files-found: ignore
+
+  collect-matrices:
+    needs: [generate-matrix, prepare-commit-fuzzer]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      fuzzing_matrix: ${{ steps.merge-matrices.outputs.fuzzing_matrix }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      
+      - name: Download all combined matrices
+        uses: actions/download-artifact@v4
+        with:
+          path: matrices
+          pattern: combined-matrix-*
+          merge-multiple: false
+      
+      - name: Merge all matrices
+        id: merge-matrices
+        run: |
+          TOTAL_JOBS=$(python3 ${{ github.workspace }}/scripts/merge_fuzzing_matrices.py \
+            fuzzing_matrix.json \
+            "matrices/combined-matrix-*/combined_matrix.json" \
+            --minimal-output fuzzing_matrix_minimal.json)
+          
+          MINIMAL_MATRIX=$(cat fuzzing_matrix_minimal.json)
+          echo "fuzzing_matrix=$MINIMAL_MATRIX" >> $GITHUB_OUTPUT
+          echo "total_jobs=$TOTAL_JOBS" >> $GITHUB_OUTPUT
+      
+      - name: Upload merged matrix
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzzing-matrix-full
+          path: fuzzing_matrix.json
+          retention-days: 1
+
+  fuzzing-jobs:
+    needs: [generate-matrix, prepare-commit-fuzzer, collect-matrices]
+    if: needs.collect-matrices.outputs.fuzzing_matrix != '' && needs.collect-matrices.outputs.fuzzing_matrix != '{"include":[]}'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.collect-matrices.outputs.fuzzing_matrix) }}
+    timeout-minutes: 360  # 60 minutes fuzzing + build time with sancov
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      
+      - name: Download full matrix data
+        uses: actions/download-artifact@v4
+        with:
+          name: fuzzing-matrix-full
+          path: .
+      
+      - name: Extract test list for this job
+        id: extract-tests
+        run: |
+          python3 ${{ github.workspace }}/scripts/extract_matrix_tests.py \
+            fuzzing_matrix.json \
+            "${{ matrix.commit }}" \
+            "${{ matrix.job_id }}" > tests_job_${{ matrix.job_id }}.json
+          
+          echo "tests_file=tests_job_${{ matrix.job_id }}.json" >> $GITHUB_OUTPUT
+          TEST_COUNT=$(python3 -c "import json; print(len(json.load(open('tests_job_${{ matrix.job_id }}.json'))))")
+          echo "✅ Extracted $TEST_COUNT tests for job ${{ matrix.job_id }}"
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3 python3-pip unzip wget binutils \
+            clang llvm lld libc++-dev libc++abi-dev cmake ninja-build
+          sudo apt-get clean
+
+      - name: Install fuzzing dependencies
+        run: |
+          pip install antlr4-python3-runtime==4.9.2 z3-solver psutil
+          git clone https://github.com/testsmt/yinyang.git
+          cd yinyang && pip install -e . && cd ..
+          pip cache purge || true
+
+      - name: Clone Z3 repository
+        run: |
+          if [ ! -d "z3" ]; then
+            git clone https://github.com/Z3Prover/z3.git z3
+          fi
+
+      - name: Checkout commit
+        working-directory: z3
+        run: |
+          git fetch origin
+          git checkout ${{ matrix.commit }}
+          echo "Checked out commit: $(git rev-parse HEAD)"
+      
+      - name: Clone z3test repository
+        run: |
+          if [ ! -d "z3test" ]; then
+            git clone https://github.com/z3prover/z3test.git z3test
+          fi
+      
+      - name: Clean up git repositories
+        run: rm -rf z3/.git z3test/.git yinyang/.git || true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download allowlists
+        uses: actions/download-artifact@v4
+        with:
+          name: changed-functions-${{ matrix.commit }}
+          path: .
+
+      - name: Install LLVM/Clang 17
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '17'
+
+      - name: Add LLVM to PATH
+        run: echo "${{ env.LLVM_PATH }}/bin" >> $GITHUB_PATH
+
+      - name: Build Z3 with sancov instrumentation
+        run: |
+          echo "=== Building Z3 with sancov instrumentation ==="
+          
+          export WORKSPACE="${{ github.workspace }}"
+          export COVERAGE_AGENT="${{ github.workspace }}/scripts/z3/partial_instrumentation/coverage_agent.cpp"
+          
+          # Setup allowlists (downloaded to current directory by previous step)
+          SANCOV_ARG=""
+          
+          if [ -f "sancov_allowlist.txt" ]; then
+            SANCOV_ARG="$(pwd)/sancov_allowlist.txt"
+            echo "Using sancov allowlist: $(grep -c '^fun:' sancov_allowlist.txt || echo 0) functions"
+          fi
+          
+          # Build with sancov instrumentation (only for changed functions)
+          ${{ github.workspace }}/scripts/z3/partial_instrumentation/build_z3_instrumented.sh \
+            "${{ matrix.commit }}" \
+            "$SANCOV_ARG" \
+            ""
+          
+          echo "✅ Build complete"
+          ls -la z3/build/z3
+      
+      - name: Verify instrumentation
+        id: verify-instrumentation
+        run: |
+          echo "=== Verifying instrumentation ==="
+          SANCOV_SYM=$(nm z3/build/z3 2>/dev/null | grep -c "__sanitizer_cov" || echo "0")
+          echo "Sancov symbols: $SANCOV_SYM"
+          
+          # Count total instrumented edges from coverage agent debug output
+          echo "=== Counting total instrumented edges ==="
+          TOTAL_EDGES=$(COVERAGE_AGENT_DEBUG=1 z3/build/z3 --version 2>&1 | grep -oP 'total_edges=\K\d+' || echo "0")
+          echo "Total instrumented edges: $TOTAL_EDGES"
+          echo "total_edges=${TOTAL_EDGES}" >> $GITHUB_OUTPUT
+          
+          echo "✅ Binary works"
+      
+      - name: Install CVC5 oracle
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 fmfuzz-dev/scripts/download_cvc5.py $HOME/.local/bin
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          cvc5 --version
+
+      - name: Verify solvers
+        run: |
+          z3 --version
+          z3/build/z3 --version
+          cvc5 --version
+
+      - name: Run coverage-guided fuzzing with recipe recording
+        working-directory: z3
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          FUZZING_DURATION="${{ inputs.fuzzing_duration_minutes || 60 }}"
+          TOTAL_EDGES="${{ steps.verify-instrumentation.outputs.total_edges }}"
+          
+          mkdir -p output profraw bugs
+          
+          echo "=== Starting coverage-guided fuzzing ==="
+          echo "Duration: ${FUZZING_DURATION} minutes"
+          echo "Workers: 4"
+          echo "Total instrumented edges: ~${TOTAL_EDGES}"
+          
+          # Use setsid to isolate fuzzer from shell signals (fixes inline mode SIGINT issue)
+          setsid python3 ${{ github.workspace }}/scripts/z3/partial_instrumentation/coverage_guided_fuzzer.py \
+            --tests-file ../${{ steps.extract-tests.outputs.tests_file }} \
+            --job-id '${{ matrix.job_id }}' \
+            --tests-root ../z3test \
+            --fuzzing-duration-minutes ${FUZZING_DURATION} \
+            --seed 42 \
+            --inline \
+            --total-edges ${TOTAL_EDGES} \
+            --z3-path ./build/z3 \
+            --workers 4 \
+            --bugs-folder ./bugs \
+            --output-dir ./output \
+            --profraw-dir ./profraw \
+            --recipe-output ../recipes_${{ matrix.commit }}_job_${{ matrix.job_id }} || true
+          
+          echo "=== Fuzzing complete ==="
+          cat ./output/coverage_stats.json || echo "No coverage stats"
+      
+      - name: Save coverage stats
+        if: always()
+        working-directory: z3
+        run: |
+          # Save coverage stats
+          if [ -f "./output/coverage_stats.json" ]; then
+            cp ./output/coverage_stats.json ../coverage_stats_${{ matrix.commit }}_${{ matrix.job_id }}.json
+          fi
+      
+      - name: Upload fuzzing results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzzing-results-${{ matrix.commit }}-job-${{ matrix.job_id }}
+          path: |
+            coverage_stats_${{ matrix.commit }}_${{ matrix.job_id }}.json
+            z3/bugs/**/*.smt2
+          if-no-files-found: ignore
+      
+      - name: Upload recipes artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: variant2-recipes-commit-${{ matrix.commit }}-job-${{ matrix.job_id }}
+          path: recipes_${{ matrix.commit }}_job_${{ matrix.job_id }}.jsonl
+          if-no-files-found: ignore
+
+  merge-and-upload-recipes:
+    needs: [generate-matrix, prepare-commit-fuzzer, fuzzing-jobs]
+    if: always() && needs.prepare-commit-fuzzer.result == 'success'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.generate-matrix.outputs.commit_matrix) }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      
+      - name: Download all recipe artifacts for commit
+        uses: actions/download-artifact@v4
+        with:
+          path: recipes-artifacts
+          pattern: variant2-recipes-commit-${{ matrix.commit }}-job-*
+          merge-multiple: false
+      
+      - name: Download changed functions
+        uses: actions/download-artifact@v4
+        with:
+          name: changed-functions-${{ matrix.commit }}
+          path: .
+      
+      - name: Merge recipes from all jobs
+        run: |
+          RECIPE_FILES=$(find recipes-artifacts -name "recipes_${{ matrix.commit }}_job_*.jsonl" -type f | sort)
+          
+          if [ -z "$RECIPE_FILES" ]; then
+            echo "⚠️ No recipe files found for commit ${{ matrix.commit }}"
+            exit 0
+          fi
+          
+          FILE_COUNT=$(echo "$RECIPE_FILES" | wc -l)
+          echo "Found $FILE_COUNT recipe files"
+          
+          # Merge all recipe files into one
+          cat $RECIPE_FILES > merged_recipes_${{ matrix.commit }}.jsonl
+          
+          TOTAL_RECIPES=$(wc -l < merged_recipes_${{ matrix.commit }}.jsonl)
+          echo "✅ Merged $TOTAL_RECIPES recipes from $FILE_COUNT job files"
+      
+      - name: Configure AWS credentials
+        if: ${{ !inputs.dry_run }}
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Get full commit hash
+        id: get-commit-merge
+        run: |
+          echo "commit_hash=${{ matrix.commit }}" >> $GITHUB_OUTPUT
+      
+      - name: Upload recipes to S3
+        if: always() && !inputs.dry_run
+        run: |
+          COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/z3/fuzzing-recipes/variant2/recipes-${COMMIT_HASH}.jsonl.gz"
+          
+          if [ ! -f "merged_recipes_${{ matrix.commit }}.jsonl" ]; then
+            echo "⚠️ Merged recipes file not found"
+            exit 0
+          fi
+          
+          gzip -c "merged_recipes_${{ matrix.commit }}.jsonl" > recipes_${COMMIT_HASH}.jsonl.gz
+          
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body recipes_${COMMIT_HASH}.jsonl.gz
+          
+          echo "✅ Uploaded variant2 recipes to S3: $S3_KEY"
+      
+      - name: Upload changed functions to S3
+        if: always() && !inputs.dry_run
+        run: |
+          COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
+          S3_KEY="evaluation/rq2/z3/changed-functions/changed_functions-${COMMIT_HASH}.json.gz"
+          
+          if [ ! -f "changed_functions.json" ]; then
+            echo "⚠️ changed_functions.json not found"
+            exit 0
+          fi
+          
+          gzip -c "changed_functions.json" > changed_functions_${COMMIT_HASH}.json.gz
+          
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body changed_functions_${COMMIT_HASH}.json.gz
+          
+          echo "✅ Uploaded changed functions to S3: $S3_KEY"
+      
+      - name: Dry run - Skip S3 upload
+        if: always() && inputs.dry_run
+        run: |
+          COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
+          
+          if [ -f "merged_recipes_${{ matrix.commit }}.jsonl" ]; then
+            RECIPE_COUNT=$(wc -l < "merged_recipes_${{ matrix.commit }}.jsonl")
+            echo "🔍 DRY RUN: Would upload $RECIPE_COUNT recipes to S3"
+          else
+            echo "⚠️ Merged recipes file not found"
+          fi

@@ -1,4 +1,4 @@
-name: Z3 RQ2 Fuzzing - Baseline
+name: Z3 RQ2 Fuzzing - Variant1
 
 on:
   workflow_dispatch:
@@ -47,212 +47,177 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
       
-      - name: Generate commit matrix from variant1 statistics
+      - name: Generate commit matrix from coverage mappings
         id: generate-matrix
         env:
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
+          # If debug commit hash is provided, use only that commit
           if [ -n "${{ inputs.debug_commit_hash }}" ]; then
             echo "🔍 Debug mode: Using specific commit ${{ inputs.debug_commit_hash }}"
             DEBUG_COMMIT="${{ inputs.debug_commit_hash }}"
+            # Create a matrix with just this commit
             COMMIT_MATRIX=$(python3 -c "import json; print(json.dumps({'include': [{'commit': '$DEBUG_COMMIT'}]}, separators=(',', ':')))")
             TOTAL_COMMITS=1
             echo "commit_matrix=$COMMIT_MATRIX" >> $GITHUB_OUTPUT
             echo "total_commits=$TOTAL_COMMITS" >> $GITHUB_OUTPUT
+            echo "✅ Debug mode: Generated matrix with 1 commit ($DEBUG_COMMIT)"
           else
-            # List commits that have variant1 statistics
-            prefix="evaluation/rq2/z3/fuzzing-statistics/variant1/"
-            commits=$(aws s3 ls s3://${{ secrets.AWS_S3_BUCKET }}/$prefix --recursive | \
-              grep "fuzzing_statistics-" | \
-              sed 's/.*fuzzing_statistics-\(.*\)\.json\.gz/\1/' | \
-              sort -u)
+            RESULT=$(python3 scripts/rq2/generate_fuzzing_matrix.py z3)
             
-            commit_count=$(echo "$commits" | wc -l)
-            echo "✅ Found $commit_count commits with variant1 statistics"
+            COMMIT_MATRIX=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(json.dumps({'include': data['include']}, separators=(',', ':')))")
+            TOTAL_COMMITS=$(echo "$RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['total_commits'])")
             
-            # Generate matrix - build JSON array directly
-            echo "[]" > /tmp/matrix_entries.json
-            for commit in $commits; do
-              jq --arg commit "$commit" '. + [{"commit": $commit}]' /tmp/matrix_entries.json > /tmp/matrix_entries_new.json
-              mv /tmp/matrix_entries_new.json /tmp/matrix_entries.json
-            done
-            
-            # Create final matrix structure in compact format
-            COMMIT_MATRIX=$(jq -c '{include: .}' /tmp/matrix_entries.json)
             echo "commit_matrix=$COMMIT_MATRIX" >> $GITHUB_OUTPUT
-            echo "total_commits=$commit_count" >> $GITHUB_OUTPUT
+            echo "total_commits=$TOTAL_COMMITS" >> $GITHUB_OUTPUT
+            
+            echo "✅ Generated matrix: $TOTAL_COMMITS commits"
           fi
 
-  prepare-baseline:
+  prepare-commit-fuzzer:
     needs: generate-matrix
     if: needs.generate-matrix.outputs.total_commits != '' && needs.generate-matrix.outputs.total_commits != '0'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.generate-matrix.outputs.commit_matrix) }}
+    outputs:
+      commit_hash: ${{ steps.get-commit.outputs.commit_hash }}
+      changed_functions_file: ${{ steps.prepare.outputs.changed_functions_file }}
+      combined_matrix: ${{ steps.prepare.outputs.combined_matrix }}
+      total_tests: ${{ steps.prepare.outputs.total_tests }}
     
     steps:
       - name: Checkout
         uses: actions/checkout@v5
       
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install LLVM/Clang 17
+        uses: KyleMayes/install-llvm-action@v2
         with:
-          python-version: '3.12'
-      
-      - name: Install system dependencies
+          version: '17'
+
+      - name: Add LLVM to PATH
+        run: echo "${{ env.LLVM_PATH }}/bin" >> $GITHUB_PATH
+
+      - name: Export LIBCLANG_PATH
+        run: echo "LIBCLANG_PATH=${{ env.LLVM_PATH }}/lib" >> $GITHUB_ENV
+
+      - name: Install system development packages
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            python3 \
-            python3-pip \
-            cmake \
-            jq
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-      
+            build-essential \
+            libc6-dev \
+            gcc \
+            g++ \
+            binutils \
+            libstdc++-14-dev \
+            libc++-dev \
+            libc++abi-dev \
+            zlib1g \
+            zlib1g-dev
+
       - name: Install Python dependencies
         run: |
-          pip install boto3
-      
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5.1.0
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-      
-      - name: Get full commit hash
-        id: get-commit
+          pip install gitpython unidiff "libclang==17.0.6"
+
+      - name: Clone Z3 repository
         run: |
-          # Expand short hash to full hash if needed
           if [ -d "z3" ]; then
-            cd z3
-            git fetch origin --quiet 2>/dev/null || true
-            FULL_HASH=$(git rev-parse "${{ matrix.commit }}")
-            echo "commit_hash=$FULL_HASH" >> $GITHUB_OUTPUT
-            echo "Expanded ${{ matrix.commit }} to $FULL_HASH"
+            echo "Z3 directory already exists, skipping clone"
           else
-            # Fallback: use matrix.commit as-is
-            echo "commit_hash=${{ matrix.commit }}" >> $GITHUB_OUTPUT
-            echo "Using ${{ matrix.commit }} as-is (repo not available)"
+            git clone https://github.com/Z3Prover/z3.git z3
           fi
-      
+
+      - name: Checkout specific commit
+        working-directory: z3
+        run: |
+          COMMIT_HASH="${{ matrix.commit }}"
+          echo "🔨 Checking out commit: $COMMIT_HASH"
+          git fetch origin
+          git checkout $COMMIT_HASH
+          echo "Checked out commit: $(git rev-parse HEAD)"
+
+      - name: Get Z3 commit hash
+        id: get-commit
+        working-directory: z3
+        run: |
+          COMMIT_HASH=$(git rev-parse HEAD)
+          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+          echo "Z3 commit hash: $COMMIT_HASH"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5.1.0
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
-      
-      - name: Download coverage mapping from S3
+
+      - name: Download coverage map from S3
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
           S3_KEY="evaluation/rq2/z3/coverage-mappings/variant1/coverage_mapping-${COMMIT_HASH}.json.gz"
           
-          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY coverage_mapping.json.gz || {
-            echo "⚠️ Coverage mapping not found, falling back to discovering all tests"
-            echo "use_coverage_mapping=false" >> $GITHUB_ENV
-            exit 0
-          }
+          aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY coverage_mapping.json.gz
           echo "✅ Downloaded coverage mapping for $COMMIT_HASH"
-          echo "use_coverage_mapping=true" >> $GITHUB_ENV
       
-      - name: Extract coverage mapping
-        if: env.use_coverage_mapping == 'true'
+      - name: Extract coverage map
         run: |
           gunzip coverage_mapping.json.gz
-          echo "✅ Extracted coverage mapping"
-      
-      - name: Download fuzzing binary from S3
+
+      - name: Download coverage binary from S3
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/z3/builds/fuzzing/${COMMIT_HASH}.tar.gz"
+          S3_KEY="evaluation/rq2/z3/builds/coverage/${COMMIT_HASH}.tar.gz"
           
           mkdir -p artifacts
           aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY artifacts/artifacts.tar.gz
-          echo "✅ Downloaded fuzzing binary for $COMMIT_HASH"
-      
-      - name: Extract fuzzing binary
+          echo "✅ Downloaded coverage binary for $COMMIT_HASH"
+
+      - name: Extract coverage binary with headers
         run: |
           mkdir -p z3/build
           ./scripts/z3/extract_build_artifacts.sh artifacts/artifacts.tar.gz z3/build true
-      
-      - name: Clone z3test repository
-        if: env.use_coverage_mapping != 'true'
-        run: |
-          if [ -d "z3test" ]; then
-            echo "z3test directory already exists, skipping clone"
-          else
-            git clone https://github.com/z3prover/z3test.git z3test
-          fi
-      
-      - name: Read changed functions from variant1 statistics
-        id: read-functions
+
+      - name: Run prepare commit fuzzer
+        id: prepare
+        working-directory: z3
         env:
-          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SKIP_COVERAGE_ENFORCEMENT: "true"
+          MAX_JOBS: 4
         run: |
-          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          python3 scripts/rq2/read_changed_functions_from_statistics.py z3 "$COMMIT_HASH" > changed_functions_data.json
+          python3 ${{ github.workspace }}/scripts/z3/commit_fuzzer/prepare_commit_fuzzer.py \
+            ${{ steps.get-commit.outputs.commit_hash }} \
+            --coverage-json ../coverage_mapping.json \
+            --compile-commands build \
+            --output-matrix ../fuzzer_matrix.json \
+            --output-changed-functions ../changed_functions.json \
+            --max-jobs 4
           
-          # Extract function IDs and create proper JSON format (same as prepare_commit_fuzzer)
-          jq '{
-            "commit_hash": .commit_hash,
-            "changed_functions": .changed_functions
-          }' changed_functions_data.json > changed_functions.json
+          echo "changed_functions_file=changed_functions.json" >> $GITHUB_OUTPUT
           
-          FUNCTION_COUNT=$(jq -r '.total_functions' changed_functions_data.json)
-          echo "✅ Read $FUNCTION_COUNT changed functions from variant1 statistics"
-      
-      - name: Extract tests from coverage mapping
-        id: pick-tests
-        if: env.use_coverage_mapping == 'true'
-        run: |
-          python3 scripts/rq2/extract_tests_from_coverage.py \
-            --coverage-mapping coverage_mapping.json \
-            --seed 42 \
-            --output fuzzer_matrix.json
-          
-          TOTAL_TESTS=$(jq -r '.total_tests' fuzzer_matrix.json)
-          TOTAL_JOBS=$(jq -r '.total_jobs' fuzzer_matrix.json)
-          echo "✅ Extracted $TOTAL_TESTS tests from coverage mapping in $TOTAL_JOBS jobs"
-          
-          # Create combined matrix: commit + fuzzer_job
-          jq -c --arg commit "${{ matrix.commit }}" '{
-            "include": (.matrix.include | map({
-              "commit": $commit,
-              "fuzzer_job": .
-            }))
-          }' fuzzer_matrix.json > combined_matrix.json
-      
-      - name: Shuffle all tests (fallback)
-        id: pick-tests-fallback
-        if: env.use_coverage_mapping != 'true'
-        run: |
-          python3 scripts/rq2/pick_random_tests.py \
-            --solver z3 \
-            --z3test-dir z3test \
-            --seed 42 \
-            --output fuzzer_matrix.json
-          
-          TOTAL_TESTS=$(jq -r '.total_tests' fuzzer_matrix.json)
-          TOTAL_JOBS=$(jq -r '.total_jobs' fuzzer_matrix.json)
-          echo "✅ Generated matrix with $TOTAL_TESTS shuffled tests in $TOTAL_JOBS jobs"
-          
-          # Create combined matrix: commit + fuzzer_job
-          jq -c --arg commit "${{ matrix.commit }}" '{
-            "include": (.matrix.include | map({
-              "commit": $commit,
-              "fuzzer_job": .
-            }))
-          }' fuzzer_matrix.json > combined_matrix.json
+          # Extract matrix and total_tests, and create combined matrix with commit
+          if [ -f "../fuzzer_matrix.json" ]; then
+            TOTAL_TESTS=$(jq -r '.total_tests' ../fuzzer_matrix.json)
+            echo "total_tests=$TOTAL_TESTS" >> $GITHUB_OUTPUT
+            
+            # Create combined matrix: commit + fuzzer_job
+            jq -c --arg commit "${{ matrix.commit }}" '{
+              "include": (.matrix.include | map({
+                "commit": $commit,
+                "fuzzer_job": .
+              }))
+            }' ../fuzzer_matrix.json > ../combined_matrix.json
+          else
+            echo "total_tests=0" >> $GITHUB_OUTPUT
+            echo "{\"include\":[]}" > ../combined_matrix.json
+          fi
       
       - name: Upload changed functions and matrix
         uses: actions/upload-artifact@v4
         with:
-          name: baseline-changed-functions-${{ matrix.commit }}
+          name: changed-functions-${{ matrix.commit }}
           path: |
             changed_functions.json
             fuzzer_matrix.json
@@ -261,16 +226,17 @@ jobs:
       - name: Upload combined matrix
         uses: actions/upload-artifact@v4
         with:
-          name: baseline-combined-matrix-${{ matrix.commit }}
+          name: combined-matrix-${{ matrix.commit }}
           path: combined_matrix.json
           if-no-files-found: ignore
 
   collect-matrices:
-    needs: [generate-matrix, prepare-baseline]
+    needs: [generate-matrix, prepare-commit-fuzzer]
     if: always()
     runs-on: ubuntu-latest
     outputs:
       fuzzing_matrix: ${{ steps.merge-matrices.outputs.fuzzing_matrix }}
+      total_jobs: ${{ steps.merge-matrices.outputs.total_jobs }}
     
     steps:
       - name: Checkout
@@ -280,7 +246,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: matrices
-          pattern: baseline-combined-matrix-*
+          pattern: combined-matrix-*
           merge-multiple: false
       
       - name: Merge all matrices
@@ -289,7 +255,7 @@ jobs:
           # Use Python script for reliable matrix merging
           TOTAL_JOBS=$(python3 ${{ github.workspace }}/scripts/merge_fuzzing_matrices.py \
             fuzzing_matrix.json \
-            "matrices/baseline-combined-matrix-*/combined_matrix.json" \
+            "matrices/combined-matrix-*/combined_matrix.json" \
             --minimal-output fuzzing_matrix_minimal.json)
           
           # Use minimal matrix for job output (much smaller)
@@ -305,19 +271,17 @@ jobs:
           retention-days: 1
 
   fuzzing-jobs:
-    needs: [generate-matrix, prepare-baseline, collect-matrices]
+    needs: [generate-matrix, prepare-commit-fuzzer, collect-matrices]
     if: needs.collect-matrices.outputs.fuzzing_matrix != '' && needs.collect-matrices.outputs.fuzzing_matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.collect-matrices.outputs.fuzzing_matrix) }}
-    timeout-minutes: 75
+    timeout-minutes: 75  # 60 minutes fuzzing + 15 minutes buffer
     
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-        with:
-          submodules: recursive
       
       - name: Download full matrix data
         uses: actions/download-artifact@v4
@@ -358,10 +322,11 @@ jobs:
             binutils
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
-      
+
       - name: Install fuzzing dependencies
         run: |
           pip install antlr4-python3-runtime==4.9.2
+          pip install z3-solver
           pip install psutil
           pip install fastcov
           git clone https://github.com/testsmt/yinyang.git
@@ -369,7 +334,7 @@ jobs:
           pip install -e .
           cd ..
           pip cache purge || true
-      
+
       - name: Clone Z3 repository
         run: |
           if [ -d "z3" ]; then
@@ -377,7 +342,7 @@ jobs:
           else
             git clone https://github.com/Z3Prover/z3.git z3
           fi
-      
+
       - name: Checkout same commit
         working-directory: z3
         run: |
@@ -401,26 +366,18 @@ jobs:
             git clone https://github.com/z3prover/z3test.git z3test
           fi
       
-      - name: Install CVC5 oracle
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python3 fmfuzz-dev/scripts/download_cvc5.py $HOME/.local/bin
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-          cvc5 --version
-      
       - name: Clean up git repositories to save space
         run: |
           rm -rf z3/.git z3test/.git yinyang/.git || true
           echo "✅ Cleaned up git repositories"
-      
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5.1.0
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
-      
+
       - name: Download fuzzing binary from S3
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
@@ -429,26 +386,37 @@ jobs:
           mkdir -p artifacts
           aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY artifacts/artifacts.tar.gz
           echo "✅ Downloaded fuzzing binary for $COMMIT_HASH"
-      
+
       - name: Extract fuzzing binary
         run: |
           ./scripts/z3/extract_build_artifacts.sh artifacts/artifacts.tar.gz z3/build true
-      
+
       - name: Download changed functions and matrix
         uses: actions/download-artifact@v4
         with:
-          name: baseline-changed-functions-${{ matrix.commit }}
+          name: changed-functions-${{ matrix.commit }}
           path: .
-      
+
+      - name: Install CVC5 oracle
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 fmfuzz-dev/scripts/download_cvc5.py $HOME/.local/bin
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          cvc5 --version
+
       - name: Verify solver binaries
         run: |
+          z3 --version
           z3/build/z3 --version
           cvc5 --version
-      
-      - name: Run fuzzing (baseline)
+
+      - name: Run fuzzing with recipe recording
         working-directory: z3
+        timeout-minutes: 75
         run: |
           FUZZING_DURATION="${{ inputs.fuzzing_duration_minutes || 60 }}"
+          
           python3 ${{ github.workspace }}/scripts/z3/commit_fuzzer/simple_commit_fuzzer.py \
             --tests-file ../${{ steps.extract-tests.outputs.tests_file }} \
             --job-id '${{ matrix.job_id }}' \
@@ -458,10 +426,7 @@ jobs:
             --seed 42 \
             --z3-path ./build/z3 \
             --cvc5-path $(which cvc5) \
-            --changed-functions ../changed_functions.json \
-            --build-dir ./build \
-            --output-statistics ../statistics_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json \
-            --commit-hash ${{ matrix.commit }}
+            --recipe-output ../recipes_${{ matrix.commit }}_job_${{ matrix.job_id }} || true
           
           echo "Python script exited, cleaning up any orphaned processes..."
           pkill -9 -f "z3" 2>/dev/null || true
@@ -470,17 +435,17 @@ jobs:
           
           echo "Fuzzing step completed"
       
-      - name: Upload statistics
+      - name: Upload recipes artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: baseline-statistics-commit-${{ matrix.commit }}-job-${{ matrix.job_id }}
-          path: statistics_commit_${{ matrix.commit }}_job_${{ matrix.job_id }}.json
+          name: variant1-recipes-commit-${{ matrix.commit }}-job-${{ matrix.job_id }}
+          path: recipes_${{ matrix.commit }}_job_${{ matrix.job_id }}.jsonl
           if-no-files-found: ignore
 
-  merge-statistics:
-    needs: [generate-matrix, prepare-baseline, fuzzing-jobs]
-    if: always() && needs.prepare-baseline.result == 'success'
+  merge-and-upload-recipes:
+    needs: [generate-matrix, prepare-commit-fuzzer, fuzzing-jobs]
+    if: always() && needs.prepare-commit-fuzzer.result == 'success'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -490,97 +455,99 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
       
-      - name: Download all statistics artifacts for commit
+      - name: Download all recipe artifacts for commit
         uses: actions/download-artifact@v4
         with:
-          path: statistics-artifacts
-          pattern: baseline-statistics-commit-${{ matrix.commit }}-job-*
+          path: recipes-artifacts
+          pattern: variant1-recipes-commit-${{ matrix.commit }}-job-*
           merge-multiple: false
       
       - name: Download changed functions
         uses: actions/download-artifact@v4
         with:
-          name: baseline-changed-functions-${{ matrix.commit }}
+          name: changed-functions-${{ matrix.commit }}
           path: .
       
-      - name: Merge statistics
+      - name: Merge recipes from all jobs
         run: |
-          STATS_FILES=$(find statistics-artifacts -name "statistics_commit_${{ matrix.commit }}_job_*.json" -type f | sort)
+          RECIPE_FILES=$(find recipes-artifacts -name "recipes_${{ matrix.commit }}_job_*.jsonl" -type f | sort)
           
-          if [ -z "$STATS_FILES" ]; then
-            echo "⚠️ No statistics files found for commit ${{ matrix.commit }}"
+          if [ -z "$RECIPE_FILES" ]; then
+            echo "⚠️ No recipe files found for commit ${{ matrix.commit }}"
             exit 0
           fi
           
-          python3 scripts/z3/commit_fuzzer/merge_fuzzing_statistics.py \
-            $STATS_FILES \
-            --output merged_statistics_${{ matrix.commit }}.json \
-            --commit-hash ${{ matrix.commit }} \
-            --coverage-map-commit ${{ matrix.commit }}
+          FILE_COUNT=$(echo "$RECIPE_FILES" | wc -l)
+          echo "Found $FILE_COUNT recipe files"
+          
+          # Merge all recipe files into one
+          cat $RECIPE_FILES > merged_recipes_${{ matrix.commit }}.jsonl
+          
+          TOTAL_RECIPES=$(wc -l < merged_recipes_${{ matrix.commit }}.jsonl)
+          echo "✅ Merged $TOTAL_RECIPES recipes from $FILE_COUNT job files"
       
       - name: Configure AWS credentials
+        if: ${{ !inputs.dry_run }}
         uses: aws-actions/configure-aws-credentials@v5.1.0
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
-      
+
       - name: Get full commit hash
         id: get-commit-merge
         if: always()
         run: |
-          # Expand short hash to full hash if needed
-          if [ -d "z3" ]; then
-            cd z3
-            git fetch origin --quiet 2>/dev/null || true
-            FULL_HASH=$(git rev-parse "${{ matrix.commit }}")
-            echo "commit_hash=$FULL_HASH" >> $GITHUB_OUTPUT
-            echo "Expanded ${{ matrix.commit }} to $FULL_HASH"
-          else
-            # Fallback: use matrix.commit as-is
-            echo "commit_hash=${{ matrix.commit }}" >> $GITHUB_OUTPUT
-            echo "Using ${{ matrix.commit }} as-is (repo not available)"
-          fi
+          echo "commit_hash=${{ matrix.commit }}" >> $GITHUB_OUTPUT
       
-      - name: Upload merged statistics to S3
-        if: always()
+      - name: Upload recipes to S3
+        if: always() && !inputs.dry_run
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/z3/fuzzing-statistics/baseline/fuzzing_statistics-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/z3/fuzzing-recipes/variant1/recipes-${COMMIT_HASH}.jsonl.gz"
           
-          if [ ! -f "merged_statistics_${{ matrix.commit }}.json" ]; then
-            echo "⚠️ Merged statistics file not found"
+          if [ ! -f "merged_recipes_${{ matrix.commit }}.jsonl" ]; then
+            echo "⚠️ Merged recipes file not found"
             exit 0
           fi
           
-          gzip -c "merged_statistics_${{ matrix.commit }}.json" > merged_statistics_${COMMIT_HASH}.json.gz
+          gzip -c "merged_recipes_${{ matrix.commit }}.jsonl" > recipes_${COMMIT_HASH}.jsonl.gz
           
           aws s3api put-object \
             --bucket ${{ secrets.AWS_S3_BUCKET }} \
             --key "$S3_KEY" \
-            --body merged_statistics_${COMMIT_HASH}.json.gz
+            --body recipes_${COMMIT_HASH}.jsonl.gz
           
-          echo "✅ Uploaded baseline fuzzing statistics to S3: $S3_KEY"
+          echo "✅ Uploaded variant1 recipes to S3: $S3_KEY"
       
-      - name: Dry run - Skip S3 upload
-        if: ${{ inputs.dry_run }}
+      - name: Upload changed functions to S3
+        if: always() && !inputs.dry_run
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
-          echo "🔍 DRY RUN: Would upload baseline fuzzing statistics to S3"
-          echo "   Commit: $COMMIT_HASH"
-          echo "   Path: evaluation/rq2/z3/fuzzing-statistics/baseline/fuzzing_statistics-${COMMIT_HASH}.json.gz"
-          if [ -f "merged_statistics_${{ matrix.commit }}.json" ]; then
-            ls -la merged_statistics_${{ matrix.commit }}.json
+          S3_KEY="evaluation/rq2/z3/changed-functions/changed_functions-${COMMIT_HASH}.json.gz"
+          
+          if [ ! -f "changed_functions.json" ]; then
+            echo "⚠️ changed_functions.json not found"
+            exit 0
           fi
+          
+          gzip -c "changed_functions.json" > changed_functions_${COMMIT_HASH}.json.gz
+          
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body changed_functions_${COMMIT_HASH}.json.gz
+          
+          echo "✅ Uploaded changed functions to S3: $S3_KEY"
       
       - name: Dry run - Skip S3 upload
-        if: ${{ inputs.dry_run }}
+        if: always() && inputs.dry_run
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
-          echo "🔍 DRY RUN: Would upload baseline fuzzing statistics to S3"
-          echo "   Commit: $COMMIT_HASH"
-          echo "   Path: evaluation/rq2/z3/fuzzing-statistics/baseline/fuzzing_statistics-${COMMIT_HASH}.json.gz"
-          if [ -f "merged_statistics_${{ matrix.commit }}.json" ]; then
-            ls -la merged_statistics_${{ matrix.commit }}.json
+          
+          if [ -f "merged_recipes_${{ matrix.commit }}.jsonl" ]; then
+            RECIPE_COUNT=$(wc -l < "merged_recipes_${{ matrix.commit }}.jsonl")
+            echo "🔍 DRY RUN: Would upload $RECIPE_COUNT recipes to S3"
+          else
+            echo "⚠️ Merged recipes file not found"
           fi
-
