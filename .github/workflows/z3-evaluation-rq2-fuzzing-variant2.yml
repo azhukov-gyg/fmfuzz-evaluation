@@ -182,14 +182,13 @@ jobs:
             echo "{\"include\":[]}" > ../combined_matrix.json
           fi
 
-      - name: Generate allowlists (sancov only, no PGO)
+      - name: Generate sancov allowlist
         id: generate-allowlists
         run: |
           if [ -f "changed_functions.json" ]; then
             python3 ${{ github.workspace }}/scripts/z3/partial_instrumentation/generate_allowlists.py \
               --input changed_functions.json \
-              --output-sancov sancov_allowlist.txt \
-              --output-pgo pgo_allowlist.txt
+              --output-sancov sancov_allowlist.txt
             
             if [ -f "sancov_allowlist.txt" ]; then
               echo "sancov_allowlist=sancov_allowlist.txt" >> $GITHUB_OUTPUT

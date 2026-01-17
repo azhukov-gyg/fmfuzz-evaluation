@@ -2,14 +2,11 @@
 # Build Z3 with sancov instrumentation for coverage-guided fuzzing
 # 
 # Usage:
-#   ./build_z3_instrumented.sh [commit_hash] [sancov_allowlist] [--enable-pgo]
+#   ./build_z3_instrumented.sh [commit_hash] [sancov_allowlist]
 #
 # Environment variables:
 #   WORKSPACE - workspace directory (default: /workspace)
 #   COVERAGE_AGENT - path to coverage_agent.cpp (auto-detected if not set)
-#
-# Note: PGO is disabled by default. Use --enable-pgo to enable profraw collection.
-#       For measurement, we use gcov instead of PGO.
 #
 set -e
 
@@ -21,7 +18,6 @@ BUILD_DIR="${Z3_DIR}/build"
 # Arguments
 COMMIT_HASH="${1:-}"
 SANCOV_ALLOWLIST="${2:-}"
-ENABLE_PGO="${3:-}"  # Pass --enable-pgo to enable PGO instrumentation
 
 log() { echo -e "\033[0;34m[INFO]\033[0m $1"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $1"; }
@@ -29,11 +25,6 @@ err() { echo -e "\033[0;31m[ERROR]\033[0m $1"; exit 1; }
 
 echo "=============================================="
 echo "Building Z3 with Sancov Instrumentation"
-if [ "$ENABLE_PGO" = "--enable-pgo" ]; then
-    echo "(PGO instrumentation ENABLED)"
-else
-    echo "(PGO instrumentation disabled)"
-fi
 echo "=============================================="
 
 # Phase 1: Clone/checkout Z3
@@ -112,23 +103,12 @@ if [ -n "$SANCOV_ALLOWLIST" ] && [ -f "$SANCOV_ALLOWLIST" ]; then
     echo "  ---------------------------------"
 fi
 
-# PGO flags (only if enabled)
-PGO_FLAGS=""
-PGO_LDFLAGS=""
-if [ "$ENABLE_PGO" = "--enable-pgo" ]; then
-    PGO_FLAGS="-fprofile-instr-generate -fcoverage-mapping"
-    PGO_LDFLAGS="-fprofile-instr-generate"
-    echo "  PGO: ENABLED (profraw files will be generated)"
-else
-    echo "  PGO: disabled (use --enable-pgo to enable)"
-fi
-
 # Let Z3's production profile handle optimization flags
 # We only add our instrumentation flags + -fno-inline to prevent inlining
 # (inlined functions bypass coverage guards, causing 0 edges hit)
-export CFLAGS="$SANCOV_FLAGS $PGO_FLAGS -fno-inline"
-export CXXFLAGS="$SANCOV_FLAGS $PGO_FLAGS -fno-inline"
-export LDFLAGS="$PGO_LDFLAGS"
+export CFLAGS="$SANCOV_FLAGS -fno-inline"
+export CXXFLAGS="$SANCOV_FLAGS -fno-inline"
+export LDFLAGS=""
 
 echo "  CFLAGS: $CFLAGS"
 echo "  CXXFLAGS: $CXXFLAGS"
@@ -149,7 +129,7 @@ cd "$BUILD_DIR"
 # Build in Debug mode with assertions to match simple fuzzer build
 # This ensures we're comparing apples to apples:
 # - Simple fuzzer uses: Debug build with assertions
-# - Coverage-guided now uses: Debug build with assertions (+ sancov/PGO)
+# - Coverage-guided now uses: Debug build with assertions (+ sancov)
 log "Phase 5b: Configuring Z3 with CMake"
 cmake \
     -DCMAKE_BUILD_TYPE=Debug \
@@ -179,9 +159,7 @@ if [ ! -f "$BINARY" ]; then
 fi
 
 SANCOV_SYM=$(nm "$BINARY" 2>/dev/null | grep -c "__sanitizer_cov" || echo "0")
-PGO_SYM=$(nm "$BINARY" 2>/dev/null | grep -c "__llvm_profile" || echo "0")
 echo "  Sancov symbols: $SANCOV_SYM"
-echo "  PGO symbols: $PGO_SYM"
 
 # Test binary
 if "$BINARY" --version > /dev/null 2>&1; then
@@ -198,15 +176,10 @@ echo "=============================================="
 echo "Binary: $BINARY"
 echo "Build time: ${BUILD_TIME}s"
 echo "Sancov symbols: $SANCOV_SYM"
-echo "PGO symbols: $PGO_SYM"
-echo "PGO enabled: $( [ "$ENABLE_PGO" = "--enable-pgo" ] && echo "yes" || echo "no" )"
 echo "File size: $(du -h "$BINARY" | cut -f1)"
 
-# Verify instrumentation (only require PGO if enabled)
+# Verify instrumentation
 if [ "$SANCOV_SYM" -gt 0 ]; then
-    if [ "$ENABLE_PGO" = "--enable-pgo" ] && [ "$PGO_SYM" -eq 0 ]; then
-        err "BUILD FAILED - PGO enabled but no PGO symbols found"
-    fi
     ok "BUILD SUCCESSFUL - Instrumentation verified"
     exit 0
 else

@@ -807,76 +807,76 @@ class SimpleCommitFuzzer:
         
         try:
             while not self.shutdown_event.is_set():
-            try:
-                if self._is_paused():
-                    resource_status = self._check_resource_state()
-                    print(f"[WORKER {worker_id}] Paused due to {resource_status} resource usage", file=sys.stderr)
-                    time.sleep(self.RESOURCE_CONFIG['pause_duration'])
-                    continue
-                
                 try:
-                    test_name = self.test_queue.get(timeout=1.0)
-                except Exception:
-                    if self.shutdown_event.is_set() or self._is_time_expired():
+                    if self._is_paused():
+                        resource_status = self._check_resource_state()
+                        print(f"[WORKER {worker_id}] Paused due to {resource_status} resource usage", file=sys.stderr)
+                        time.sleep(self.RESOURCE_CONFIG['pause_duration'])
+                        continue
+                    
+                    try:
+                        test_name = self.test_queue.get(timeout=1.0)
+                    except Exception:
+                        if self.shutdown_event.is_set() or self._is_time_expired():
+                            break
+                        continue
+                    
+                    if self._is_time_expired():
+                        try:
+                            self.test_queue.put(test_name)
+                        except Exception:
+                            pass
                         break
+                    
+                    resource_status = self._check_resource_state()
+                    if resource_status == 'warning':
+                        time.sleep(2)
+                    elif resource_status == 'critical':
+                        try:
+                            self.test_queue.put(test_name)
+                        except Exception:
+                            pass
+                        time.sleep(self.RESOURCE_CONFIG['pause_duration'])
+                        continue
+                    
+                    # Track which test this worker is currently processing
+                    self.current_tests[worker_id] = test_name
+                    
+                    time_remaining = self._get_time_remaining()
+                    
+                    # Use inline typefuzz with recipes if enabled, otherwise use subprocess
+                    if recipe_recorder:
+                        exit_code, bug_files, runtime = self._run_inline_typefuzz_with_recipes(
+                            test_name,
+                            worker_id,
+                            recipe_recorder,
+                            per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
+                        )
+                    else:
+                        exit_code, bug_files, runtime = self._run_typefuzz(
+                            test_name,
+                            worker_id,
+                            per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
+                        )
+                    
+                    # Clear test tracking after processing
+                    if worker_id in self.current_tests:
+                        del self.current_tests[worker_id]
+                    
+                    action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
+                    
+                    if action == 'requeue':
+                        try:
+                            self.test_queue.put(test_name)
+                            self.stats['tests_requeued'] += 1
+                        except Exception:
+                            pass
+                    
+                    self.stats['tests_processed'] += 1
+                    
+                except Exception as e:
+                    print(f"[WORKER {worker_id}] Error in worker: {e}", file=sys.stderr)
                     continue
-                
-                if self._is_time_expired():
-                    try:
-                        self.test_queue.put(test_name)
-                    except Exception:
-                        pass
-                    break
-                
-                resource_status = self._check_resource_state()
-                if resource_status == 'warning':
-                    time.sleep(2)
-                elif resource_status == 'critical':
-                    try:
-                        self.test_queue.put(test_name)
-                    except Exception:
-                        pass
-                    time.sleep(self.RESOURCE_CONFIG['pause_duration'])
-                    continue
-                
-                # Track which test this worker is currently processing
-                self.current_tests[worker_id] = test_name
-                
-                time_remaining = self._get_time_remaining()
-                
-                # Use inline typefuzz with recipes if enabled, otherwise use subprocess
-                if recipe_recorder:
-                    exit_code, bug_files, runtime = self._run_inline_typefuzz_with_recipes(
-                        test_name,
-                        worker_id,
-                        recipe_recorder,
-                        per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
-                    )
-                else:
-                    exit_code, bug_files, runtime = self._run_typefuzz(
-                        test_name,
-                        worker_id,
-                        per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
-                    )
-                
-                # Clear test tracking after processing
-                if worker_id in self.current_tests:
-                    del self.current_tests[worker_id]
-                
-                action = self._handle_exit_code(test_name, exit_code, bug_files, runtime, worker_id)
-                
-                if action == 'requeue':
-                    try:
-                        self.test_queue.put(test_name)
-                        self.stats['tests_requeued'] += 1
-                    except Exception:
-                        pass
-                
-                self.stats['tests_processed'] += 1
-                
-            except Exception as e:
-                print(f"[WORKER {worker_id}] Error in worker: {e}", file=sys.stderr)
-                continue
         finally:
             # Close recipe recorder
             if recipe_recorder:
@@ -1012,160 +1012,6 @@ class SimpleCommitFuzzer:
         print("=" * 60)
 
 
-def analyze_fuzzing_coverage(
-    changed_functions: Path,
-    build_dir: Path,
-    output_statistics: Path,
-    job_id: Optional[str] = None,
-    commit_hash: Optional[str] = None,
-):
-    """Collect coverage with fastcov and analyze changed functions"""
-    import tempfile
-    
-    # Debug: Check for .gcda files before running fastcov
-    print(f"[DEBUG] Checking for coverage files in {build_dir}...")
-    gcda_files = list(build_dir.rglob("*.gcda"))
-    gcno_files = list(build_dir.rglob("*.gcno"))
-    print(f"[DEBUG] Found {len(gcda_files)} .gcda files and {len(gcno_files)} .gcno files")
-    if gcda_files:
-        print(f"[DEBUG] Sample .gcda files (first 5):")
-        for gcda in gcda_files[:5]:
-            print(f"[DEBUG]   - {gcda}")
-    else:
-        print(f"[DEBUG] WARNING: No .gcda files found! Coverage data may not be available.")
-        print(f"[DEBUG] This could mean:")
-        print(f"[DEBUG]   1. The binary was not instrumented for coverage")
-        print(f"[DEBUG]   2. The binary was not executed (no coverage data generated)")
-        print(f"[DEBUG]   3. .gcda files are in a different location")
-    
-    # Run fastcov to collect coverage
-    fastcov_output = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
-    fastcov_output.close()
-    fastcov_path = Path(fastcov_output.name)
-    
-    try:
-        print(f"[INFO] Running fastcov on {build_dir}...")
-        print(f"[DEBUG] Working directory: {build_dir.parent}")
-        print(f"[DEBUG] Sample .gcda file paths (first 3):")
-        for gcda in gcda_files[:3]:
-            print(f"[DEBUG]   - {gcda}")
-        
-        # Match cvc5 exactly: run from build_dir.parent with --search-directory as str(build_dir)
-        # This works because both cvc5 and z3 workflows now use working-directory and relative paths
-        result = subprocess.run([
-            "fastcov", "--gcov", "gcov",
-            "--search-directory", str(build_dir),
-            "--output", str(fastcov_path),
-            "--exclude", "/usr/include/*",
-            "--exclude", "*/deps/*",
-            "--jobs", "4"
-        ], cwd=build_dir.parent, capture_output=True, text=True, check=False)
-        
-        # Debug: Check if fastcov produced a JSON file even if it failed
-        if fastcov_path.exists():
-            file_size = fastcov_path.stat().st_size
-            print(f"[DEBUG] fastcov output file exists: {fastcov_path} (size: {file_size} bytes)")
-            if file_size > 0:
-                try:
-                    with open(fastcov_path, 'r') as f:
-                        fastcov_data = json.load(f)
-                    print(f"[DEBUG] fastcov JSON structure: {list(fastcov_data.keys())}")
-                    if 'sources' in fastcov_data:
-                        print(f"[DEBUG] Found {len(fastcov_data['sources'])} source files in fastcov JSON")
-                except Exception as e:
-                    print(f"[DEBUG] Could not parse fastcov JSON: {e}")
-        else:
-            print(f"[DEBUG] fastcov output file does not exist")
-        
-        if result.returncode != 0:
-            print(f"[ERROR] fastcov failed (exit code {result.returncode})", file=sys.stderr)
-            print(f"[ERROR] fastcov stdout: {result.stdout}", file=sys.stderr)
-            print(f"[ERROR] fastcov stderr: {result.stderr}", file=sys.stderr)
-            # Create empty statistics
-            stats = {
-                "functions": []
-            }
-            if job_id:
-                stats['job_id'] = job_id
-            if commit_hash:
-                stats['commit_hash'] = commit_hash
-            with open(output_statistics, 'w') as f:
-                json.dump(stats, f, indent=2)
-            return
-        
-        # Verify fastcov JSON file is valid and has data
-        if not fastcov_path.exists():
-            print(f"[ERROR] fastcov succeeded but output file does not exist: {fastcov_path}", file=sys.stderr)
-            stats = {
-                "functions": []
-            }
-            if job_id:
-                stats['job_id'] = job_id
-            if commit_hash:
-                stats['commit_hash'] = commit_hash
-            with open(output_statistics, 'w') as f:
-                json.dump(stats, f, indent=2)
-            return
-        
-        # Try to load and validate the JSON
-        try:
-            with open(fastcov_path, 'r') as f:
-                fastcov_data = json.load(f)
-            if 'sources' not in fastcov_data or len(fastcov_data.get('sources', {})) == 0:
-                print(f"[WARNING] fastcov JSON has no source files. Coverage data may be empty.", file=sys.stderr)
-                print(f"[WARNING] This could mean no functions were executed during fuzzing.", file=sys.stderr)
-        except json.JSONDecodeError as e:
-            print(f"[ERROR] fastcov produced invalid JSON: {e}", file=sys.stderr)
-            stats = {
-                "functions": []
-            }
-            if job_id:
-                stats['job_id'] = job_id
-            if commit_hash:
-                stats['commit_hash'] = commit_hash
-            with open(output_statistics, 'w') as f:
-                json.dump(stats, f, indent=2)
-            return
-        
-        # Run analyze script
-        print(f"[INFO] Analyzing coverage...")
-        script_dir = Path(__file__).parent
-        analyze_script = script_dir / "analyze_fuzzing_coverage.py"
-        
-        if not analyze_script.exists():
-            print(f"[ERROR] analyze_fuzzing_coverage.py not found at {analyze_script}", file=sys.stderr)
-            sys.exit(1)
-        
-        cmd = [
-            sys.executable, str(analyze_script),
-            "--changed-functions", str(changed_functions),
-            "--fastcov-json", str(fastcov_path),
-            "--output", str(output_statistics),
-            # "--debug",  # Disabled to test if debug output causes hang
-        ]
-        if job_id:
-            cmd.extend(["--job-id", job_id])
-        if commit_hash:
-            cmd.extend(["--commit-hash", commit_hash])
-        
-        print(f"[DEBUG] Running: {' '.join(cmd)}", file=sys.stderr)
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=300)
-        print(f"[DEBUG] Subprocess completed with return code: {result.returncode}", file=sys.stderr)
-        if result.returncode != 0:
-            print(f"[ERROR] Coverage analysis failed: {result.stderr}", file=sys.stderr)
-            print(f"[ERROR] Coverage analysis stdout: {result.stdout}", file=sys.stderr)
-        else:
-            print(result.stdout)
-        print(f"[DEBUG] analyze_fuzzing_coverage finished", file=sys.stderr)
-    
-    finally:
-        # Clean up temp file
-        try:
-            fastcov_path.unlink()
-        except Exception:
-            pass
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Simple commit fuzzer that runs typefuzz on tests with multiple solvers"
@@ -1259,25 +1105,6 @@ def main():
         help="Folder to store bugs (default: bugs)",
     )
     parser.add_argument(
-        "--changed-functions",
-        type=Path,
-        help="JSON file with changed functions list (for coverage analysis)",
-    )
-    parser.add_argument(
-        "--build-dir",
-        default="./build",
-        help="Build directory for coverage analysis (default: ./build)",
-    )
-    parser.add_argument(
-        "--output-statistics",
-        type=Path,
-        help="Output statistics JSON file (for coverage analysis)",
-    )
-    parser.add_argument(
-        "--commit-hash",
-        help="Commit hash for statistics output",
-    )
-    parser.add_argument(
         "--fuzzing-duration-minutes",
         type=float,
         default=60.0,
@@ -1338,21 +1165,7 @@ def main():
             recipe_output=args.recipe_output,
         )
         
-        # Clear coverage data before fuzzing
-        if args.changed_functions and args.output_statistics:
-            print("[INFO] Clearing existing .gcda files...")
-            build_dir = Path(args.build_dir)
-            if build_dir.exists():
-                for gcda_file in build_dir.rglob("*.gcda"):
-                    try:
-                        gcda_file.unlink()
-                    except Exception as e:
-                        print(f"[WARN] Failed to delete {gcda_file}: {e}")
-        
         fuzzer.run()
-        
-        # Coverage analysis is now done in a separate workflow step
-        # to avoid potential hang issues with subprocess capture
         
         # Always exit with success - use os._exit to force terminate
         # without waiting for threads/cleanup handlers that may hang
