@@ -1,159 +1,179 @@
 #!/usr/bin/env python3
 """
-Generate allowlist for sancov instrumentation from changed functions.
+Generate Sancov Allowlist from Changed Functions
+=================================================
 
-This script reads changed functions from a JSON file (produced by prepare_commit_fuzzer.py)
-and generates a sancov allowlist file.
+Generates sancov allowlist from the changed_functions.json output
+of prepare_commit_fuzzer_sancov.py.
 
-The allowlist uses the format expected by LLVM:
-  fun:function_name
-  src:source_file.cpp
+Input format (changed_functions.json):
+{
+  "commit_hash": "...",
+  "changed_functions": ["file:signature", ...],
+  "function_info_map": {
+    "file:signature": {
+      "signature": "...",
+      "file": "...",
+      "start": 123,
+      "end": 456,
+      "mangled_name": "_ZN5nlsat..."
+    }
+  }
+}
+
+Output format:
+
+Sancov Allowlist (-fsanitize-coverage-allowlist):
+    src:*
+    fun:_ZN5nlsat...
+    fun:_ZN5nlsat...
+
+Usage:
+    python generate_allowlists.py \\
+        --input changed_functions.json \\
+        --output-sancov sancov_allowlist.txt
 """
 
 import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 
-def load_changed_functions(json_path: Path) -> Dict:
-    """Load changed functions from JSON file."""
-    with open(json_path, 'r') as f:
-        data = json.load(f)
-    return data
-
-
-def extract_function_names(changed_functions: Dict) -> Set[str]:
-    """Extract all function names (signatures) from changed functions.
-    
-    Z3's prepare_commit_fuzzer.py outputs changed_functions as a list of strings
-    in the format: "file:signature:line" (e.g., "src/nlsat/nlsat_explain.cpp:nlsat::explain::imp::cell_root_info::reset():296")
+def load_changed_functions(input_file: str) -> Tuple[List[str], Dict]:
     """
-    function_names = set()
+    Load changed functions from JSON file.
     
-    if 'changed_functions' in changed_functions:
-        for func in changed_functions['changed_functions']:
-            # In Z3, changed_functions is a list of strings (not dicts)
-            if isinstance(func, str):
-                # Function signature is already the full identifier
-                # Format: "file:signature:line"
-                function_names.add(func)
-            elif isinstance(func, dict):
-                # Fallback: if it's a dict, extract signature
-                signature = func.get('signature', '')
-                if signature:
-                    function_names.add(signature)
+    Returns:
+        (changed_functions list, function_info_map dict)
+    """
+    with open(input_file, 'r') as f:
+        data = json.load(f)
     
-    return function_names
+    changed_functions = data.get('changed_functions', [])
+    function_info_map = data.get('function_info_map', {})
+    
+    return changed_functions, function_info_map
 
 
-def generate_sancov_allowlist(function_names: Set[str], source_files: Set[str] = None) -> str:
+def extract_mangled_names(
+    changed_functions: List[str],
+    function_info_map: Dict
+) -> Set[str]:
+    """
+    Extract mangled function names from function_info_map.
+    
+    Args:
+        changed_functions: List of "file:signature" strings
+        function_info_map: Dict mapping "file:signature" to function info
+        
+    Returns:
+        Set of mangled function names
+    """
+    mangled_names = set()
+    
+    for func_key in changed_functions:
+        if func_key in function_info_map:
+            info = function_info_map[func_key]
+            mangled_name = info.get('mangled_name')
+            if mangled_name:
+                mangled_names.add(mangled_name)
+    
+    return mangled_names
+
+
+def generate_sancov_allowlist(
+    mangled_names: Set[str],
+    source_files: Optional[Set[str]] = None
+) -> str:
     """
     Generate sancov allowlist content.
     
     Format:
-      fun:function_name
-      src:source_file.cpp
+        src:*  (or src:<file> for each file)
+        fun:<mangled_name>
+        
+    Args:
+        mangled_names: Set of mangled function names
+        source_files: Optional set of source files (if None, uses src:*)
+        
+    Returns:
+        Allowlist content as string
     """
-    lines = []
+    lines = [
+        "# Sancov Allowlist - Auto-generated",
+        "# Format: -fsanitize-coverage-allowlist=<this_file>",
+        "#",
+        "# Source filter (required for fun: patterns to work)",
+        "src:*",
+        "",
+        "# Functions to instrument",
+    ]
     
     # Add function entries
-    for func_name in sorted(function_names):
-        lines.append(f"fun:{func_name}")
-    
-    # Add source file entries if provided
-    if source_files:
-        for src_file in sorted(source_files):
-            lines.append(f"src:{src_file}")
+    for name in sorted(mangled_names):
+        lines.append(f"fun:{name}")
     
     return '\n'.join(lines) + '\n'
 
 
-def extract_source_files(changed_functions: Dict) -> Set[str]:
-    """Extract source file paths from changed functions.
-    
-    For Z3, changed_functions are strings in format "file:signature:line",
-    so we extract the file part before the first colon.
-    """
-    source_files = set()
-    
-    if 'changed_functions' in changed_functions:
-        for func in changed_functions['changed_functions']:
-            if isinstance(func, str):
-                # Format: "file:signature:line" - extract file part
-                if ':' in func:
-                    file_path = func.split(':', 1)[0]
-                    if file_path:
-                        source_files.add(file_path)
-            elif isinstance(func, dict):
-                # Fallback: if it's a dict, extract file
-                file_path = func.get('file', '')
-                if file_path:
-                    source_files.add(file_path)
-    
-    return source_files
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate sancov allowlist from changed functions"
+        description='Generate sancov allowlist from changed functions',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        '--input',
-        type=Path,
-        required=True,
-        help='Input JSON file with changed functions'
-    )
-    parser.add_argument(
-        '--output-sancov',
-        type=Path,
-        required=True,
-        help='Output path for sancov allowlist'
-    )
-    parser.add_argument(
-        '--include-sources',
-        action='store_true',
-        help='Include source file entries in allowlist'
-    )
+    parser.add_argument('--input', '-i', required=True,
+                        help='Path to changed_functions.json')
+    parser.add_argument('--output-sancov', '-s', required=True,
+                        help='Output path for sancov allowlist')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                        help='Verbose output')
     
     args = parser.parse_args()
     
+    # Validate input
+    if not Path(args.input).exists():
+        print(f"❌ Input file not found: {args.input}")
+        return 1
+    
+    sancov_path = Path(args.output_sancov)
+    
     # Load changed functions
-    if not args.input.exists():
-        print(f"Error: Input file not found: {args.input}", file=sys.stderr)
-        sys.exit(1)
+    print(f"📂 Loading: {args.input}")
+    changed_functions, function_info_map = load_changed_functions(args.input)
     
-    changed_functions = load_changed_functions(args.input)
-    
-    # Extract function names
-    function_names = extract_function_names(changed_functions)
-    
-    if not function_names:
-        print("Warning: No function names found in input file", file=sys.stderr)
+    if not changed_functions:
+        print("⚠️  No changed functions found in input file")
         # Create empty allowlist
-        args.output_sancov.write_text("")
-        sys.exit(0)
+        sancov_path.write_text("")
+        return 0
     
-    print(f"Found {len(function_names)} changed functions")
+    print(f"   Found {len(changed_functions)} changed functions")
     
-    # Extract source files if requested
-    source_files = None
-    if args.include_sources:
-        source_files = extract_source_files(changed_functions)
-        if source_files:
-            print(f"Found {len(source_files)} source files")
+    # Extract mangled names
+    mangled_names = extract_mangled_names(changed_functions, function_info_map)
+    print(f"   Extracted {len(mangled_names)} mangled names")
     
-    # Generate allowlist
-    sancov_content = generate_sancov_allowlist(function_names, source_files)
+    if not mangled_names:
+        print("⚠️  No mangled names found. Allowlist will be empty.")
+        sancov_path.write_text("")
+        return 0
     
-    # Write allowlist
-    args.output_sancov.write_text(sancov_content)
+    if args.verbose:
+        print("\n   Mangled names:")
+        for name in sorted(mangled_names):
+            print(f"     {name}")
+        print()
     
-    entry_count = len(function_names) + (len(source_files) if source_files else 0)
+    # Generate and write sancov allowlist
+    sancov_content = generate_sancov_allowlist(mangled_names)
+    with open(sancov_path, 'w') as f:
+        f.write(sancov_content)
+    print(f"✅ Sancov allowlist: {sancov_path} ({len(mangled_names)} functions)")
     
-    print(f"Generated sancov allowlist: {args.output_sancov} ({entry_count} entries)")
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

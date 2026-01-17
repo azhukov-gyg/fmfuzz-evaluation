@@ -157,7 +157,7 @@ jobs:
           SKIP_COVERAGE_ENFORCEMENT: "true"
           MAX_JOBS: 4
         run: |
-          python3 ${{ github.workspace }}/scripts/z3/commit_fuzzer/prepare_commit_fuzzer.py \
+          python3 ${{ github.workspace }}/scripts/z3/commit_fuzzer/prepare_commit_fuzzer_sancov.py \
             ${{ steps.get-commit.outputs.commit_hash }} \
             --coverage-json ../coverage_mapping.json \
             --compile-commands build \
