@@ -6,14 +6,47 @@ import json
 import multiprocessing
 import os
 import psutil
+import random
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+# Add scripts/rq2 to path for shared components (RecipeRecorder, InlineTypeFuzz)
+SCRIPT_DIR = Path(__file__).parent
+RQ2_PATH = SCRIPT_DIR.parent.parent / "rq2"
+if str(RQ2_PATH) not in sys.path:
+    sys.path.insert(0, str(RQ2_PATH))
+
+
+# Lazy imports for recipe recording and InlineTypeFuzz (avoid import errors if not needed)
+_RecipeRecorder = None
+_InlineTypeFuzz = None
+_get_worker_recipe_path = None
+_merge_recipe_files = None
+
+def _import_recipes():
+    """Lazy import recipe recorder components."""
+    global _RecipeRecorder, _get_worker_recipe_path, _merge_recipe_files
+    if _RecipeRecorder is None:
+        from recipe_recorder import RecipeRecorder, get_worker_recipe_path, merge_recipe_files
+        _RecipeRecorder = RecipeRecorder
+        _get_worker_recipe_path = get_worker_recipe_path
+        _merge_recipe_files = merge_recipe_files
+    return _RecipeRecorder, _get_worker_recipe_path, _merge_recipe_files
+
+def _import_inline_typefuzz():
+    """Lazy import InlineTypeFuzz from shared module."""
+    global _InlineTypeFuzz
+    if _InlineTypeFuzz is None:
+        from inline_typefuzz import InlineTypeFuzz
+        _InlineTypeFuzz = InlineTypeFuzz
+    return _InlineTypeFuzz
 
 
 class SimpleCommitFuzzer:
@@ -50,6 +83,7 @@ class SimpleCommitFuzzer:
         z3_path: str = "./build/z3",
         cvc5_path: Optional[str] = None,
         job_id: Optional[str] = None,
+        recipe_output: Optional[str] = None,  # Path to recipe output dir/file
     ):
         self.tests = tests
         self.tests_root = Path(tests_root)
@@ -59,6 +93,7 @@ class SimpleCommitFuzzer:
         self.seed = seed
         self.job_id = job_id
         self.start_time = time.time()
+        self.recipe_output = recipe_output  # If set, enables recipe recording
         
         try:
             self.cpu_count = psutil.cpu_count()
@@ -598,6 +633,124 @@ class SimpleCommitFuzzer:
             for folder in [scratch_folder, log_folder]:
                 shutil.rmtree(folder, ignore_errors=True)
     
+    def _run_inline_typefuzz_with_recipes(
+        self,
+        test_name: str,
+        worker_id: int,
+        recipe_recorder,
+        per_test_timeout: Optional[float] = None,
+    ) -> Tuple[int, List[Path], float]:
+        """
+        Run typefuzz inline (not subprocess) with recipe recording.
+        Used when --recipe-output is specified.
+        Note: Z3 SMT2 files don't have headers, so we don't extract directives.
+        """
+        InlineTypeFuzz = _import_inline_typefuzz()
+        
+        test_path = self.tests_root / test_name
+        if not test_path.exists():
+            print(f"[WORKER {worker_id}] Error: Test file not found: {test_path}", file=sys.stderr)
+            return (1, [], 0.0)
+        
+        bugs_folder = self.bugs_folder / f"worker_{worker_id}"
+        bugs_folder.mkdir(parents=True, exist_ok=True)
+        
+        # Set random seed for deterministic mutations
+        random.seed(self.seed)
+        
+        # Parse seed
+        fuzzer = InlineTypeFuzz(test_path)
+        if not fuzzer.parse():
+            print(f"[WORKER {worker_id}] Failed to parse: {test_name}", file=sys.stderr)
+            return (self.EXIT_CODE_UNSUPPORTED, [], 0.0)
+        
+        # Get solver commands (Z3 doesn't have headers, so no directive extraction)
+        z3_memory_mb = self.RESOURCE_CONFIG['z3_memory_limit_mb']
+        z3_cmd = f"{self.z3_path} smt.threads=1 memory_max_size={z3_memory_mb} model_validate=true"
+        
+        # Build CVC5 command (if available) - no header parsing for Z3
+        cvc5_cmd = None
+        if self.cvc5_path:
+            cvc5_cmd = f"{self.cvc5_path} --check-models --check-proofs --strings-exp"
+        
+        start_time = time.time()
+        bug_files = []
+        iterations_done = 0
+        
+        # Record seed start
+        recipe_recorder.record_seed_start(str(test_path), self.iterations)
+        
+        # Build solver list
+        solvers_list = [z3_cmd]
+        if cvc5_cmd:
+            solvers_list.append(cvc5_cmd)
+        
+        for iteration in range(1, self.iterations + 1):
+            # Check timeout
+            if per_test_timeout and (time.time() - start_time) > per_test_timeout:
+                break
+            
+            # Check shutdown
+            if self.shutdown_event.is_set():
+                break
+            
+            # Generate mutation
+            mutant, success = fuzzer.mutate()
+            if not success:
+                continue
+            
+            iterations_done += 1
+            
+            # Only run solver every modulo iterations (like typefuzz -m flag)
+            if iteration % self.modulo != 0:
+                continue
+            
+            # Record recipe ONLY for mutations where solver actually runs
+            recipe_recorder.record(str(test_path), iteration)
+            
+            # Write mutant to temp file
+            mutant_path = None
+            try:
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
+                    f.write(mutant)
+                    mutant_path = Path(f.name)
+                
+                # Run differential testing
+                is_bug, bug_type, _ = fuzzer.run_solvers_differential(
+                    mutant_path, 
+                    solvers_list,
+                    timeout=120,
+                    env=os.environ.copy()
+                )
+                
+                if is_bug:
+                    # Save bug
+                    bug_dest = bugs_folder / f"bug_{bug_type}_{int(time.time())}_{iteration}.smt2"
+                    shutil.copy(str(mutant_path), str(bug_dest))
+                    bug_files.append(bug_dest)
+                    print(f"[WORKER {worker_id}] Found {bug_type} bug at iteration {iteration}", file=sys.stderr)
+                    
+            except Exception as e:
+                pass
+            finally:
+                # Cleanup temp file
+                if mutant_path and mutant_path.exists():
+                    try:
+                        mutant_path.unlink()
+                    except:
+                        pass
+        
+        runtime = time.time() - start_time
+        
+        # Record seed end
+        recipe_recorder.record_seed_end(str(test_path), iterations_done, 
+                                        reason="bug_found" if bug_files else "completed")
+        
+        # Determine exit code
+        if bug_files:
+            return (self.EXIT_CODE_BUGS_FOUND, bug_files, runtime)
+        return (self.EXIT_CODE_SUCCESS, [], runtime)
+    
     def _handle_exit_code(
         self,
         test_name: str,
@@ -641,10 +794,19 @@ class SimpleCommitFuzzer:
         else:
             return 'continue'
     
-    def _worker_process(self, worker_id: int):
+    def _worker_process(self, worker_id: int, recipe_output_path: Optional[str] = None):
         print(f"[WORKER {worker_id}] Started")
         
-        while not self.shutdown_event.is_set():
+        # Initialize recipe recorder if enabled
+        recipe_recorder = None
+        if recipe_output_path:
+            RecipeRecorder, get_worker_recipe_path, _ = _import_recipes()
+            worker_recipe_path = get_worker_recipe_path(recipe_output_path, worker_id - 1)  # 0-indexed
+            recipe_recorder = RecipeRecorder(worker_recipe_path, self.seed, worker_id=worker_id - 1)
+            print(f"[WORKER {worker_id}] Recording recipes to: {worker_recipe_path}", file=sys.stderr)
+        
+        try:
+            while not self.shutdown_event.is_set():
             try:
                 if self._is_paused():
                     resource_status = self._check_resource_state()
@@ -681,11 +843,21 @@ class SimpleCommitFuzzer:
                 self.current_tests[worker_id] = test_name
                 
                 time_remaining = self._get_time_remaining()
-                exit_code, bug_files, runtime = self._run_typefuzz(
-                    test_name,
-                    worker_id,
-                    per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
-                )
+                
+                # Use inline typefuzz with recipes if enabled, otherwise use subprocess
+                if recipe_recorder:
+                    exit_code, bug_files, runtime = self._run_inline_typefuzz_with_recipes(
+                        test_name,
+                        worker_id,
+                        recipe_recorder,
+                        per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
+                    )
+                else:
+                    exit_code, bug_files, runtime = self._run_typefuzz(
+                        test_name,
+                        worker_id,
+                        per_test_timeout=time_remaining if self.time_remaining and time_remaining > 0 else None,
+                    )
                 
                 # Clear test tracking after processing
                 if worker_id in self.current_tests:
@@ -705,6 +877,11 @@ class SimpleCommitFuzzer:
             except Exception as e:
                 print(f"[WORKER {worker_id}] Error in worker: {e}", file=sys.stderr)
                 continue
+        finally:
+            # Close recipe recorder
+            if recipe_recorder:
+                recipe_recorder.close()
+                print(f"[WORKER {worker_id}] Closed recipe recorder ({recipe_recorder.recipe_count} recipes)", file=sys.stderr)
         
         print(f"[WORKER {worker_id}] Stopped")
     
@@ -728,9 +905,16 @@ class SimpleCommitFuzzer:
         for test in self.tests:
             self.test_queue.put(test)
         
+        # Print recipe mode info
+        if self.recipe_output:
+            print(f"Recipe recording: ENABLED → {self.recipe_output}")
+        
         workers = []
         for worker_id in range(1, self.num_workers + 1):
-            worker = multiprocessing.Process(target=self._worker_process, args=(worker_id,))
+            worker = multiprocessing.Process(
+                target=self._worker_process, 
+                args=(worker_id, self.recipe_output)
+            )
             worker.start()
             workers.append(worker)
         
@@ -783,6 +967,20 @@ class SimpleCommitFuzzer:
                     shutil.move(str(bug_file), str(dest))
                 except Exception:
                     pass
+        
+        # Merge recipe files from all workers
+        if self.recipe_output:
+            _, get_worker_recipe_path, merge_recipe_files = _import_recipes()
+            worker_files = [
+                get_worker_recipe_path(self.recipe_output, i) 
+                for i in range(self.num_workers)
+            ]
+            # Filter to existing files
+            existing_files = [f for f in worker_files if Path(f).exists()]
+            if existing_files:
+                merged_path = self.recipe_output if self.recipe_output.endswith('.jsonl') else f"{self.recipe_output}.jsonl"
+                total_recipes = merge_recipe_files(existing_files, merged_path)
+                print(f"\n📝 Merged {total_recipes} recipes from {len(existing_files)} workers → {merged_path}")
         
         print()
         print("=" * 60)
@@ -1085,6 +1283,11 @@ def main():
         default=60.0,
         help="Fuzzing duration in minutes (default: 60.0)",
     )
+    parser.add_argument(
+        "--recipe-output",
+        help="Path to recipe output file (enables recipe recording mode). "
+             "Each worker writes to {path}_worker_N.jsonl, merged at end.",
+    )
     
     args = parser.parse_args()
     
@@ -1132,6 +1335,7 @@ def main():
             z3_path=args.z3_path,
             cvc5_path=args.cvc5_path,
             job_id=args.job_id,
+            recipe_output=args.recipe_output,
         )
         
         # Clear coverage data before fuzzing
