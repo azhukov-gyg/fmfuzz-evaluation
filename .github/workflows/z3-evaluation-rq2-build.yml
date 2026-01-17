@@ -38,13 +38,24 @@ jobs:
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
-          MATRIX=$(python3 scripts/rq2/generate_build_matrix.py z3)
-          COMMIT_COUNT=$(echo "$MATRIX" | python3 -c "import sys, json; data=json.load(sys.stdin); print(len(data['include']))")
+          # Get commits from generate_build_matrix.py
+          COMMITS_JSON=$(python3 scripts/rq2/generate_build_matrix.py z3)
+          
+          # Expand to include both build types for each commit
+          MATRIX=$(echo "$COMMITS_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          commits = [entry['commit'] for entry in data['include']]
+          build_types = ['fuzzing', 'instrumented']
+          include = [{'commit': c, 'build_type': b} for c in commits for b in build_types]
+          print(json.dumps({'include': include}, separators=(',', ':')))
+          ")
+          TOTAL_JOBS=$(echo "$MATRIX" | python3 -c "import sys, json; print(len(json.load(sys.stdin)['include']))")
           
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "total_commits=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+          echo "total_commits=$TOTAL_JOBS" >> $GITHUB_OUTPUT
           
-          echo "✅ Generated matrix with $COMMIT_COUNT commits"
+          echo "✅ Generated matrix with $TOTAL_JOBS jobs (commits × 2 build types)"
           echo "$MATRIX" | python3 -m json.tool
 
   build-binaries:
@@ -62,10 +73,13 @@ jobs:
         with:
           submodules: recursive
       
+      - name: Show build info
+        run: |
+          echo "🔨 Building: ${{ matrix.commit }} (${{ matrix.build_type }})"
+      
       - name: Prepare Z3 for commit
         run: |
           COMMIT_HASH="${{ matrix.commit }}"
-          echo "🔨 Building commit: $COMMIT_HASH"
           if [ -d "z3" ]; then
             rm -rf z3
           fi
@@ -75,75 +89,6 @@ jobs:
           echo "Checked out commit: $(git rev-parse HEAD)"
           cd ..
       
-      - name: Install LLVM/Clang 17 for coverage build
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: '17'
-      
-      - name: Add LLVM to PATH
-        run: echo "${{ env.LLVM_PATH }}/bin" >> $GITHUB_PATH
-      
-      - name: Install GCC 14 (for consistent toolchain)
-        run: |
-          # Install GCC 14 to ensure consistent toolchain version
-          # This ensures coverage format compatibility (gcov-14 can read GCC 14 coverage data)
-          sudo apt-get update
-          sudo apt-get install -y gcc-14 g++-14 libstdc++-14-dev
-          # Set GCC 14 as default
-          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 60
-          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 60
-          sudo update-alternatives --set gcc /usr/bin/gcc-14
-          sudo update-alternatives --set g++ /usr/bin/g++-14
-      
-      - name: Clean build for coverage
-        run: |
-          if [ -d "z3/build" ]; then
-            rm -rf z3/build
-          fi
-      
-      - name: Build Z3 coverage binary
-        run: |
-          # Use GCC 14 directly for compilation to ensure coverage format matches
-          # This ensures 'B42*' format that gcov-14 can read
-          export CXX="g++-14"
-          export CC="gcc-14"
-          ./fmfuzz-dev/scripts/z3/build.sh --static --coverage
-      
-      - name: Collect coverage artifacts
-        run: |
-          ./scripts/z3/collect_build_artifacts.sh z3/build .artifacts-coverage
-      
-      - name: Show build directory structure
-        run: |
-          echo "=== Full build directory structure ==="
-          echo "Build directory: z3/build"
-          echo ""
-          if [ -d "z3/build" ]; then
-            echo "Directory tree:"
-            find z3/build -type f -o -type d | sort | sed 's|^z3/build/||' | sed 's|^|  |'
-            echo ""
-            echo "File count by type:"
-            echo "  .cpp files: $(find z3/build -name "*.cpp" -type f 2>/dev/null | wc -l)"
-            echo "  .h files: $(find z3/build -name "*.h" -type f 2>/dev/null | wc -l)"
-            echo "  .gcno files: $(find z3/build -name "*.gcno" -type f 2>/dev/null | wc -l)"
-            echo "  Total files: $(find z3/build -type f 2>/dev/null | wc -l)"
-          else
-            echo "Build directory does not exist"
-          fi
-      
-      - name: Compress coverage artifacts
-        run: |
-          cd .artifacts-coverage
-          tar -czf /tmp/artifacts-coverage.tar.gz .
-          cd ..
-      
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5.1.0
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-      
       - name: Get commit hash
         id: get-commit
         working-directory: z3
@@ -152,20 +97,116 @@ jobs:
           echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
           echo "Z3 commit hash: $COMMIT_HASH"
       
-      - name: Upload coverage binary to S3
+      # ============================================================
+      # SIMPLE BUILD (BASELINE)
+      # ============================================================
+      
+      - name: Build Z3 simple binary (baseline)
+        if: matrix.build_type == 'fuzzing'
+        run: |
+          cd z3
+          mkdir -p build
+          cd build
+          cmake -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+                -DZ3_BUILD_LIBZ3_SHARED=OFF \
+                -DZ3_BUILD_EXECUTABLE=ON \
+                -DZ3_BUILD_TEST_EXECUTABLES=OFF \
+                -G "Unix Makefiles" ..
+          make -j$(nproc)
+          echo "✅ Built simple binary (debug + assertions)"
+      
+      - name: Collect simple build artifacts
+        if: matrix.build_type == 'fuzzing'
+        run: |
+          ./scripts/z3/collect_build_artifacts.sh z3/build .artifacts
+      
+      # ============================================================
+      # INSTRUMENTED BUILD (EDGE COVERAGE)
+      # ============================================================
+      
+      - name: Install LLVM/Clang 17 for instrumented build
+        if: matrix.build_type == 'instrumented'
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: '17'
+      
+      - name: Add LLVM to PATH
+        if: matrix.build_type == 'instrumented'
+        run: echo "${{ env.LLVM_PATH }}/bin" >> $GITHUB_PATH
+      
+      - name: Build Z3 with sancov instrumentation
+        if: matrix.build_type == 'instrumented'
+        run: |
+          echo "=== Building Z3 with sancov instrumentation ==="
+          
+          export WORKSPACE="${{ github.workspace }}"
+          export COVERAGE_AGENT="${{ github.workspace }}/scripts/z3/partial_instrumentation/coverage_agent.cpp"
+          
+          # Build with sancov instrumentation (no allowlist - instrument everything)
+          # Allowlists will be used during fuzzing workflow
+          ${{ github.workspace }}/scripts/z3/partial_instrumentation/build_z3_instrumented.sh \
+            "${{ matrix.commit }}" \
+            "" \
+            ""
+          
+          echo "✅ Build complete"
+          ls -la z3/build/z3
+      
+      - name: Verify instrumentation
+        if: matrix.build_type == 'instrumented'
+        id: verify-instrumentation
+        run: |
+          echo "=== Verifying instrumentation ==="
+          SANCOV_SYM=$(nm z3/build/z3 2>/dev/null | grep -c "__sanitizer_cov" || echo "0")
+          echo "Sancov symbols: $SANCOV_SYM"
+          
+          # Count total instrumented edges from coverage agent debug output
+          echo "=== Counting total instrumented edges ==="
+          TOTAL_EDGES=$(COVERAGE_AGENT_DEBUG=1 z3/build/z3 --version 2>&1 | grep -oP 'total_edges=\K\d+' || echo "0")
+          echo "Total instrumented edges: $TOTAL_EDGES"
+          echo "total_edges=${TOTAL_EDGES}" >> $GITHUB_OUTPUT
+          
+          echo "✅ Binary works"
+      
+      - name: Collect instrumented build artifacts
+        if: matrix.build_type == 'instrumented'
+        run: |
+          ./scripts/z3/collect_build_artifacts.sh z3/build .artifacts
+      
+      # ============================================================
+      # UPLOAD (common for both build types)
+      # ============================================================
+      
+      - name: Compress artifacts
+        run: |
+          cd .artifacts
+          tar -czf /tmp/artifacts.tar.gz .
+          cd ..
+          ls -la /tmp/artifacts.tar.gz
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      
+      - name: Upload binary to S3
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/z3/builds/coverage/${COMMIT_HASH}.tar.gz"
+          BUILD_TYPE="${{ matrix.build_type }}"
+          S3_KEY="evaluation/rq2/z3/builds/${BUILD_TYPE}/${COMMIT_HASH}.tar.gz"
           
-          if [ ! -f "/tmp/artifacts-coverage.tar.gz" ]; then
-            echo "❌ Error: artifacts-coverage.tar.gz not found"
+          if [ ! -f "/tmp/artifacts.tar.gz" ]; then
+            echo "❌ Error: artifacts.tar.gz not found"
             exit 1
           fi
           
           aws s3api put-object \
             --bucket ${{ secrets.AWS_S3_BUCKET }} \
             --key "$S3_KEY" \
-            --body /tmp/artifacts-coverage.tar.gz
+            --body /tmp/artifacts.tar.gz
           
-          echo "✅ Uploaded coverage binary to S3: $S3_KEY"
+          echo "✅ Uploaded ${BUILD_TYPE} binary to S3: $S3_KEY"
 
