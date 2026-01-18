@@ -71,10 +71,6 @@ MUTATION_TIMEOUT = 30
 # Timeout for parsing operations (seconds) - parsing large files can hang
 PARSE_TIMEOUT = 60
 
-# Maximum content size (bytes) - skip chains that produce content larger than this
-# Empirically, 50KB+ content causes parser hangs
-MAX_CONTENT_SIZE = 50 * 1024  # 50KB
-
 # Add current directory to path for imports
 SCRIPT_DIR = Path(__file__).parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -541,10 +537,6 @@ def regenerate_chain_content(
                         if success and mutant:
                             content = mutant
                             log(f"[W{worker_id}] Chain step {step_idx+1}: COMPLETE (new content len={len(content)})")
-                            # Check content size limit
-                            if len(content) > MAX_CONTENT_SIZE:
-                                log(f"[W{worker_id}] Chain step {step_idx+1}: CONTENT TOO LARGE ({len(content)} > {MAX_CONTENT_SIZE}), skipping")
-                                return None
                         else:
                             log(f"[W{worker_id}] Chain step {step_idx}: mutation {target_iter} failed")
                             return None
@@ -898,12 +890,6 @@ def generation_worker(
                 progress_queue.put(('gen_skip', worker_id, seed_name, f'read failed: {e}'))
                 tests_failed += len(group_recipes)
                 continue
-        
-        # Check content size
-        if len(start_content) > MAX_CONTENT_SIZE:
-            progress_queue.put(('gen_skip', worker_id, seed_name, f'content too large ({len(start_content)} bytes)'))
-            tests_failed += len(group_recipes)
-            continue
         
         # Initialize RNG and create fuzzer
         random.seed(rng_seed)
