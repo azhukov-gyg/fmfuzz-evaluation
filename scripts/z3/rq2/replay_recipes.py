@@ -958,7 +958,9 @@ def execution_worker(
         
         # Z3 command with memory limit
         cmd = [solver_path, f"-memory:{z3_memory_mb}", test_path]
+        test_name = os.path.basename(test_path)
         
+        start_time = time.time()
         try:
             result = subprocess.run(
                 cmd,
@@ -967,10 +969,14 @@ def execution_worker(
                 text=True
             )
             tests_success += 1
+            elapsed = time.time() - start_time
+            progress_queue.put(('exec_test', worker_id, test_name, elapsed, 'ok'))
         except subprocess.TimeoutExpired:
             tests_failed += 1
+            progress_queue.put(('exec_test', worker_id, test_name, timeout, 'TIMEOUT'))
         except Exception as e:
             tests_failed += 1
+            progress_queue.put(('exec_test', worker_id, test_name, 0, f'ERROR: {e}'))
         
         tests_run += 1
         
@@ -978,9 +984,6 @@ def execution_worker(
             os.unlink(test_path)
         except:
             pass
-        
-        if tests_run % 50 == 0:
-            progress_queue.put(('exec_progress', worker_id, tests_run, tests_success))
     
     result_queue.put({
         'worker_id': worker_id,
@@ -1214,9 +1217,9 @@ def replay_recipes_two_phase(
                 if msg[0] == 'exec_worker_start':
                     _, wid, pid = msg
                     log(f"[E{wid}] Worker started (pid={pid})")
-                elif msg[0] == 'exec_progress':
-                    _, wid, tests_run, tests_success = msg
-                    log(f"[E{wid}] Progress: {tests_run} run, {tests_success} success")
+                elif msg[0] == 'exec_test':
+                    _, wid, test_name, elapsed, status = msg
+                    log(f"[E{wid}] {test_name}: {status} ({elapsed:.1f}s)")
                 elif msg[0] == 'exec_worker_done':
                     _, wid, tests_run, tests_success, tests_failed = msg
                     log(f"[E{wid}] Worker done: {tests_run} run, {tests_success} ok, {tests_failed} failed")
