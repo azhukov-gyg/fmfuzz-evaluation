@@ -387,7 +387,8 @@ def regenerate_chain_content(
     seed_path: str,
     rng_seed: int,
     chain: Tuple[int, ...],
-    worker_id: int
+    worker_id: int,
+    chain_cache: Optional[Dict[Tuple[str, int, Tuple[int, ...]], str]] = None
 ) -> Optional[str]:
     """
     Regenerate intermediate mutant content by replaying the mutation chain.
@@ -397,11 +398,19 @@ def regenerate_chain_content(
         rng_seed: RNG seed used for mutations
         chain: Tuple of iterations, e.g., (10, 20) means gen1 at iter 10, gen2 at iter 20
         worker_id: For logging
+        chain_cache: Optional cache mapping (seed_path, rng_seed, chain_prefix) -> content
     
     Returns:
         The content of the final mutant in the chain, or None if regeneration fails.
         For empty chain, returns the original seed content.
     """
+    # Check cache for this exact chain
+    if chain_cache is not None:
+        cache_key = (seed_path, rng_seed, chain)
+        if cache_key in chain_cache:
+            log(f"[W{worker_id}] Chain {list(chain)} found in cache")
+            return chain_cache[cache_key]
+    
     # Read original seed content
     try:
         with open(seed_path, 'r') as f:
@@ -414,9 +423,25 @@ def regenerate_chain_content(
     if not chain:
         return content
     
-    # Replay each step in the chain (dry mutations - no solver calls)
-    log(f"[W{worker_id}] Chain has {len(chain)} steps: {list(chain)}")
+    # Find longest cached prefix to start from
+    start_step = 0
+    if chain_cache is not None:
+        for prefix_len in range(len(chain) - 1, 0, -1):
+            prefix = chain[:prefix_len]
+            prefix_key = (seed_path, rng_seed, prefix)
+            if prefix_key in chain_cache:
+                content = chain_cache[prefix_key]
+                start_step = prefix_len
+                log(f"[W{worker_id}] Chain prefix {list(prefix)} found in cache, starting from step {start_step+1}")
+                break
+    
+    remaining_steps = len(chain) - start_step
+    log(f"[W{worker_id}] Chain has {len(chain)} steps: {list(chain)}" + 
+        (f" (skipping {start_step} cached)" if start_step > 0 else ""))
     for step_idx, target_iter in enumerate(chain):
+        # Skip steps we got from cache
+        if step_idx < start_step:
+            continue
         log(f"[W{worker_id}] Chain step {step_idx+1}/{len(chain)}: target_iter={target_iter}")
         # Initialize RNG fresh for each chain step (same as during fuzzing)
         random.seed(rng_seed)
@@ -473,6 +498,11 @@ def regenerate_chain_content(
                         if success and mutant:
                             content = mutant
                             log(f"[W{worker_id}] Chain step {step_idx+1}: COMPLETE (new content len={len(content)})")
+                            # Cache this intermediate result
+                            if chain_cache is not None:
+                                prefix = chain[:step_idx+1]
+                                cache_key = (seed_path, rng_seed, prefix)
+                                chain_cache[cache_key] = content
                         else:
                             log(f"[W{worker_id}] Chain step {step_idx}: mutation {target_iter} failed")
                             return None
@@ -769,9 +799,13 @@ def generation_worker(
 ):
     """
     Phase 1 worker: Generate test files from seed groups.
+    Uses chain prefix caching to avoid redundant chain regeneration.
     """
     tests_generated = 0
     tests_failed = 0
+    
+    # Cache for chain prefix content: (seed_path, rng_seed, chain_prefix) -> content
+    chain_cache: Dict[Tuple[str, int, Tuple[int, ...]], str] = {}
     
     progress_queue.put(('gen_worker_start', worker_id, os.getpid()))
     
@@ -796,7 +830,7 @@ def generation_worker(
             continue
         
         if chain:
-            start_content = regenerate_chain_content(seed_path, rng_seed, chain, worker_id)
+            start_content = regenerate_chain_content(seed_path, rng_seed, chain, worker_id, chain_cache)
             if start_content is None:
                 progress_queue.put(('gen_skip', worker_id, seed_name, f'chain regeneration failed{chain_str}'))
                 tests_failed += len(group_recipes)
@@ -1054,7 +1088,12 @@ def replay_recipes_two_phase(
     test_queue = multiprocessing.Queue()
     progress_queue = multiprocessing.Queue()
     
-    for (seed_path, rng_seed, chain), group_recipes in seed_groups_list:
+    # Sort tasks by (seed_path, rng_seed, chain_length) so shorter chains are processed first
+    # This maximizes cache hits for chain prefixes
+    sorted_tasks = sorted(seed_groups_list, key=lambda x: (x[0][0], x[0][1], len(x[0][2])))
+    log(f"Sorted {len(sorted_tasks)} tasks by chain length for optimal caching")
+    
+    for (seed_path, rng_seed, chain), group_recipes in sorted_tasks:
         task_queue.put((seed_path, rng_seed, chain, group_recipes))
     
     for _ in range(num_workers):
@@ -1071,49 +1110,56 @@ def replay_recipes_two_phase(
     
     log(f"Started {num_workers} generation workers")
     
+    # Monitor generation progress - track completion by messages, not just process state
     gen_done = 0
-    while any(p.is_alive() for p in gen_processes):
+    workers_done = set()
+    
+    # Keep processing until all workers have reported done
+    while len(workers_done) < num_workers:
         try:
-            while True:
-                msg = progress_queue.get_nowait()
-                if msg[0] == 'gen_worker_start':
-                    _, wid, pid = msg
-                    log(f"[G{wid}] Worker started (pid={pid})")
-                elif msg[0] == 'gen_start':
-                    _, wid, seed_name, num_recipes = msg
-                    log(f"[G{wid}] Generating: {seed_name} ({num_recipes} recipes)")
-                elif msg[0] == 'gen_done':
-                    _, wid, seed_name, num_recipes = msg
-                    gen_done += 1
-                    log(f"[G{wid}] Done: {seed_name} [{gen_done}/{total_seeds}]")
-                elif msg[0] == 'gen_skip':
-                    _, wid, seed_name, reason = msg
-                    gen_done += 1
-                    log(f"[G{wid}] Skip: {seed_name} - {reason} [{gen_done}/{total_seeds}]")
-                elif msg[0] == 'gen_mutation_timeout':
-                    _, wid, seed_name, iteration = msg
-                    log(f"[G{wid}] Mutation timeout: {seed_name} at iter {iteration}")
-                elif msg[0] == 'hash_mismatch':
-                    _, wid, seed_name, iteration, expected, actual = msg
-                    log(f"[G{wid}] ⚠️ HASH MISMATCH {seed_name} iter {iteration}: expected={expected} actual={actual}")
-                elif msg[0] == 'gen_worker_done':
-                    _, wid, generated, failed = msg
-                    log(f"[G{wid}] Worker done: {generated} generated, {failed} failed")
-        except queue.Empty:
-            pass
-        time.sleep(0.1)
-    
-    for p in gen_processes:
-        p.join()
-    
-    try:
-        while True:
-            msg = progress_queue.get_nowait()
-            if msg[0] == 'gen_worker_done':
+            # Use timeout to avoid blocking forever
+            msg = progress_queue.get(timeout=1.0)
+            if msg[0] == 'gen_worker_start':
+                _, wid, pid = msg
+                log(f"[G{wid}] Worker started (pid={pid})")
+            elif msg[0] == 'gen_start':
+                _, wid, seed_name, num_recipes = msg
+                log(f"[G{wid}] Generating: {seed_name} ({num_recipes} recipes)")
+            elif msg[0] == 'gen_done':
+                _, wid, seed_name, num_recipes = msg
+                gen_done += 1
+                log(f"[G{wid}] Done: {seed_name} [{gen_done}/{total_seeds}]")
+            elif msg[0] == 'gen_skip':
+                _, wid, seed_name, reason = msg
+                gen_done += 1
+                log(f"[G{wid}] Skip: {seed_name} - {reason} [{gen_done}/{total_seeds}]")
+            elif msg[0] == 'gen_mutation_timeout':
+                _, wid, seed_name, iteration = msg
+                log(f"[G{wid}] Mutation timeout: {seed_name} at iter {iteration}")
+            elif msg[0] == 'hash_mismatch':
+                _, wid, seed_name, iteration, expected, actual = msg
+                log(f"[G{wid}] ⚠️ HASH MISMATCH {seed_name} iter {iteration}: expected={expected} actual={actual}")
+            elif msg[0] == 'gen_worker_done':
                 _, wid, generated, failed = msg
-                log(f"[G{wid}] Worker done: {generated} generated, {failed} failed")
-    except queue.Empty:
-        pass
+                workers_done.add(wid)
+                log(f"[G{wid}] Worker done: {generated} generated, {failed} failed ({len(workers_done)}/{num_workers} workers complete)")
+            elif msg[0].startswith('gen_'):
+                log(f"[GEN] {msg}")
+        except queue.Empty:
+            # Log status periodically when waiting
+            alive_workers = [i for i, p in enumerate(gen_processes) if p.is_alive()]
+            if alive_workers:
+                log(f"[STATUS] Waiting for workers {alive_workers}, {len(workers_done)}/{num_workers} reported done")
+    
+    log(f"All {num_workers} workers reported done, cleaning up...")
+    
+    # Wait for processes to actually exit (with timeout)
+    for i, p in enumerate(gen_processes):
+        p.join(timeout=5.0)
+        if p.is_alive():
+            log(f"[WARNING] Worker {i} still alive after join, terminating")
+            p.terminate()
+            p.join(timeout=2.0)
     
     tests_generated = test_queue.qsize()
     phase1_time = time.time() - start_time
