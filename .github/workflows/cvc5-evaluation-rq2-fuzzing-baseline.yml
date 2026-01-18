@@ -302,7 +302,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.collect-matrices.outputs.fuzzing_matrix) }}
-    timeout-minutes: 75
+    timeout-minutes: 360
     
     steps:
       - name: Checkout

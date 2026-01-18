@@ -23,6 +23,7 @@ import argparse
 import json
 import multiprocessing
 import os
+import queue
 import random
 import subprocess
 import sys
@@ -814,24 +815,55 @@ def replay_recipes_optimized(
                 elif msg[0] == 'error':
                     _, worker_id, seed_name, error_msg = msg
                     log(f"[W{worker_id}] ERROR {seed_name}: {error_msg}")
-        except:
-            pass
+        except queue.Empty:
+            pass  # No more messages, continue loop
+        except Exception as e:
+            log(f"WARNING: Error processing progress message: {e}")
         
         time.sleep(0.5)
     
-    # Collect final results from workers
+    # Drain remaining progress messages after workers exit
+    try:
+        while True:
+            msg = progress_queue.get_nowait()
+            if msg[0] == 'done':
+                _, worker_id, seed_name, recipe_count, successful = msg
+                seeds_done += 1
+                log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] {seed_name}: {recipe_count} recipes, {successful} ok (final)")
+            elif msg[0] == 'skip':
+                _, worker_id, seed_name, reason, recipe_count = msg
+                seeds_done += 1
+                log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] SKIP {seed_name}: {reason} (final)")
+    except:
+        pass
+    
+    # Collect final results from workers with timeout to avoid hanging
     successful_runs = 0
     failed_runs = 0
     total_mutations = 0
+    results_collected = 0
     
-    for _ in range(len(processes)):
-        result = result_queue.get()
-        successful_runs += result['successful_runs']
-        failed_runs += result['failed_runs']
-        total_mutations += result['mutations_generated']
-    
+    # First, join all processes with a timeout
     for p in processes:
-        p.join()
+        p.join(timeout=30)  # Give each process 30s to finish cleanup
+        if p.is_alive():
+            log(f"WARNING: Process {p.pid} still alive after join timeout, terminating")
+            p.terminate()
+            p.join(timeout=5)
+    
+    # Now collect results with timeout (processes should be done)
+    for i in range(len(processes)):
+        try:
+            result = result_queue.get(timeout=5)
+            successful_runs += result['successful_runs']
+            failed_runs += result['failed_runs']
+            total_mutations += result['mutations_generated']
+            results_collected += 1
+        except Exception as e:
+            log(f"WARNING: Failed to get result {i+1}/{len(processes)}: {e}")
+    
+    if results_collected < len(processes):
+        log(f"WARNING: Only collected {results_collected}/{len(processes)} worker results")
     
     # Extract coverage once at the end
     log("")

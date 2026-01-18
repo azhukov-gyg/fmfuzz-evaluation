@@ -277,7 +277,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.collect-matrices.outputs.fuzzing_matrix) }}
-    timeout-minutes: 75  # 60 minutes fuzzing + 15 minutes buffer
+    timeout-minutes: 360
     
     steps:
       - name: Checkout
@@ -413,7 +413,7 @@ jobs:
 
       - name: Run fuzzing with recipe recording
         working-directory: z3
-        timeout-minutes: 75
+        timeout-minutes: 360
         run: |
           FUZZING_DURATION="${{ inputs.fuzzing_duration_minutes || 60 }}"
           
