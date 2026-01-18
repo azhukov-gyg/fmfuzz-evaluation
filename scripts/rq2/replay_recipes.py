@@ -872,12 +872,16 @@ def replay_recipes_optimized(
             while True:
                 msg = progress_queue.get_nowait()
                 if msg[0] == 'done':
-                    _, worker_id, seed_name, recipe_count, successful = msg
+                    # Format: ('done', worker_id, seed_name, recipe_count, successful, min_iter, max_iter)
+                    worker_id = msg[1]
+                    seed_name = msg[2]
+                    recipe_count = msg[3]
+                    successful = msg[4]
+                    min_iter = msg[5] if len(msg) > 5 else 0
+                    max_iter = msg[6] if len(msg) > 6 else 0
                     seeds_done += 1
                     elapsed = time.time() - start_time
                     rate = seeds_done / elapsed if elapsed > 0 else 0
-                    min_iter = msg[5] if len(msg) > 5 else 0
-                    max_iter = msg[6] if len(msg) > 6 else 0
                     log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] {seed_name}: {recipe_count} recipes (iter {min_iter}-{max_iter}), {successful} ok ({rate:.1f} seeds/s)")
                 elif msg[0] == 'skip':
                     _, worker_id, seed_name, reason, recipe_count = msg
@@ -907,7 +911,11 @@ def replay_recipes_optimized(
         while True:
             msg = progress_queue.get_nowait()
             if msg[0] == 'done':
-                _, worker_id, seed_name, recipe_count, successful = msg
+                # Format: ('done', worker_id, seed_name, recipe_count, successful, min_iter, max_iter)
+                worker_id = msg[1]
+                seed_name = msg[2]
+                recipe_count = msg[3]
+                successful = msg[4]
                 seeds_done += 1
                 log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] {seed_name}: {recipe_count} recipes, {successful} ok (final)")
             elif msg[0] == 'skip':
