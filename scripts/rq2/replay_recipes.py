@@ -25,13 +25,48 @@ import multiprocessing
 import os
 import queue
 import random
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+
+
+class MutationTimeout(Exception):
+    """Raised when a mutation operation times out."""
+    pass
+
+
+@contextmanager
+def mutation_timeout(seconds: int):
+    """Context manager for timing out mutation operations.
+    
+    Uses signal.SIGALRM on Unix systems. Falls back to no timeout on Windows.
+    Note: Only works in the main thread of a process.
+    """
+    def timeout_handler(signum, frame):
+        raise MutationTimeout(f"Mutation timed out after {seconds}s")
+    
+    if hasattr(signal, 'SIGALRM'):
+        # Unix: use signal alarm
+        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+    else:
+        # Windows: no timeout support (signal.SIGALRM not available)
+        yield
+
+
+# Timeout for individual mutation operations (seconds)
+MUTATION_TIMEOUT = 30
 
 # Add current directory to path for imports
 SCRIPT_DIR = Path(__file__).parent
@@ -470,15 +505,20 @@ def regenerate_chain_content(
             log(f"[W{worker_id}] Chain step {step_idx}: failed to create fuzzer: {e}")
             return None
         
-        # Generate mutations up to target_iter (dry - no solver)
-        for i in range(1, target_iter + 1):
-            mutant, success = fuzzer.mutate()
-            if i == target_iter:
-                if success and mutant:
-                    content = mutant
-                else:
-                    log(f"[W{worker_id}] Chain step {step_idx}: mutation {target_iter} failed")
-                    return None
+        # Generate mutations up to target_iter (dry - no solver) with timeout
+        try:
+            with mutation_timeout(MUTATION_TIMEOUT):
+                for i in range(1, target_iter + 1):
+                    mutant, success = fuzzer.mutate()
+                    if i == target_iter:
+                        if success and mutant:
+                            content = mutant
+                        else:
+                            log(f"[W{worker_id}] Chain step {step_idx}: mutation {target_iter} failed")
+                            return None
+        except MutationTimeout:
+            log(f"[W{worker_id}] Chain step {step_idx}: MUTATION TIMEOUT after {MUTATION_TIMEOUT}s at iter {target_iter}")
+            return None
     
     return content
 
@@ -581,78 +621,89 @@ def process_seed_group(
     last_progress_time = time.time()
     recipes_since_progress = 0
     
+    mutation_timeout_hit = False
+    
     for recipe in group_recipes:
+        if mutation_timeout_hit:
+            break  # Skip remaining recipes for this seed
+            
         target_iteration = recipe.get('iteration', 0)
         
-        # Generate mutations up to target (reusing RNG state!)
-        while current_iteration < target_iteration:
-            current_iteration += 1
-            mutant, success = fuzzer.mutate()
-            mutations += 1
+        # Generate mutations up to target (reusing RNG state!) with timeout protection
+        try:
+            with mutation_timeout(MUTATION_TIMEOUT):
+                while current_iteration < target_iteration:
+                    current_iteration += 1
+                    mutant, success = fuzzer.mutate()
+                    mutations += 1
+        except MutationTimeout:
+            progress_queue.put(('mutation_timeout', worker_id, seed_name, current_iteration, len(group_recipes)))
+            mutation_timeout_hit = True
+            continue
             
-            if current_iteration == target_iteration:
-                if success and mutant:
-                    # Validate content hash if available (determinism check)
-                    expected_hash = recipe.get('hash')
-                    if expected_hash:
-                        actual_hash = compute_content_hash(mutant)
-                        if actual_hash != expected_hash:
-                            progress_queue.put(('hash_mismatch', worker_id, seed_name, 
-                                              current_iteration, expected_hash, actual_hash))
-                            # Continue anyway but log the mismatch
+        if current_iteration == target_iteration:
+            if success and mutant:
+                # Validate content hash if available (determinism check)
+                expected_hash = recipe.get('hash')
+                if expected_hash:
+                    actual_hash = compute_content_hash(mutant)
+                    if actual_hash != expected_hash:
+                        progress_queue.put(('hash_mismatch', worker_id, seed_name, 
+                                          current_iteration, expected_hash, actual_hash))
+                        # Continue anyway but log the mismatch
+                
+                # Run solver
+                mutant_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
+                        f.write(mutant)
+                        mutant_path = f.name
                     
-                    # Run solver
-                    mutant_path = None
-                    try:
-                        with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
-                            f.write(mutant)
-                            mutant_path = f.name
-                        
-                        # Use same flags as fuzzing to trigger the same code paths
-                        # Base flags (respecting DISABLE-TESTER) + any test-specific flags
-                        solver_cmd = [solver_path] + base_flags
-                        # Add test-specific flags if any
-                        if test_flags:
-                            solver_cmd.extend(test_flags.split())
-                        solver_cmd.append(mutant_path)
-                        result = subprocess.run(
-                            solver_cmd,
-                            capture_output=True,
-                            timeout=timeout,
-                            cwd=build_dir,
-                            env=gcov_env
-                        )
-                        successful += 1
-                        recipes_since_progress += 1
-                        
-                        # Log progress every 60 seconds or every 50 mutations
-                        now = time.time()
-                        if now - last_progress_time > 60 or recipes_since_progress >= 50:
-                            progress_queue.put(('progress', worker_id, seed_name, successful, len(group_recipes)))
-                            last_progress_time = now
-                            recipes_since_progress = 0
-                        
-                    except subprocess.TimeoutExpired:
-                        successful += 1  # Still counts as processed
-                        # Log timeout with remaining count so user knows what's left
-                        remaining = len(group_recipes) - successful
-                        progress_queue.put(('timeout', worker_id, seed_name, current_iteration, remaining, len(group_recipes)))
-                    except FileNotFoundError as e:
-                        if mutations == 1:  # Only log once per seed
-                            progress_queue.put(('error', worker_id, seed_name, f'Solver not found: {solver_path}'))
-                        failed += 1
-                    except Exception as e:
-                        if mutations == 1:  # Only log once per seed
-                            progress_queue.put(('error', worker_id, seed_name, str(e)))
-                        failed += 1
-                    finally:
-                        if mutant_path and os.path.exists(mutant_path):
-                            try:
-                                os.unlink(mutant_path)
-                            except:
-                                pass
-                else:
+                    # Use same flags as fuzzing to trigger the same code paths
+                    # Base flags (respecting DISABLE-TESTER) + any test-specific flags
+                    solver_cmd = [solver_path] + base_flags
+                    # Add test-specific flags if any
+                    if test_flags:
+                        solver_cmd.extend(test_flags.split())
+                    solver_cmd.append(mutant_path)
+                    result = subprocess.run(
+                        solver_cmd,
+                        capture_output=True,
+                        timeout=timeout,
+                        cwd=build_dir,
+                        env=gcov_env
+                    )
+                    successful += 1
+                    recipes_since_progress += 1
+                    
+                    # Log progress every 60 seconds or every 50 mutations
+                    now = time.time()
+                    if now - last_progress_time > 60 or recipes_since_progress >= 50:
+                        progress_queue.put(('progress', worker_id, seed_name, successful, len(group_recipes)))
+                        last_progress_time = now
+                        recipes_since_progress = 0
+                    
+                except subprocess.TimeoutExpired:
+                    successful += 1  # Still counts as processed
+                    # Log timeout with remaining count so user knows what's left
+                    remaining = len(group_recipes) - successful
+                    progress_queue.put(('timeout', worker_id, seed_name, current_iteration, remaining, len(group_recipes)))
+                except FileNotFoundError as e:
+                    if mutations == 1:  # Only log once per seed
+                        progress_queue.put(('error', worker_id, seed_name, f'Solver not found: {solver_path}'))
                     failed += 1
+                except Exception as e:
+                    if mutations == 1:  # Only log once per seed
+                        progress_queue.put(('error', worker_id, seed_name, str(e)))
+                    failed += 1
+                finally:
+                    if mutant_path and os.path.exists(mutant_path):
+                        try:
+                            os.unlink(mutant_path)
+                        except:
+                            pass
+            else:
+                failed += 1
     
     # Get iteration range for reporting
     iterations = [r.get('iteration', 0) for r in group_recipes]
@@ -677,17 +728,43 @@ def worker_process(
     total_failed = 0
     total_mutations = 0
     seeds_done = 0
+    total_seeds = len(seed_groups_chunk)
+    worker_start = time.time()
     
-    for (seed_path, rng_seed, chain), group_recipes in seed_groups_chunk:
-        successful, failed, mutations = process_seed_group(
-            seed_path, rng_seed, chain, group_recipes,
-            solver_path, build_dir, timeout,
-            worker_id, progress_queue
-        )
-        total_successful += successful
-        total_failed += failed
-        total_mutations += mutations
-        seeds_done += 1
+    # Send worker start message
+    progress_queue.put(('worker_start', worker_id, total_seeds, os.getpid()))
+    
+    for idx, ((seed_path, rng_seed, chain), group_recipes) in enumerate(seed_groups_chunk):
+        seed_name = Path(seed_path).name
+        seed_start = time.time()
+        
+        # Send seed start message
+        progress_queue.put(('seed_start', worker_id, seed_name, idx + 1, total_seeds, len(group_recipes)))
+        
+        try:
+            successful, failed, mutations = process_seed_group(
+                seed_path, rng_seed, chain, group_recipes,
+                solver_path, build_dir, timeout,
+                worker_id, progress_queue
+            )
+            total_successful += successful
+            total_failed += failed
+            total_mutations += mutations
+            seeds_done += 1
+            
+            seed_elapsed = time.time() - seed_start
+            progress_queue.put(('seed_complete', worker_id, seed_name, idx + 1, total_seeds, seed_elapsed))
+            
+        except Exception as e:
+            # Catch any unexpected exceptions in seed processing
+            seed_elapsed = time.time() - seed_start
+            progress_queue.put(('seed_error', worker_id, seed_name, str(e), seed_elapsed))
+            seeds_done += 1
+    
+    worker_elapsed = time.time() - worker_start
+    
+    # Send worker complete message before putting result
+    progress_queue.put(('worker_complete', worker_id, seeds_done, total_seeds, worker_elapsed))
     
     result_queue.put({
         'worker_id': worker_id,
@@ -864,14 +941,36 @@ def replay_recipes_optimized(
     # Monitor progress (extraction happens once at end)
     seeds_done = 0
     total_seeds = len(seed_groups_list)
+    workers_complete = set()  # Track which workers have finished
+    last_status_time = time.time()
+    STATUS_INTERVAL = 60  # Log status every 60 seconds even if no progress
     
     log("")
     while any(p.is_alive() for p in processes):
         # Process progress messages
+        messages_processed = 0
         try:
             while True:
                 msg = progress_queue.get_nowait()
-                if msg[0] == 'done':
+                messages_processed += 1
+                
+                if msg[0] == 'worker_start':
+                    _, worker_id, num_seeds, pid = msg
+                    log(f"[W{worker_id}] WORKER_START: pid={pid}, {num_seeds} seeds to process")
+                elif msg[0] == 'seed_start':
+                    _, worker_id, seed_name, seed_idx, total_worker_seeds, num_recipes = msg
+                    log(f"[W{worker_id}] SEED_START: {seed_name} ({seed_idx}/{total_worker_seeds}), {num_recipes} recipes")
+                elif msg[0] == 'seed_complete':
+                    _, worker_id, seed_name, seed_idx, total_worker_seeds, elapsed_sec = msg
+                    log(f"[W{worker_id}] SEED_COMPLETE: {seed_name} ({seed_idx}/{total_worker_seeds}) in {elapsed_sec:.1f}s")
+                elif msg[0] == 'seed_error':
+                    _, worker_id, seed_name, error_msg, elapsed_sec = msg
+                    log(f"[W{worker_id}] SEED_ERROR: {seed_name} after {elapsed_sec:.1f}s - {error_msg}")
+                elif msg[0] == 'worker_complete':
+                    _, worker_id, seeds_processed, total_worker_seeds, elapsed_sec = msg
+                    workers_complete.add(worker_id)
+                    log(f"[W{worker_id}] WORKER_COMPLETE: {seeds_processed}/{total_worker_seeds} seeds in {elapsed_sec:.1f}s")
+                elif msg[0] == 'done':
                     # Format: ('done', worker_id, seed_name, recipe_count, successful, min_iter, max_iter)
                     worker_id = msg[1]
                     seed_name = msg[2]
@@ -893,23 +992,55 @@ def replay_recipes_optimized(
                 elif msg[0] == 'timeout':
                     _, worker_id, seed_name, iteration, remaining, total = msg
                     log(f"[W{worker_id}] TIMEOUT {seed_name} iter {iteration} ({remaining} remaining of {total})")
+                elif msg[0] == 'mutation_timeout':
+                    _, worker_id, seed_name, iteration, total = msg
+                    log(f"[W{worker_id}] MUTATION_TIMEOUT {seed_name} at iter {iteration} - skipping remaining {total} recipes")
                 elif msg[0] == 'hash_mismatch':
                     _, worker_id, seed_name, iteration, expected, actual = msg
                     log(f"[W{worker_id}] ⚠️ HASH MISMATCH {seed_name} iter {iteration}: expected={expected} actual={actual}")
                 elif msg[0] == 'error':
                     _, worker_id, seed_name, error_msg = msg
                     log(f"[W{worker_id}] ERROR {seed_name}: {error_msg}")
+                else:
+                    log(f"[DEBUG] Unknown message type: {msg[0]}, full msg: {msg}")
         except queue.Empty:
             pass  # No more messages, continue loop
         except Exception as e:
             log(f"WARNING: Error processing progress message: {e}")
         
+        # Periodic status update even if no messages (to detect hangs)
+        now = time.time()
+        if now - last_status_time >= STATUS_INTERVAL:
+            elapsed = now - start_time
+            alive_workers = [i for i, p in enumerate(processes) if p.is_alive()]
+            dead_workers = [i for i, p in enumerate(processes) if not p.is_alive()]
+            complete_workers = list(workers_complete)
+            
+            log(f"")
+            log(f"[STATUS] Elapsed: {elapsed:.0f}s, Seeds done: {seeds_done}/{total_seeds}")
+            log(f"[STATUS] Workers alive: {alive_workers}, dead: {dead_workers}, complete: {complete_workers}")
+            for i, p in enumerate(processes):
+                status = "ALIVE" if p.is_alive() else "DEAD"
+                exit_code = p.exitcode if p.exitcode is not None else "N/A"
+                log(f"[STATUS]   Worker {i}: {status}, pid={p.pid}, exitcode={exit_code}")
+            log(f"")
+            
+            last_status_time = now
+        
         time.sleep(0.5)
     
+    # Final status before draining
+    log("")
+    log(f"[DEBUG] All workers exited. Final process status:")
+    for i, p in enumerate(processes):
+        log(f"[DEBUG]   Worker {i}: pid={p.pid}, exitcode={p.exitcode}")
+    
     # Drain remaining progress messages after workers exit
+    drained_count = 0
     try:
         while True:
             msg = progress_queue.get_nowait()
+            drained_count += 1
             if msg[0] == 'done':
                 # Format: ('done', worker_id, seed_name, recipe_count, successful, min_iter, max_iter)
                 worker_id = msg[1]
@@ -917,13 +1048,29 @@ def replay_recipes_optimized(
                 recipe_count = msg[3]
                 successful = msg[4]
                 seeds_done += 1
-                log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] {seed_name}: {recipe_count} recipes, {successful} ok (final)")
+                log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] {seed_name}: {recipe_count} recipes, {successful} ok (drain)")
             elif msg[0] == 'skip':
                 _, worker_id, seed_name, reason, recipe_count = msg
                 seeds_done += 1
-                log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] SKIP {seed_name}: {reason} (final)")
-    except:
+                log(f"[W{worker_id}] [{seeds_done}/{total_seeds}] SKIP {seed_name}: {reason} (drain)")
+            elif msg[0] == 'worker_complete':
+                _, worker_id, seeds_processed, total_worker_seeds, elapsed_sec = msg
+                workers_complete.add(worker_id)
+                log(f"[W{worker_id}] WORKER_COMPLETE: {seeds_processed}/{total_worker_seeds} seeds in {elapsed_sec:.1f}s (drain)")
+            elif msg[0] == 'seed_complete':
+                _, worker_id, seed_name, seed_idx, total_worker_seeds, elapsed_sec = msg
+                log(f"[W{worker_id}] SEED_COMPLETE: {seed_name} ({seed_idx}/{total_worker_seeds}) in {elapsed_sec:.1f}s (drain)")
+            # Log any other messages during drain
+            elif msg[0] not in ('progress', 'seed_start'):
+                log(f"[DEBUG] Drained message: {msg[0]}")
+    except queue.Empty:
         pass
+    except Exception as e:
+        log(f"WARNING: Error draining progress queue: {e}")
+    
+    log(f"[DEBUG] Drained {drained_count} messages from progress queue")
+    log(f"[DEBUG] Final seeds_done: {seeds_done}/{total_seeds}")
+    log(f"[DEBUG] Workers that sent WORKER_COMPLETE: {sorted(workers_complete)}")
     
     # Collect final results from workers with timeout to avoid hanging
     successful_runs = 0
@@ -931,18 +1078,29 @@ def replay_recipes_optimized(
     total_mutations = 0
     results_collected = 0
     
+    log(f"[DEBUG] Joining processes...")
+    
     # First, join all processes with a timeout
-    for p in processes:
+    for i, p in enumerate(processes):
+        log(f"[DEBUG]   Joining worker {i} (pid={p.pid})...")
         p.join(timeout=30)  # Give each process 30s to finish cleanup
         if p.is_alive():
-            log(f"WARNING: Process {p.pid} still alive after join timeout, terminating")
+            log(f"WARNING: Worker {i} (pid={p.pid}) still alive after join timeout, terminating")
             p.terminate()
             p.join(timeout=5)
+            if p.is_alive():
+                log(f"ERROR: Worker {i} (pid={p.pid}) STILL alive after terminate!")
+        else:
+            log(f"[DEBUG]   Worker {i} joined, exitcode={p.exitcode}")
+    
+    log(f"[DEBUG] All processes joined. Collecting results from result_queue...")
     
     # Now collect results with timeout (processes should be done)
     for i in range(len(processes)):
         try:
+            log(f"[DEBUG]   Getting result {i+1}/{len(processes)}...")
             result = result_queue.get(timeout=5)
+            log(f"[DEBUG]   Got result from worker {result.get('worker_id', '?')}: {result}")
             successful_runs += result['successful_runs']
             failed_runs += result['failed_runs']
             total_mutations += result['mutations_generated']
