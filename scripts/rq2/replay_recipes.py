@@ -68,7 +68,8 @@ def mutation_timeout(seconds: int):
 # Timeout for individual mutation operations (seconds)
 MUTATION_TIMEOUT = 30
 
-# Timeout for parsing operations (seconds) - parsing large files can hang
+# Timeout for parsing operations (seconds)
+# Deeply nested formulas cause copy.deepcopy to take forever in yinyang's get_unique_subterms
 PARSE_TIMEOUT = 60
 
 # Add current directory to path for imports
@@ -533,9 +534,7 @@ def regenerate_chain_content(
                         log(f"[W{worker_id}] Chain step {step_idx+1}: PARSE TIMEOUT after {PARSE_TIMEOUT}s (content={len(content)} bytes)")
                         return None
                     if not parse_ok:
-                        # Log first 500 chars of content that failed to parse
-                        content_preview = content[:500] if len(content) > 500 else content
-                        log(f"[W{worker_id}] Chain step {step_idx}: parse failed. Content preview: {content_preview[:200]}...")
+                        log(f"[W{worker_id}] Chain step {step_idx+1}: parse failed")
                         return None
                     log(f"[W{worker_id}] Chain step {step_idx+1}: parse OK")
                 finally:
