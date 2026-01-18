@@ -68,6 +68,13 @@ def mutation_timeout(seconds: int):
 # Timeout for individual mutation operations (seconds)
 MUTATION_TIMEOUT = 30
 
+# Timeout for parsing operations (seconds) - parsing large files can hang
+PARSE_TIMEOUT = 60
+
+# Maximum content size (bytes) - skip chains that produce content larger than this
+# Empirically, 50KB+ content causes parser hangs
+MAX_CONTENT_SIZE = 50 * 1024  # 50KB
+
 # Add script directories to path for imports
 SCRIPT_DIR = Path(__file__).parent
 RQ2_DIR = Path(__file__).parent.parent.parent / "rq2"
@@ -431,8 +438,14 @@ def regenerate_chain_content(
                     temp_path = f.name
                 try:
                     fuzzer = InlineTypeFuzz(Path(temp_path))
-                    log(f"[W{worker_id}] Chain step {step_idx+1}: parsing temp file")
-                    if not fuzzer.parse():
+                    log(f"[W{worker_id}] Chain step {step_idx+1}: parsing temp file (timeout={PARSE_TIMEOUT}s)")
+                    try:
+                        with mutation_timeout(PARSE_TIMEOUT):
+                            parse_ok = fuzzer.parse()
+                    except MutationTimeout:
+                        log(f"[W{worker_id}] Chain step {step_idx+1}: PARSE TIMEOUT after {PARSE_TIMEOUT}s (content={len(content)} bytes)")
+                        return None
+                    if not parse_ok:
                         log(f"[W{worker_id}] Chain step {step_idx}: parse failed")
                         return None
                     log(f"[W{worker_id}] Chain step {step_idx+1}: parse OK")
@@ -462,6 +475,10 @@ def regenerate_chain_content(
                         if success and mutant:
                             content = mutant
                             log(f"[W{worker_id}] Chain step {step_idx+1}: COMPLETE (new content len={len(content)})")
+                            # Check content size limit
+                            if len(content) > MAX_CONTENT_SIZE:
+                                log(f"[W{worker_id}] Chain step {step_idx+1}: CONTENT TOO LARGE ({len(content)} > {MAX_CONTENT_SIZE}), skipping")
+                                return None
                         else:
                             log(f"[W{worker_id}] Chain step {step_idx}: mutation {target_iter} failed")
                             return None
@@ -551,9 +568,15 @@ def process_seed_group(
                     f.write(start_content)
                     temp_path = f.name
                 try:
-                    progress_queue.put(('debug', worker_id, f'parsing temp file: {temp_path}'))
+                    progress_queue.put(('debug', worker_id, f'parsing temp file: {temp_path} (timeout={PARSE_TIMEOUT}s)'))
                     fuzzer = InlineTypeFuzz(Path(temp_path))
-                    if not fuzzer.parse():
+                    try:
+                        with mutation_timeout(PARSE_TIMEOUT):
+                            parse_ok = fuzzer.parse()
+                    except MutationTimeout:
+                        progress_queue.put(('parse_timeout', worker_id, seed_name, f'chain content parse timeout{chain_str}', len(group_recipes), len(start_content)))
+                        return 0, len(group_recipes), 0
+                    if not parse_ok:
                         progress_queue.put(('skip', worker_id, seed_name, f'chain content parse failed{chain_str}', len(group_recipes)))
                         return 0, len(group_recipes), 0
                     progress_queue.put(('debug', worker_id, f'temp file parse SUCCESS'))
@@ -571,8 +594,14 @@ def process_seed_group(
         # No chain - parse original file
         progress_queue.put(('debug', worker_id, f'creating fuzzer from original file'))
         fuzzer = InlineTypeFuzz(Path(seed_path))
-        progress_queue.put(('debug', worker_id, f'parsing original file'))
-        if not fuzzer.parse():
+        progress_queue.put(('debug', worker_id, f'parsing original file (timeout={PARSE_TIMEOUT}s)'))
+        try:
+            with mutation_timeout(PARSE_TIMEOUT):
+                parse_ok = fuzzer.parse()
+        except MutationTimeout:
+            progress_queue.put(('parse_timeout', worker_id, seed_name, 'original file parse timeout', len(group_recipes), 0))
+            return 0, len(group_recipes), 0
+        if not parse_ok:
             progress_queue.put(('skip', worker_id, seed_name, 'parse failed', len(group_recipes)))
             return 0, len(group_recipes), 0
         progress_queue.put(('debug', worker_id, f'original file parse SUCCESS'))
@@ -732,6 +761,487 @@ def worker_process(
         'seeds_processed': seeds_done
     })
 
+
+# =============================================================================
+# TWO-PHASE REPLAY: Generate tests first, then execute in parallel
+# =============================================================================
+
+def generation_worker(
+    worker_id: int,
+    task_queue: multiprocessing.Queue,
+    output_queue: multiprocessing.Queue,
+    progress_queue: multiprocessing.Queue,
+    output_dir: str
+):
+    """
+    Phase 1 worker: Generate test files from seed groups.
+    """
+    tests_generated = 0
+    tests_failed = 0
+    
+    progress_queue.put(('gen_worker_start', worker_id, os.getpid()))
+    
+    while True:
+        try:
+            task = task_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        
+        if task is None:
+            break
+        
+        seed_path, rng_seed, chain, group_recipes = task
+        seed_name = Path(seed_path).name
+        chain_str = f" chain={list(chain)}" if chain else ""
+        
+        progress_queue.put(('gen_start', worker_id, seed_name, len(group_recipes)))
+        
+        if not os.path.exists(seed_path):
+            progress_queue.put(('gen_skip', worker_id, seed_name, 'seed not found'))
+            tests_failed += len(group_recipes)
+            continue
+        
+        if chain:
+            start_content = regenerate_chain_content(seed_path, rng_seed, chain, worker_id)
+            if start_content is None:
+                progress_queue.put(('gen_skip', worker_id, seed_name, f'chain regeneration failed{chain_str}'))
+                tests_failed += len(group_recipes)
+                continue
+        else:
+            try:
+                with open(seed_path, 'r') as f:
+                    start_content = f.read()
+            except Exception as e:
+                progress_queue.put(('gen_skip', worker_id, seed_name, f'read failed: {e}'))
+                tests_failed += len(group_recipes)
+                continue
+        
+        if len(start_content) > MAX_CONTENT_SIZE:
+            progress_queue.put(('gen_skip', worker_id, seed_name, f'content too large ({len(start_content)} bytes)'))
+            tests_failed += len(group_recipes)
+            continue
+        
+        random.seed(rng_seed)
+        
+        try:
+            fuzzer = InlineTypeFuzz.from_string(start_content) if hasattr(InlineTypeFuzz, 'from_string') else None
+            if fuzzer is None:
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
+                    f.write(start_content)
+                    temp_path = f.name
+                try:
+                    fuzzer = InlineTypeFuzz(Path(temp_path))
+                    with mutation_timeout(PARSE_TIMEOUT):
+                        if not fuzzer.parse():
+                            progress_queue.put(('gen_skip', worker_id, seed_name, 'parse failed'))
+                            tests_failed += len(group_recipes)
+                            continue
+                except MutationTimeout:
+                    progress_queue.put(('gen_skip', worker_id, seed_name, f'parse timeout ({PARSE_TIMEOUT}s)'))
+                    tests_failed += len(group_recipes)
+                    continue
+                finally:
+                    try:
+                        os.unlink(temp_path)
+                    except:
+                        pass
+        except Exception as e:
+            progress_queue.put(('gen_skip', worker_id, seed_name, f'fuzzer init failed: {e}'))
+            tests_failed += len(group_recipes)
+            continue
+        
+        current_iteration = 0
+        mutation_timeout_hit = False
+        
+        for recipe in sorted(group_recipes, key=lambda r: r.get('iteration', 0)):
+            if mutation_timeout_hit:
+                tests_failed += 1
+                continue
+            
+            target_iteration = recipe.get('iteration', 0)
+            
+            try:
+                with mutation_timeout(MUTATION_TIMEOUT):
+                    while current_iteration < target_iteration:
+                        current_iteration += 1
+                        mutant, success = fuzzer.mutate()
+            except MutationTimeout:
+                progress_queue.put(('gen_mutation_timeout', worker_id, seed_name, current_iteration))
+                mutation_timeout_hit = True
+                tests_failed += 1
+                continue
+            
+            if current_iteration == target_iteration and success and mutant:
+                test_id = f"{worker_id}_{tests_generated}"
+                test_path = os.path.join(output_dir, f"test_{test_id}.smt2")
+                try:
+                    with open(test_path, 'w') as f:
+                        f.write(mutant)
+                    
+                    output_queue.put({
+                        'test_path': test_path,
+                        'seed_path': seed_path,
+                        'recipe': recipe
+                    })
+                    tests_generated += 1
+                except Exception as e:
+                    progress_queue.put(('gen_write_error', worker_id, seed_name, str(e)))
+                    tests_failed += 1
+            else:
+                tests_failed += 1
+        
+        progress_queue.put(('gen_done', worker_id, seed_name, len(group_recipes)))
+    
+    progress_queue.put(('gen_worker_done', worker_id, tests_generated, tests_failed))
+
+
+def execution_worker(
+    worker_id: int,
+    test_queue: multiprocessing.Queue,
+    result_queue: multiprocessing.Queue,
+    progress_queue: multiprocessing.Queue,
+    solver_path: str,
+    timeout: int,
+    z3_memory_mb: int
+):
+    """
+    Phase 2 worker: Execute solver on generated test files.
+    """
+    tests_run = 0
+    tests_success = 0
+    tests_failed = 0
+    
+    progress_queue.put(('exec_worker_start', worker_id, os.getpid()))
+    
+    while True:
+        try:
+            test = test_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        
+        if test is None:
+            break
+        
+        test_path = test['test_path']
+        
+        # Z3 command with memory limit
+        cmd = [solver_path, f"-memory:{z3_memory_mb}", test_path]
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                timeout=timeout,
+                capture_output=True,
+                text=True
+            )
+            tests_success += 1
+        except subprocess.TimeoutExpired:
+            tests_failed += 1
+        except Exception as e:
+            tests_failed += 1
+        
+        tests_run += 1
+        
+        try:
+            os.unlink(test_path)
+        except:
+            pass
+        
+        if tests_run % 50 == 0:
+            progress_queue.put(('exec_progress', worker_id, tests_run, tests_success))
+    
+    result_queue.put({
+        'worker_id': worker_id,
+        'tests_run': tests_run,
+        'tests_success': tests_success,
+        'tests_failed': tests_failed
+    })
+    progress_queue.put(('exec_worker_done', worker_id, tests_run, tests_success, tests_failed))
+
+
+def replay_recipes_two_phase(
+    recipe_file: str,
+    solver_path: str,
+    build_dir: str,
+    changed_functions_file: str,
+    output_file: str,
+    gcov_cmd: str = "gcov",
+    timeout: int = 60,
+    num_workers: int = 4,
+    seeds_file: Optional[str] = None,
+    z3_memory_mb: int = 4096
+) -> dict:
+    """
+    Two-phase recipe replay for Z3.
+    """
+    log("=" * 60)
+    log(f"RECIPE REPLAY (TWO-PHASE)")
+    log("=" * 60)
+    
+    solver_path = os.path.abspath(solver_path)
+    build_dir = os.path.abspath(build_dir)
+    log(f"Solver: {solver_path}")
+    log(f"Build dir: {build_dir}")
+    
+    if not YINYANG_AVAILABLE:
+        log("ERROR: yinyang not available for mutation regeneration")
+        return {"error": "yinyang not available"}
+    
+    allowed_seed_keys: Optional[Set[Tuple[str, int, Tuple[int, ...]]]] = None
+    if seeds_file:
+        log(f"Loading seed filter from: {seeds_file}")
+        with open(seeds_file, 'r') as f:
+            seeds_data = json.load(f)
+        
+        if isinstance(seeds_data, dict) and 'seed_keys' in seeds_data:
+            allowed_seed_keys = set()
+            for sk in seeds_data['seed_keys']:
+                chain = tuple(sk.get('chain', []))
+                allowed_seed_keys.add((sk['seed_path'], sk['rng_seed'], chain))
+            log(f"Filtering to {len(allowed_seed_keys)} seed groups")
+    
+    log(f"Loading recipes from: {recipe_file}")
+    reader = RecipeReader(recipe_file)
+    all_recipes = reader.recipes
+    log(f"Total recipes in file: {len(all_recipes)}")
+    
+    if allowed_seed_keys is not None:
+        def recipe_to_key(r):
+            return (r.get('seed_path'), r.get('rng_seed', 42), tuple(r.get('chain', [])))
+        recipes = [r for r in all_recipes if recipe_to_key(r) in allowed_seed_keys]
+        log(f"After seed filter: {len(recipes)} recipes")
+    else:
+        recipes = all_recipes
+    
+    if len(recipes) == 0:
+        log("WARNING: No recipes to process!")
+        results = {
+            "recipe_file": recipe_file,
+            "recipes_processed": 0,
+            "successful_runs": 0,
+            "failed_runs": 0,
+            "function_counts": {},
+            "total_function_calls": 0,
+        }
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        return results
+    
+    log(f"Loading changed functions from: {changed_functions_file}")
+    changed_functions = load_changed_functions(changed_functions_file)
+    log(f"Tracking {len(changed_functions)} changed functions")
+    
+    log("Grouping recipes by seed...")
+    seed_groups = group_recipes_by_seed(recipes)
+    seed_groups_list = list(seed_groups.items())
+    total_seeds = len(seed_groups_list)
+    total_recipes = sum(len(g) for _, g in seed_groups_list)
+    log(f"Found {total_seeds} unique seed groups, {total_recipes} total recipes")
+    
+    test_output_dir = tempfile.mkdtemp(prefix='replay_tests_')
+    log(f"Test output directory: {test_output_dir}")
+    
+    log("Resetting gcda files...")
+    reset_gcda_files(build_dir)
+    
+    start_time = time.time()
+    
+    # Phase 1: Generate
+    log("")
+    log("=" * 60)
+    log("PHASE 1: Generating test files")
+    log("=" * 60)
+    
+    task_queue = multiprocessing.Queue()
+    test_queue = multiprocessing.Queue()
+    progress_queue = multiprocessing.Queue()
+    
+    for (seed_path, rng_seed, chain), group_recipes in seed_groups_list:
+        task_queue.put((seed_path, rng_seed, chain, group_recipes))
+    
+    for _ in range(num_workers):
+        task_queue.put(None)
+    
+    gen_processes = []
+    for i in range(num_workers):
+        p = multiprocessing.Process(
+            target=generation_worker,
+            args=(i, task_queue, test_queue, progress_queue, test_output_dir)
+        )
+        p.start()
+        gen_processes.append(p)
+    
+    log(f"Started {num_workers} generation workers")
+    
+    gen_done = 0
+    while any(p.is_alive() for p in gen_processes):
+        try:
+            while True:
+                msg = progress_queue.get_nowait()
+                if msg[0] == 'gen_worker_start':
+                    _, wid, pid = msg
+                    log(f"[G{wid}] Worker started (pid={pid})")
+                elif msg[0] == 'gen_start':
+                    _, wid, seed_name, num_recipes = msg
+                    log(f"[G{wid}] Generating: {seed_name} ({num_recipes} recipes)")
+                elif msg[0] == 'gen_done':
+                    _, wid, seed_name, num_recipes = msg
+                    gen_done += 1
+                    log(f"[G{wid}] Done: {seed_name} [{gen_done}/{total_seeds}]")
+                elif msg[0] == 'gen_skip':
+                    _, wid, seed_name, reason = msg
+                    gen_done += 1
+                    log(f"[G{wid}] Skip: {seed_name} - {reason} [{gen_done}/{total_seeds}]")
+                elif msg[0] == 'gen_mutation_timeout':
+                    _, wid, seed_name, iteration = msg
+                    log(f"[G{wid}] Mutation timeout: {seed_name} at iter {iteration}")
+                elif msg[0] == 'gen_worker_done':
+                    _, wid, generated, failed = msg
+                    log(f"[G{wid}] Worker done: {generated} generated, {failed} failed")
+        except queue.Empty:
+            pass
+        time.sleep(0.1)
+    
+    for p in gen_processes:
+        p.join()
+    
+    try:
+        while True:
+            msg = progress_queue.get_nowait()
+            if msg[0] == 'gen_worker_done':
+                _, wid, generated, failed = msg
+                log(f"[G{wid}] Worker done: {generated} generated, {failed} failed")
+    except queue.Empty:
+        pass
+    
+    tests_generated = test_queue.qsize()
+    phase1_time = time.time() - start_time
+    log(f"\nPhase 1 complete: {tests_generated} tests generated in {phase1_time:.1f}s")
+    
+    if tests_generated == 0:
+        log("WARNING: No tests generated!")
+        try:
+            import shutil
+            shutil.rmtree(test_output_dir)
+        except:
+            pass
+        
+        results = {
+            "recipe_file": recipe_file,
+            "recipes_processed": 0,
+            "successful_runs": 0,
+            "failed_runs": total_recipes,
+            "function_counts": {},
+            "total_function_calls": 0,
+        }
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        return results
+    
+    # Phase 2: Execute
+    log("")
+    log("=" * 60)
+    log("PHASE 2: Executing solver on test files")
+    log("=" * 60)
+    
+    for _ in range(num_workers):
+        test_queue.put(None)
+    
+    result_queue = multiprocessing.Queue()
+    
+    exec_processes = []
+    for i in range(num_workers):
+        p = multiprocessing.Process(
+            target=execution_worker,
+            args=(i, test_queue, result_queue, progress_queue, solver_path, timeout, z3_memory_mb)
+        )
+        p.start()
+        exec_processes.append(p)
+    
+    log(f"Started {num_workers} execution workers")
+    
+    while any(p.is_alive() for p in exec_processes):
+        try:
+            while True:
+                msg = progress_queue.get_nowait()
+                if msg[0] == 'exec_worker_start':
+                    _, wid, pid = msg
+                    log(f"[E{wid}] Worker started (pid={pid})")
+                elif msg[0] == 'exec_progress':
+                    _, wid, tests_run, tests_success = msg
+                    log(f"[E{wid}] Progress: {tests_run} run, {tests_success} success")
+                elif msg[0] == 'exec_worker_done':
+                    _, wid, tests_run, tests_success, tests_failed = msg
+                    log(f"[E{wid}] Worker done: {tests_run} run, {tests_success} ok, {tests_failed} failed")
+        except queue.Empty:
+            pass
+        time.sleep(0.1)
+    
+    for p in exec_processes:
+        p.join()
+    
+    total_run = 0
+    total_success = 0
+    total_failed = 0
+    
+    try:
+        while True:
+            result = result_queue.get_nowait()
+            total_run += result['tests_run']
+            total_success += result['tests_success']
+            total_failed += result['tests_failed']
+    except queue.Empty:
+        pass
+    
+    phase2_time = time.time() - start_time - phase1_time
+    log(f"\nPhase 2 complete: {total_run} tests executed in {phase2_time:.1f}s")
+    
+    # Extract coverage
+    log("")
+    log("=" * 60)
+    log("Extracting coverage data")
+    log("=" * 60)
+    
+    function_counts = extract_function_counts(build_dir, changed_functions)
+    total_function_calls = sum(function_counts.values())
+    
+    log(f"Extracted counts for {len(function_counts)} functions")
+    log(f"Total function calls: {total_function_calls}")
+    
+    try:
+        import shutil
+        shutil.rmtree(test_output_dir)
+        log(f"Cleaned up test directory: {test_output_dir}")
+    except Exception as e:
+        log(f"WARNING: Failed to clean up test directory: {e}")
+    
+    total_time = time.time() - start_time
+    
+    results = {
+        "recipe_file": recipe_file,
+        "recipes_processed": total_recipes,
+        "tests_generated": tests_generated,
+        "successful_runs": total_success,
+        "failed_runs": total_failed,
+        "function_counts": function_counts,
+        "total_function_calls": total_function_calls,
+        "phase1_time": phase1_time,
+        "phase2_time": phase2_time,
+        "total_time": total_time
+    }
+    
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    log(f"\nResults written to: {output_file}")
+    log(f"Total time: {total_time:.1f}s")
+    
+    return results
+
+
+# =============================================================================
+# Legacy single-phase replay (kept for compatibility)
+# =============================================================================
 
 def replay_recipes_optimized(
     recipe_file: str,
@@ -955,6 +1465,9 @@ def replay_recipes_optimized(
                 elif msg[0] == 'mutation_timeout':
                     _, worker_id, seed_name, iteration, total = msg
                     log(f"[W{worker_id}] MUTATION_TIMEOUT {seed_name} at iter {iteration} - skipping remaining {total} recipes")
+                elif msg[0] == 'parse_timeout':
+                    _, worker_id, seed_name, reason, recipe_count, content_len = msg
+                    log(f"[W{worker_id}] PARSE_TIMEOUT {seed_name}: {reason} (content={content_len} bytes) - skipping {recipe_count} recipes")
                 elif msg[0] == 'hash_mismatch':
                     _, worker_id, seed_name, iteration, expected, actual = msg
                     log(f"[W{worker_id}] ⚠️ HASH MISMATCH {seed_name} iter {iteration}: expected={expected} actual={actual}")
@@ -1156,7 +1669,7 @@ def replay_recipes_optimized(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Z3 Recipe Replay - Measure function calls using gcov (OPTIMIZED + PARALLEL)"
+        description="Z3 Recipe Replay - Measure function calls using gcov"
     )
     parser.add_argument("recipe_file", help="Recipe JSONL file to replay")
     parser.add_argument("--solver", required=True, help="Path to gcov-instrumented Z3 binary")
@@ -1171,24 +1684,39 @@ def main():
     parser.add_argument("--end-idx", type=int, help="End index for recipe slice (legacy)")
     parser.add_argument("--seeds-file", help="JSON file with list of seed paths to process (recommended)")
     parser.add_argument("--z3-memory-mb", type=int, default=4096, help="Z3 memory limit in MB")
+    parser.add_argument("--legacy", action="store_true", help="Use legacy single-phase replay")
     
     args = parser.parse_args()
     
-    replay_recipes_optimized(
-        recipe_file=args.recipe_file,
-        solver_path=args.solver,
-        build_dir=args.build_dir,
-        changed_functions_file=args.changed_functions,
-        output_file=args.output,
-        gcov_cmd=args.gcov,
-        timeout=args.timeout,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        start_idx=args.start_idx,
-        end_idx=args.end_idx,
-        seeds_file=args.seeds_file,
-        z3_memory_mb=args.z3_memory_mb
-    )
+    if args.legacy:
+        replay_recipes_optimized(
+            recipe_file=args.recipe_file,
+            solver_path=args.solver,
+            build_dir=args.build_dir,
+            changed_functions_file=args.changed_functions,
+            output_file=args.output,
+            gcov_cmd=args.gcov,
+            timeout=args.timeout,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            start_idx=args.start_idx,
+            end_idx=args.end_idx,
+            seeds_file=args.seeds_file,
+            z3_memory_mb=args.z3_memory_mb
+        )
+    else:
+        replay_recipes_two_phase(
+            recipe_file=args.recipe_file,
+            solver_path=args.solver,
+            build_dir=args.build_dir,
+            changed_functions_file=args.changed_functions,
+            output_file=args.output,
+            gcov_cmd=args.gcov,
+            timeout=args.timeout,
+            num_workers=args.num_workers,
+            seeds_file=args.seeds_file,
+            z3_memory_mb=args.z3_memory_mb
+        )
 
 
 if __name__ == "__main__":
