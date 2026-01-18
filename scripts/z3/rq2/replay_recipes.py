@@ -412,41 +412,56 @@ def regenerate_chain_content(
         return content
     
     # Replay each step in the chain (dry mutations - no solver calls)
+    log(f"[W{worker_id}] Chain has {len(chain)} steps: {list(chain)}")
     for step_idx, target_iter in enumerate(chain):
+        log(f"[W{worker_id}] Chain step {step_idx+1}/{len(chain)}: target_iter={target_iter}")
         # Initialize RNG fresh for each chain step (same as during fuzzing)
         random.seed(rng_seed)
         
         # Create fuzzer from current content
         try:
             # InlineTypeFuzz can accept content string directly via from_string
+            log(f"[W{worker_id}] Chain step {step_idx+1}: creating fuzzer (content len={len(content)})")
             fuzzer = InlineTypeFuzz.from_string(content) if hasattr(InlineTypeFuzz, 'from_string') else None
             if fuzzer is None:
                 # Fallback: write to temp file and parse
+                log(f"[W{worker_id}] Chain step {step_idx+1}: from_string N/A, using temp file")
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
                     f.write(content)
                     temp_path = f.name
                 try:
                     fuzzer = InlineTypeFuzz(Path(temp_path))
+                    log(f"[W{worker_id}] Chain step {step_idx+1}: parsing temp file")
                     if not fuzzer.parse():
                         log(f"[W{worker_id}] Chain step {step_idx}: parse failed")
                         return None
+                    log(f"[W{worker_id}] Chain step {step_idx+1}: parse OK")
                 finally:
                     try:
                         os.unlink(temp_path)
                     except:
                         pass
+            else:
+                log(f"[W{worker_id}] Chain step {step_idx+1}: from_string OK")
         except Exception as e:
             log(f"[W{worker_id}] Chain step {step_idx}: failed to create fuzzer: {e}")
             return None
         
         # Generate mutations up to target_iter (dry - no solver) with timeout
+        log(f"[W{worker_id}] Chain step {step_idx+1}: running {target_iter} mutations (timeout={MUTATION_TIMEOUT}s)")
+        mutation_start = time.time()
         try:
             with mutation_timeout(MUTATION_TIMEOUT):
                 for i in range(1, target_iter + 1):
                     mutant, success = fuzzer.mutate()
+                    # Log progress every 50 iterations
+                    if i % 50 == 0:
+                        elapsed = time.time() - mutation_start
+                        log(f"[W{worker_id}] Chain step {step_idx+1}: mutation {i}/{target_iter} ({elapsed:.1f}s)")
                     if i == target_iter:
                         if success and mutant:
                             content = mutant
+                            log(f"[W{worker_id}] Chain step {step_idx+1}: COMPLETE (new content len={len(content)})")
                         else:
                             log(f"[W{worker_id}] Chain step {step_idx}: mutation {target_iter} failed")
                             return None
@@ -454,6 +469,7 @@ def regenerate_chain_content(
             log(f"[W{worker_id}] Chain step {step_idx}: MUTATION TIMEOUT after {MUTATION_TIMEOUT}s at iter {target_iter}")
             return None
     
+    log(f"[W{worker_id}] Chain regeneration complete, final content len={len(content)}")
     return content
 
 
@@ -485,6 +501,9 @@ def process_seed_group(
     seed_name = Path(seed_path).name
     chain_str = f" chain={list(chain)}" if chain else ""
     
+    # Debug: log entry into process_seed_group
+    progress_queue.put(('debug', worker_id, f'ENTER process_seed_group: {seed_name}, chain={list(chain) if chain else []}, recipes={len(group_recipes)}'))
+    
     # Don't set GCOV_PREFIX - let gcov use embedded absolute paths
     gcov_env = os.environ.copy()
     
@@ -493,54 +512,72 @@ def process_seed_group(
         progress_queue.put(('skip', worker_id, seed_name, 'not found', len(group_recipes)))
         return 0, len(group_recipes), 0
     
+    progress_queue.put(('debug', worker_id, f'seed file exists: {seed_path}'))
+    
     # Regenerate chain content if needed (dry mutations - no solver)
     if chain:
+        progress_queue.put(('debug', worker_id, f'STARTING chain regeneration: {list(chain)}'))
         log(f"[W{worker_id}] {seed_name}: regenerating chain {list(chain)}")
         start_content = regenerate_chain_content(seed_path, rng_seed, chain, worker_id)
         if start_content is None:
             progress_queue.put(('skip', worker_id, seed_name, f'chain regeneration failed{chain_str}', len(group_recipes)))
             return 0, len(group_recipes), 0
+        progress_queue.put(('debug', worker_id, f'chain regeneration SUCCESS, content len={len(start_content)}'))
         # Count chain mutations (not counted toward solver runs)
         mutations += sum(chain)
     else:
+        progress_queue.put(('debug', worker_id, f'no chain, using original file'))
         start_content = None  # Will read from file directly
     
     # Z3 doesn't use COMMAND-LINE directives like CVC5
     # Use standard flags: smt.threads=1, memory limit, model validation
+    progress_queue.put(('debug', worker_id, f'setting up Z3 flags'))
     base_flags = [f"smt.threads=1", f"memory_max_size={z3_memory_mb}", "model_validate=true"]
     
     # Initialize RNG and create fuzzer
+    progress_queue.put(('debug', worker_id, f'initializing RNG and fuzzer'))
     random.seed(rng_seed)
     
     # Create fuzzer from chain content or original file
     if start_content is not None:
         # We have regenerated chain content - use it
+        progress_queue.put(('debug', worker_id, f'creating fuzzer from chain content'))
         try:
             fuzzer = InlineTypeFuzz.from_string(start_content) if hasattr(InlineTypeFuzz, 'from_string') else None
             if fuzzer is None:
                 # Fallback: write to temp file
+                progress_queue.put(('debug', worker_id, f'from_string not available, using temp file'))
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
                     f.write(start_content)
                     temp_path = f.name
                 try:
+                    progress_queue.put(('debug', worker_id, f'parsing temp file: {temp_path}'))
                     fuzzer = InlineTypeFuzz(Path(temp_path))
                     if not fuzzer.parse():
                         progress_queue.put(('skip', worker_id, seed_name, f'chain content parse failed{chain_str}', len(group_recipes)))
                         return 0, len(group_recipes), 0
+                    progress_queue.put(('debug', worker_id, f'temp file parse SUCCESS'))
                 finally:
                     try:
                         os.unlink(temp_path)
                     except:
                         pass
+            else:
+                progress_queue.put(('debug', worker_id, f'from_string SUCCESS'))
         except Exception as e:
             progress_queue.put(('skip', worker_id, seed_name, f'chain fuzzer init failed: {e}', len(group_recipes)))
             return 0, len(group_recipes), 0
     else:
         # No chain - parse original file
+        progress_queue.put(('debug', worker_id, f'creating fuzzer from original file'))
         fuzzer = InlineTypeFuzz(Path(seed_path))
+        progress_queue.put(('debug', worker_id, f'parsing original file'))
         if not fuzzer.parse():
             progress_queue.put(('skip', worker_id, seed_name, 'parse failed', len(group_recipes)))
             return 0, len(group_recipes), 0
+        progress_queue.put(('debug', worker_id, f'original file parse SUCCESS'))
+    
+    progress_queue.put(('debug', worker_id, f'fuzzer ready, starting recipe processing'))
     
     # Process iterations sequentially
     current_iteration = 0
@@ -886,6 +923,9 @@ def replay_recipes_optimized(
                 elif msg[0] == 'seed_error':
                     _, worker_id, seed_name, error_msg, elapsed_sec = msg
                     log(f"[W{worker_id}] SEED_ERROR: {seed_name} after {elapsed_sec:.1f}s - {error_msg}")
+                elif msg[0] == 'debug':
+                    _, worker_id, debug_msg = msg
+                    log(f"[W{worker_id}] DEBUG: {debug_msg}")
                 elif msg[0] == 'worker_complete':
                     _, worker_id, seeds_processed, total_worker_seeds, elapsed_sec = msg
                     workers_complete.add(worker_id)
