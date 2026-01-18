@@ -562,7 +562,8 @@ def regenerate_chain_content(
                     if i == target_iter:
                         if success and mutant:
                             content = mutant
-                            log(f"[W{worker_id}] Chain step {step_idx+1}: COMPLETE (new content len={len(content)})")
+                            content_hash = compute_content_hash(content)
+                            log(f"[W{worker_id}] Chain step {step_idx+1}: COMPLETE len={len(content)} hash={content_hash}")
                             # Cache this intermediate result
                             if chain_cache is not None:
                                 prefix = chain[:step_idx+1]
