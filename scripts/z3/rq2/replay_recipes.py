@@ -1249,7 +1249,8 @@ def replay_recipes_two_phase(
     log("Extracting coverage data")
     log("=" * 60)
     
-    function_counts = extract_function_counts(build_dir, changed_functions)
+    coverage_data = extract_coverage_fastcov(build_dir, gcov_cmd, changed_functions)
+    function_counts = coverage_data.get("function_counts", {})
     total_function_calls = sum(function_counts.values())
     
     log(f"Extracted counts for {len(function_counts)} functions")

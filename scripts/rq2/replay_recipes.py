@@ -1050,7 +1050,7 @@ def execution_worker(
             break
         
         test_path = test['test_path']
-        test_flags = test.get('test_flags', [])
+        test_flags_str = test.get('test_flags', '')
         disabled_testers = test.get('disabled_testers', set())
         recipe = test['recipe']
         
@@ -1061,7 +1061,9 @@ def execution_worker(
         if 'model' in disabled_testers:
             base_flags = [f for f in base_flags if f != '--debug-check-models']
         
-        cmd = [solver_path] + base_flags + test_flags + [test_path]
+        # test_flags is a string, split it into a list
+        test_flags_list = test_flags_str.split() if test_flags_str else []
+        cmd = [solver_path] + base_flags + test_flags_list + [test_path]
         
         # Run solver
         try:
@@ -1384,7 +1386,8 @@ def replay_recipes_two_phase(
     log("Extracting coverage data")
     log("=" * 60)
     
-    function_counts = extract_function_counts(build_dir, changed_functions)
+    coverage_data = extract_coverage_fastcov(build_dir, gcov_cmd, changed_functions)
+    function_counts = coverage_data.get("function_counts", {})
     total_function_calls = sum(function_counts.values())
     
     log(f"Extracted counts for {len(function_counts)} functions")
