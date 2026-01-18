@@ -508,7 +508,9 @@ def regenerate_chain_content(
                         log(f"[W{worker_id}] Chain step {step_idx+1}: PARSE TIMEOUT after {PARSE_TIMEOUT}s (content={len(content)} bytes)")
                         return None
                     if not parse_ok:
-                        log(f"[W{worker_id}] Chain step {step_idx}: parse failed")
+                        # Log first 500 chars of content that failed to parse
+                        content_preview = content[:500] if len(content) > 500 else content
+                        log(f"[W{worker_id}] Chain step {step_idx}: parse failed. Content preview: {content_preview[:200]}...")
                         return None
                     log(f"[W{worker_id}] Chain step {step_idx+1}: parse OK")
                 finally:
@@ -949,6 +951,15 @@ def generation_worker(
                 continue
             
             if current_iteration == target_iteration and success and mutant:
+                # Validate content hash if available (determinism check)
+                expected_hash = recipe.get('hash')
+                if expected_hash:
+                    actual_hash = compute_content_hash(mutant)
+                    if actual_hash != expected_hash:
+                        progress_queue.put(('hash_mismatch', worker_id, seed_name, 
+                                          current_iteration, expected_hash, actual_hash))
+                        # Continue anyway but log the mismatch
+                
                 # Write test file
                 test_id = f"{worker_id}_{tests_generated}"
                 test_path = os.path.join(output_dir, f"test_{test_id}.smt2")
@@ -1207,6 +1218,9 @@ def replay_recipes_two_phase(
                 elif msg[0] == 'gen_mutation_timeout':
                     _, wid, seed_name, iteration = msg
                     log(f"[G{wid}] Mutation timeout: {seed_name} at iter {iteration}")
+                elif msg[0] == 'hash_mismatch':
+                    _, wid, seed_name, iteration, expected, actual = msg
+                    log(f"[G{wid}] ⚠️ HASH MISMATCH {seed_name} iter {iteration}: expected={expected} actual={actual}")
                 elif msg[0] == 'gen_worker_done':
                     _, wid, generated, failed = msg
                     log(f"[G{wid}] Worker done: {generated} generated, {failed} failed")
