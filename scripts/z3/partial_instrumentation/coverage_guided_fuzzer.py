@@ -2637,15 +2637,21 @@ class CoverageGuidedFuzzer:
                         path_freq = self._get_test_path_frequency(test_path_str)
                         owned_edges = self._get_owned_edges_count(test_path_str)
                         
-                        # Get individual factors for debug logging
-                        S = self._get_speed_base(runtime_ms)
+                        # Use _calculate_perf_score for consistent geometric mean scoring
+                        perf_score = self._calculate_perf_score(
+                            runtime_ms, actual_edges, generation, test_path_str,
+                            path_freq, owned_edges
+                        )
+                        dynamic_iterations = self._score_to_iterations(perf_score)
+                        
+                        # Get individual factors for debug logging only
+                        S = self._get_speed_multiplier(runtime_ms)
                         C = self._get_coverage_multiplier(actual_edges)
                         N, _ = self._get_newcomer_multiplier(test_path_str)
                         D = self._get_depth_multiplier(generation)
                         F = self._get_rarity_multiplier(path_freq)
                         U = self._get_owned_edges_multiplier(owned_edges)
-                        perf_score = S * C * N * D * F * U
-                        dynamic_iterations = self._score_to_iterations(perf_score)
+                        E = self._get_edge_rarity_multiplier(test_path_str)
                     else:
                         # Mutants: use stored perf_score or recalculate if needed
                         # Get calibration data for individual factors
@@ -2661,15 +2667,21 @@ class CoverageGuidedFuzzer:
                         path_freq = self._get_test_path_frequency(test_path_str)
                         owned_edges = self._get_owned_edges_count(test_path_str)
                         
-                        # Get individual factors for debug logging
-                        S = self._get_speed_base(runtime_ms)
+                        # Use _calculate_perf_score for consistent geometric mean scoring
+                        perf_score = self._calculate_perf_score(
+                            runtime_ms, actual_edges, generation, test_path_str,
+                            path_freq, owned_edges
+                        )
+                        dynamic_iterations = self._score_to_iterations(perf_score)
+                        
+                        # Get individual factors for debug logging only
+                        S = self._get_speed_multiplier(runtime_ms)
                         C = self._get_coverage_multiplier(actual_edges)
                         N, _ = self._get_newcomer_multiplier(test_path_str)
                         D = self._get_depth_multiplier(generation)
                         F = self._get_rarity_multiplier(path_freq)
                         U = self._get_owned_edges_multiplier(owned_edges)
-                        perf_score = S * C * N * D * F * U
-                        dynamic_iterations = self._score_to_iterations(perf_score)
+                        E = self._get_edge_rarity_multiplier(test_path_str)
                     
                     # Log test pickup with AFL score factors
                     # Log EVERY seed to see all decision points, but only some mutants
@@ -2681,8 +2693,8 @@ class CoverageGuidedFuzzer:
                             print(f"[W{worker_id}] {test_type} {test_name} iter=0 q={queue_size}", flush=True)
                         else:
                             test_type = f"gen{generation}" if is_mutant else "seed"
-                            # Show AFL score factors: S(speed) C(cov) N(new) D(depth) F(rare) U(own) + actual edges (e)
-                            print(f"[W{worker_id}] {test_type} {test_name} e={actual_edges} S={S} C={C:.1f} N={N:.0f} D={D} F={F:.1f} U={U:.1f} → score={perf_score:.0f} iter={dynamic_iterations} q={queue_size}", flush=True)
+                            # Show AFL score factors with geometric mean: S×(C×N×D×F×U×E)^(1/6)
+                            print(f"[W{worker_id}] {test_type} {test_name} e={actual_edges} S={S:.1f} C={C:.1f} N={N:.0f} D={D:.1f} F={F:.1f} U={U:.1f} E={E:.1f} → score={perf_score:.0f} iter={dynamic_iterations} q={queue_size}", flush=True)
                     
                     # Mark worker as busy
                     self.worker_status[worker_id] = test_name
