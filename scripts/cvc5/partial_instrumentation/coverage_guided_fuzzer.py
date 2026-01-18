@@ -294,6 +294,16 @@ class CoverageGuidedFuzzer:
         # Test -> owned_edges_count mapping (for score lookup)
         self.test_owned_edges = self.manager.dict()
         
+        # Edge hit counts for edge rarity scoring (E factor)
+        # Tracks how many times each edge has been hit globally
+        # Tests hitting rarely-hit edges get exploration bonus
+        self.edge_hit_counts = self.manager.dict()  # edge_id -> total_hits
+        self.edge_hit_counts_lock = multiprocessing.Lock()
+        self.test_edge_rarity = self.manager.dict()  # test_path -> rarity_score
+        
+        # Exploration rate: probability of selecting random seed instead of weighted queue
+        self.exploration_rate = 0.10  # 10% random exploration from original seeds
+        
         # -------------------------------------------------------------------------
         # AFL++ style queue management
         # -------------------------------------------------------------------------
@@ -600,6 +610,52 @@ class CoverageGuidedFuzzer:
         if owned_edges >= 1:   return 1.1
         return 1.0                           # No penalty - baseline iterations
     
+    def _get_edge_rarity_multiplier(self, test_path: str) -> float:
+        """
+        Edge rarity factor (E) - bonus for tests hitting rarely-hit edges.
+        
+        Unlike F (path rarity) which tracks how often a PATH SIGNATURE was seen,
+        this directly measures how often the EDGES this test hits have been seen.
+        
+        Higher rarity_score = test hits edges that few other tests hit.
+        This encourages exploration of under-tested code paths.
+        
+        Returns multiplier in [1.0, 8.0].
+        """
+        rarity_score = self.test_edge_rarity.get(test_path, 0)
+        
+        if rarity_score >= 10.0:  return 8.0   # Hits many very rare edges
+        if rarity_score >= 5.0:   return 6.0
+        if rarity_score >= 2.0:   return 4.0
+        if rarity_score >= 1.0:   return 3.0
+        if rarity_score >= 0.5:   return 2.0
+        if rarity_score >= 0.1:   return 1.5
+        return 1.0
+    
+    def _update_edge_hit_counts(self, trace_bits: bytes, test_path: str):
+        """
+        Update global edge hit counts and compute test's edge rarity score.
+        
+        Called after each test execution to track:
+        1. How many times each edge has been hit globally
+        2. The "rarity score" for this test (sum of 1/edge_hits for each edge)
+        
+        Tests hitting rarely-hit edges get higher rarity scores.
+        """
+        with self.edge_hit_counts_lock:
+            rarity_score = 0.0
+            for edge_id, hit_count in enumerate(trace_bits):
+                if hit_count > 0:
+                    # Increment global hit count for this edge
+                    current = self.edge_hit_counts.get(edge_id, 0) + 1
+                    self.edge_hit_counts[edge_id] = current
+                    # Add inverse frequency to rarity score
+                    # Rare edges (low hit count) contribute more
+                    rarity_score += 1.0 / current
+            
+            # Cache the rarity score for this test
+            self.test_edge_rarity[test_path] = rarity_score
+    
     def _calculate_perf_score(
         self,
         runtime_ms: float,
@@ -610,38 +666,47 @@ class CoverageGuidedFuzzer:
         owned_edges: int = 0,
     ) -> float:
         """
-        Calculate AFL-style performance score.
+        Calculate AFL-style performance score with geometric mean balancing.
         Higher score = more iterations deserved AND higher selection probability.
         
-        Score = BASE × S(speed) × C(coverage) × N(newcomer) × D(depth) × F(rarity) × U(owned)
+        Score = BASE × S × GeometricMean(C, N, D, F, U, E)
         
-        BASE = 100 (constant baseline)
+        Speed (S) stays multiplicative - fast tests should get many more iterations.
+        Interest factors (C,N,D,F,U,E) combined via geometric mean to prevent explosion.
         
-        Factors (all are multipliers now):
-          S: [0.1, 3.0]  - speed multiplier based on ABSOLUTE runtime
-                           <0.5s → 3.0, 0.5-1s → 2.0, 1-2s → 1.0,
-                           2-5s → 0.5, 5-10s → 0.2, >10s → 0.1
+        Factors:
+          S: [0.1, 3.0]  - speed multiplier (multiplicative)
           C: [1.0, 5.0]  - coverage relative to average
           N: [1.0, 8.0]  - newcomer bonus (decays)
-          D: [1, 5]      - depth/generation bonus
-          F: [0.5, 4.0]  - path rarity
+          D: [1.0, 4.5]  - depth/generation bonus
+          F: [0.25, 4.0] - path rarity
           U: [1.0, 4.0]  - owned edges
+          E: [1.0, 8.0]  - edge rarity (NEW - exploration bonus)
         
-        Score ranges (mapped to iterations [5, 500]):
-          - Very slow (>10s): 10-800 → 5-100 iterations
-          - Slow (5-10s): 20-1600 → 5-200 iterations
-          - Normal (1-2s): 100-8000 → 30-500 iterations
-          - Fast (<0.5s): 300-24000 → 100-500 iterations
+        Score ranges with geometric mean:
+          - Max (fast + all bonuses): 100 × 3.0 × 5.3 ≈ 1,590
+          - Fast + no bonuses: 100 × 3.0 × 1.0 = 300
+          - Slow + rare edges: 100 × 0.2 × 1.4 = 28
+          - Very slow: 100 × 0.1 × 1.0 = 10
         """
         BASE = 100  # Baseline score
+        
+        # Speed factor (multiplicative - most important)
         S = self._get_speed_multiplier(runtime_ms)
+        
+        # Interest factors (combined via geometric mean to prevent explosion)
         C = self._get_coverage_multiplier(edges_hit)
         N, _ = self._get_newcomer_multiplier(test_path)
         D = self._get_depth_multiplier(generation)
         F = self._get_rarity_multiplier(path_frequency)
         U = self._get_owned_edges_multiplier(owned_edges)
+        E = self._get_edge_rarity_multiplier(test_path)
         
-        return BASE * S * C * N * D * F * U
+        # Geometric mean of 6 interest factors: (C×N×D×F×U×E)^(1/6)
+        interest_product = C * N * D * F * U * E
+        interest = interest_product ** (1/6)
+        
+        return BASE * S * interest
     
     def _score_to_iterations(self, score: float) -> int:
         """
@@ -1147,16 +1212,15 @@ class CoverageGuidedFuzzer:
 
     def _queue_pop(self, timeout: float = 1.0) -> Optional[tuple]:
         """
-        Pop item from queue using weighted random selection.
+        Pop item from queue using weighted random selection with exploration.
         
         During calibration: strict FIFO from calibration queue.
-        After calibration: weighted random selection where P(item) ∝ perf_score.
+        After calibration: 
+          - 10% chance: EXPLORATION - pick random seed from original test list
+          - 90% chance: EXPLOITATION - weighted random selection from queue
         
-        Uses the FULL perf_score (S×C×N×D×F×U) directly as weight, ensuring
-        all AFL-style scoring factors affect selection probability.
-        
-        This prevents starvation - even low-scored tests get occasional attention,
-        while high-scored tests are selected more frequently.
+        Exploration ensures we don't get stuck in local optima by occasionally
+        trying seeds that haven't been prioritized by the coverage-guided scoring.
         """
         # During calibration, use strict FIFO
         if not self.calibration_done.is_set():
@@ -1168,14 +1232,29 @@ class CoverageGuidedFuzzer:
             except:
                 return None
         
-        # After calibration, use weighted random selection
+        # EXPLORATION: With probability exploration_rate, pick random original seed
+        # This ensures diversity even when queue is dominated by high-coverage mutants
+        if random.random() < self.exploration_rate and self.tests:
+            seed_path = random.choice(self.tests)
+            # Create exploration item with moderate score
+            # Queue item format: (perf_score, new_cov_rank, generation, seq, path_str)
+            exploration_item = (150.0, 2, 0, self._next_seq(), seed_path)
+            
+            # Track as exploration selection
+            with self._selection_history_lock:
+                self._selection_history.append((150.0, -1.0, f"EXPLORE:{Path(seed_path).name}"))
+                while len(self._selection_history) > self.MAX_SELECTION_HISTORY:
+                    del self._selection_history[0]
+            
+            return exploration_item
+        
+        # EXPLOITATION: Weighted random selection from queue
         with self._work_queue_lock:
             if len(self._work_queue_list) == 0:
                 return None
             
             # Extract items for weighted selection
             # Item format: (perf_score, new_cov_rank, generation, seq, path_str)
-            # perf_score = S×C×N×D×F×U (already includes all factors)
             items = list(self._work_queue_list)
             
             if len(items) == 1:
@@ -1185,8 +1264,6 @@ class CoverageGuidedFuzzer:
                 total_weight = items[0][0]
             else:
                 # Weighted random selection: P(item) ∝ perf_score
-                # perf_score already includes: S(speed), C(coverage), N(newcomer),
-                # D(depth), F(rarity), U(owned edges)
                 weights = []
                 for item in items:
                     perf_score = item[0]
@@ -2271,9 +2348,10 @@ class CoverageGuidedFuzzer:
             if coverage_hash:
                 path_freq = self._update_path_frequency(coverage_hash, str(pending_path))
             
-            # Update edge ownership (AFL's tc_ref) using trace_bits
+            # Update edge ownership (AFL's tc_ref) and edge hit counts using trace_bits
             if edges_hit > 0:
                 self._update_edge_ownership(trace_bits, runtime_i * 1000, str(pending_path))
+                self._update_edge_hit_counts(trace_bits, str(pending_path))
 
             # Set newcomer bonus for new mutants
             # Mutants with NEW coverage get big bonus (8x) to encourage exploration
@@ -2721,8 +2799,9 @@ class CoverageGuidedFuzzer:
                         if edges_hit_calib > 0:
                             coverage_hash = self._hash_coverage(trace_bits_calib)
                             self._update_path_frequency(coverage_hash, test_path_str)
-                            # Update edge ownership (AFL's tc_ref)
+                            # Update edge ownership (AFL's tc_ref) and edge hit counts
                             self._update_edge_ownership(trace_bits_calib, runtime * 1000, test_path_str)
+                            self._update_edge_hit_counts(trace_bits_calib, test_path_str)
                             # Update top_rated for favored marking (AFL's update_bitmap_score)
                             self._update_top_rated(test_path_str, trace_bits_calib, runtime * 1000)
                         
@@ -2821,11 +2900,12 @@ class CoverageGuidedFuzzer:
                         # Only log coverage for new edges (reduce verbosity)
                         # print(f"[W{worker_id}] {test_name}: hit={edges_hit} new={new_edges} total={total_edges_after}")
                         
-                        # Update edge ownership (AFL's tc_ref) and path frequency
+                        # Update edge ownership (AFL's tc_ref), path frequency, and edge hit counts
                         if edges_hit > 0:
                             coverage_hash = self._hash_coverage(trace_bits)
                             self._update_path_frequency(coverage_hash, test_path_str)
                             self._update_edge_ownership(trace_bits, runtime * 1000, test_path_str)
+                            self._update_edge_hit_counts(trace_bits, test_path_str)
                         
                         # Decide what to do with mutants based on coverage.
                         # Queue item format: (runtime, new_cov_rank, generation, seq, path_str)
