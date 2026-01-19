@@ -70,11 +70,17 @@ class RecipeRecorder:
         # Ensure output directory exists
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Open file for writing
-        self._file = open(self.output_path, 'w')
+        # Open file for APPENDING (critical: don't overwrite on worker restart!)
+        # Check if file exists and has content to decide whether to write header
+        file_exists = self.output_path.exists() and self.output_path.stat().st_size > 0
+        self._file = open(self.output_path, 'a')
         
-        # Write header comment (for human readability)
-        self._file.write(f"# Recipe log - worker={worker_id}, rng_seed={rng_seed}, started={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        # Write header comment only if file is new
+        if not file_exists:
+            self._file.write(f"# Recipe log - worker={worker_id}, rng_seed={rng_seed}, started={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        else:
+            # Add restart marker for debugging
+            self._file.write(f"# Worker {worker_id} restarted at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         self._file.flush()
     
     def record(self, seed_path: str, iteration: int, 
