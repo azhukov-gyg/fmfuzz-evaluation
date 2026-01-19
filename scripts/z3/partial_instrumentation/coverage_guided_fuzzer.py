@@ -25,6 +25,14 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+# Try to import numpy for fast bitmap operations
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+    np = None
+
 # Import shared InlineTypeFuzz and RecipeRecorder from scripts/rq2
 SCRIPT_DIR = Path(__file__).parent
 RQ2_PATH = SCRIPT_DIR.parent.parent / "rq2"
@@ -58,6 +66,50 @@ def _import_recipes():
 
 # AFL-style coverage map size (1KB bitmap)
 AFL_MAP_SIZE = 1024
+
+# =============================================================================
+# FAST BITMAP OPERATIONS (numpy-accelerated when available)
+# =============================================================================
+
+def _fast_count_edges(trace_bits: bytes) -> int:
+    """Count non-zero bytes in coverage bitmap. ~10x faster with numpy."""
+    if NUMPY_AVAILABLE:
+        arr = np.frombuffer(trace_bits, dtype=np.uint8)
+        return int(np.count_nonzero(arr))
+    else:
+        return sum(1 for b in trace_bits if b != 0)
+
+def _fast_find_new_edges(trace_bits: bytes, global_map: bytes) -> List[int]:
+    """Find indices where trace_bits has coverage but global_map is 0xff (uncovered).
+    Returns list of new edge indices. ~5x faster with numpy."""
+    if NUMPY_AVAILABLE:
+        trace = np.frombuffer(trace_bits, dtype=np.uint8)
+        global_arr = np.frombuffer(global_map, dtype=np.uint8)
+        # New edge: trace_bits[i] != 0 AND global_map[i] == 0xff
+        new_mask = (trace != 0) & (global_arr == 0xff)
+        return list(np.where(new_mask)[0])
+    else:
+        new_edges = []
+        for i in range(len(trace_bits)):
+            if trace_bits[i] != 0 and global_map[i] == 0xff:
+                new_edges.append(i)
+        return new_edges
+
+def _fast_hash_coverage(trace_bits: bytes) -> int:
+    """Fast hash of coverage pattern. ~3x faster with numpy."""
+    if NUMPY_AVAILABLE:
+        arr = np.frombuffer(trace_bits, dtype=np.uint8)
+        # Use numpy's faster operations
+        nonzero = arr != 0
+        if not np.any(nonzero):
+            return 0
+        # Simple but fast hash: sum of indices * sum of values
+        indices = np.where(nonzero)[0]
+        values = arr[nonzero]
+        return hash((int(np.sum(indices)), int(np.sum(values)), len(indices)))
+    else:
+        # Fallback to simple hash
+        return hash(tuple(i for i, b in enumerate(trace_bits) if b != 0))
 
 
 class CoverageGuidedFuzzer:
@@ -2224,22 +2276,25 @@ class CoverageGuidedFuzzer:
             except Exception:
                 trace_bits = b'\x00' * AFL_MAP_SIZE
 
-            edges_hit = sum(1 for b in trace_bits if b != 0)
+            # FAST: Use numpy-accelerated bitmap operations
+            edges_hit = _fast_count_edges(trace_bits)
             
             # Hash coverage pattern for path frequency tracking (AFL's n_fuzz)
-            coverage_hash = self._hash_coverage(trace_bits) if edges_hit > 0 else None
+            coverage_hash = _fast_hash_coverage(trace_bits) if edges_hit > 0 else None
 
             # Check for new coverage using SHARED global_coverage_map (with lock)
+            # FAST: Use numpy to find new edges, only lock for the update
             has_new = False
             new_edges = 0
 
             with coverage_map_lock:
                 coverage_bytes = bytes(global_coverage_map[:])
-                for j in range(AFL_MAP_SIZE):
-                    if trace_bits[j] and coverage_bytes[j] == 0xff:
-                        global_coverage_map[j] = 0x00
-                        new_edges += 1
-                        has_new = True
+                new_edge_indices = _fast_find_new_edges(trace_bits, coverage_bytes)
+                if new_edge_indices:
+                    has_new = True
+                    new_edges = len(new_edge_indices)
+                    for idx in new_edge_indices:
+                        global_coverage_map[idx] = 0x00
 
             if has_new:
                 self._inc_stat('total_new_edges', new_edges)
@@ -2766,11 +2821,12 @@ class CoverageGuidedFuzzer:
                         # Read coverage from shm to get edges_hit for this seed
                         shm.seek(0)
                         trace_bits_calib = shm.read(AFL_MAP_SIZE)
-                        edges_hit_calib = sum(1 for b in trace_bits_calib if b != 0)
+                        # FAST: Use numpy for edge counting
+                        edges_hit_calib = _fast_count_edges(trace_bits_calib)
                         
                         # Hash coverage pattern and track frequency
                         if edges_hit_calib > 0:
-                            coverage_hash = self._hash_coverage(trace_bits_calib)
+                            coverage_hash = _fast_hash_coverage(trace_bits_calib)
                             self._update_path_frequency(coverage_hash, test_path_str)
                             # Update edge ownership (AFL's tc_ref) and edge hit counts
                             self._update_edge_ownership(trace_bits_calib, runtime * 1000, test_path_str)
@@ -2852,8 +2908,8 @@ class CoverageGuidedFuzzer:
                         shm.seek(0)
                         trace_bits = shm.read(AFL_MAP_SIZE)
                         
-                        # Count edges hit in this execution
-                        edges_hit = sum(1 for b in trace_bits if b != 0)
+                        # FAST: Count edges hit in this execution using numpy
+                        edges_hit = _fast_count_edges(trace_bits)
                         
                         # Debug: log if we're getting any coverage at all (first few tests only)
                         if edges_hit == 0 and self._get_stat('tests_processed') < 5:
@@ -2861,19 +2917,21 @@ class CoverageGuidedFuzzer:
                             print(f"[DEBUG] SHM {shm_name}: edges_hit={edges_hit}, sample_nonzero={nonzero_sample[:10]}, __AFL_SHM_ID={shm_id}")
                         
                         # Check for new coverage using SHARED global_coverage_map (with lock)
+                        # FAST: Use numpy to find new edges
                         has_new = False
                         new_edges = 0
                         total_edges_before = 0
                         
                         with coverage_map_lock:
                             coverage_bytes = bytes(global_coverage_map[:])
-                            total_edges_before = sum(1 for b in coverage_bytes if b == 0x00)
+                            total_edges_before = AFL_MAP_SIZE - _fast_count_edges(bytes([0xff if b == 0xff else 0 for b in coverage_bytes]))
                             
-                            for i in range(AFL_MAP_SIZE):
-                                if trace_bits[i] and coverage_bytes[i] == 0xff:
-                                    global_coverage_map[i] = 0x00
-                                    new_edges += 1
-                                    has_new = True
+                            new_edge_indices = _fast_find_new_edges(trace_bits, coverage_bytes)
+                            if new_edge_indices:
+                                has_new = True
+                                new_edges = len(new_edge_indices)
+                                for idx in new_edge_indices:
+                                    global_coverage_map[idx] = 0x00
                         
                         total_edges_after = total_edges_before + new_edges
                         # Only log coverage for new edges (reduce verbosity)
@@ -2881,7 +2939,7 @@ class CoverageGuidedFuzzer:
                         
                         # Update edge ownership (AFL's tc_ref) and path frequency
                         if edges_hit > 0:
-                            coverage_hash = self._hash_coverage(trace_bits)
+                            coverage_hash = _fast_hash_coverage(trace_bits)
                             self._update_path_frequency(coverage_hash, test_path_str)
                             self._update_edge_ownership(trace_bits, runtime * 1000, test_path_str)
                             self._update_edge_hit_counts(trace_bits, test_path_str)
