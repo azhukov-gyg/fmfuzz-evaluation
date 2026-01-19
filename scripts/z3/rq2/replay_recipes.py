@@ -726,7 +726,7 @@ def process_seed_group(
 
 def worker_process(
     worker_id: int,
-    seed_groups_chunk: List[Tuple[Tuple[str, int, Tuple[int, ...]], List[dict]]],
+    task_queue: multiprocessing.Queue,
     solver_path: str,
     build_dir: str,
     timeout: int,
@@ -734,23 +734,34 @@ def worker_process(
     result_queue: multiprocessing.Queue,
     z3_memory_mb: int = 4096
 ):
-    """Worker that processes a chunk of seed groups (with chain support)."""
+    """Worker that pulls seed groups from queue for dynamic load balancing."""
     total_successful = 0
     total_failed = 0
     total_mutations = 0
     seeds_done = 0
-    total_seeds = len(seed_groups_chunk)
     worker_start = time.time()
     
     # Send worker start message
-    progress_queue.put(('worker_start', worker_id, total_seeds, os.getpid()))
+    progress_queue.put(('worker_start', worker_id, 0, os.getpid()))
     
-    for idx, ((seed_path, rng_seed, chain), group_recipes) in enumerate(seed_groups_chunk):
+    while True:
+        try:
+            task = task_queue.get(timeout=1)
+        except:
+            # Check if queue is empty and all work is done
+            if task_queue.empty():
+                break
+            continue
+        
+        if task is None:  # Poison pill
+            break
+        
+        (seed_path, rng_seed, chain), group_recipes = task
         seed_name = Path(seed_path).name
         seed_start = time.time()
         
         # Send seed start message
-        progress_queue.put(('seed_start', worker_id, seed_name, idx + 1, total_seeds, len(group_recipes)))
+        progress_queue.put(('seed_start', worker_id, seed_name, seeds_done + 1, 0, len(group_recipes)))
         
         try:
             successful, failed, mutations = process_seed_group(
@@ -764,7 +775,7 @@ def worker_process(
             seeds_done += 1
             
             seed_elapsed = time.time() - seed_start
-            progress_queue.put(('seed_complete', worker_id, seed_name, idx + 1, total_seeds, seed_elapsed))
+            progress_queue.put(('seed_complete', worker_id, seed_name, seeds_done, 0, seed_elapsed))
             
         except Exception as e:
             # Catch any unexpected exceptions in seed processing
@@ -775,7 +786,7 @@ def worker_process(
     worker_elapsed = time.time() - worker_start
     
     # Send worker complete message before putting result
-    progress_queue.put(('worker_complete', worker_id, seeds_done, total_seeds, worker_elapsed))
+    progress_queue.put(('worker_complete', worker_id, seeds_done, seeds_done, worker_elapsed))
     
     result_queue.put({
         'worker_id': worker_id,
@@ -1429,29 +1440,26 @@ def replay_recipes_optimized(
     log("Starting parallel replay...")
     log("-" * 60)
     
-    # Split seed groups among workers
-    chunk_size = (len(seed_groups_list) + actual_workers - 1) // actual_workers
-    chunks = []
-    for i in range(actual_workers):
-        start = i * chunk_size
-        end = min(start + chunk_size, len(seed_groups_list))
-        if start < len(seed_groups_list):
-            chunks.append(seed_groups_list[start:end])
+    # Create task queue and add all seed groups
+    task_queue = multiprocessing.Queue()
+    for seed_group in seed_groups_list:
+        task_queue.put(seed_group)
     
-    # Show chunk distribution
-    for i, chunk in enumerate(chunks):
-        total_recipes = sum(len(recipes) for _, recipes in chunk)
-        log(f"  Worker {i}: {len(chunk)} seeds, {total_recipes} recipes")
+    # Add poison pills for workers
+    for _ in range(actual_workers):
+        task_queue.put(None)
+    
+    log(f"  {len(seed_groups_list)} seed groups queued for {actual_workers} workers")
     
     # Create queues and start workers
     progress_queue = multiprocessing.Queue()
     result_queue = multiprocessing.Queue()
     
     processes = []
-    for i, chunk in enumerate(chunks):
+    for i in range(actual_workers):
         p = multiprocessing.Process(
             target=worker_process,
-            args=(i, chunk, solver_path, build_dir, timeout, progress_queue, result_queue, z3_memory_mb)
+            args=(i, task_queue, solver_path, build_dir, timeout, progress_queue, result_queue, z3_memory_mb)
         )
         p.start()
         processes.append(p)
