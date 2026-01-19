@@ -2880,9 +2880,15 @@ class CoverageGuidedFuzzer:
                             self.excluded_tests.append(original_test_id)
                             print(f"[WORKER {worker_id}] [EXCLUDE] {test_name} (id={original_test_id}) added to exclusion list ({len(current_excluded)+1} total)")
                             sys.stdout.flush()
-                    elif action == 'remove':
-                        print(f"[WORKER {worker_id}] [DEBUG] Not excluding {test_name}: generation={generation}, action={action}")
-                        sys.stdout.flush()
+                    elif action == 'remove' and generation > 0:
+                        # Delete mutant file from pending_mutants to prevent disk accumulation
+                        # and stop this lineage from producing more failing children
+                        mutant_file = Path(path_str)
+                        if mutant_file.exists() and str(self.pending_mutants_dir) in str(mutant_file):
+                            try:
+                                mutant_file.unlink()
+                            except Exception:
+                                pass
                     
                     # Coverage tracking and mutant processing
                     # NOTE: Inline mode handles its own per-mutant coverage tracking

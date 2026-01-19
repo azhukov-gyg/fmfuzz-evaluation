@@ -121,10 +121,8 @@ class InlineTypeFuzz:
             return True
             
         except Exception as e:
-            # Log the actual error for debugging
-            import traceback
+            # Just log the error message, not full traceback (to avoid log spam)
             print(f"[InlineTypeFuzz] Parse failed for {self.seed_path}: {e}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
             return False
     
     def mutate(self) -> Tuple[Optional[str], bool]:
