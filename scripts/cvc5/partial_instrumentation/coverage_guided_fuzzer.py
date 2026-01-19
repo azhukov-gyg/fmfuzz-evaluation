@@ -228,6 +228,7 @@ class CoverageGuidedFuzzer:
         self.stats_bugs_found = multiprocessing.Value('i', 0)
         self.stats_tests_removed_unsupported = multiprocessing.Value('i', 0)
         self.stats_tests_removed_timeout = multiprocessing.Value('i', 0)
+        self.stats_tests_removed_parse_failed = multiprocessing.Value('i', 0)
         self.stats_mutants_created = multiprocessing.Value('i', 0)
         self.stats_mutants_with_new_coverage = multiprocessing.Value('i', 0)
         self.stats_mutants_with_existing_coverage = multiprocessing.Value('i', 0)
@@ -2158,7 +2159,9 @@ class CoverageGuidedFuzzer:
         
         mutator = InlineTypeFuzz(test_path)
         if not mutator.parse():
-            return (0, [], time.time() - start_time, [])
+            # Return exit code 4 to indicate parse failure - test will be excluded
+            print(f"[WORKER {worker_id}] [INLINE] {test_path.name}: parse failed, excluding", flush=True)
+            return (4, [], time.time() - start_time, [])
         
         env = os.environ.copy()
         env['__AFL_SHM_ID'] = shm_id
@@ -2532,6 +2535,10 @@ class CoverageGuidedFuzzer:
         elif exit_code == self.EXIT_CODE_UNSUPPORTED:
             print(f"[WORKER {worker_id}] ⚠ Exit code 3: {test_name} (unsupported operation - removing)")
             self._inc_stat('tests_removed_unsupported')
+            return 'remove'
+        
+        elif exit_code == 4:  # Parse failure (e.g., typecheck error on deep mutant)
+            self._inc_stat('tests_removed_parse_failed')
             return 'remove'
         
         elif exit_code == self.EXIT_CODE_SUCCESS:
@@ -3353,6 +3360,7 @@ class CoverageGuidedFuzzer:
         print(f"  Bugs found: {self._get_stat('bugs_found')}")
         print(f"  Tests removed (unsupported): {self._get_stat('tests_removed_unsupported')}")
         print(f"  Tests removed (timeout): {self._get_stat('tests_removed_timeout')}")
+        print(f"  Tests removed (parse failed): {self._get_stat('tests_removed_parse_failed')}")
         
         # Merge profdata if PGO was enabled
         self._merge_profdata()
