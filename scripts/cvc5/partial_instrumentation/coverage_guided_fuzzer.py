@@ -2883,7 +2883,7 @@ class CoverageGuidedFuzzer:
                     elif action == 'remove' and generation > 0:
                         # Delete mutant file from pending_mutants to prevent disk accumulation
                         # and stop this lineage from producing more failing children
-                        mutant_file = Path(path_str)
+                        mutant_file = Path(test_path_str)
                         if mutant_file.exists() and str(self.pending_mutants_dir) in str(mutant_file):
                             try:
                                 mutant_file.unlink()
