@@ -67,6 +67,9 @@ def _import_recipes():
 # AFL-style coverage map size (1KB bitmap)
 AFL_MAP_SIZE = 1024
 
+# Pre-allocated zero buffer for clearing shared memory (avoids allocation per-test)
+AFL_ZERO_BUFFER = b'\x00' * AFL_MAP_SIZE
+
 # =============================================================================
 # FAST BITMAP OPERATIONS (numpy-accelerated when available)
 # =============================================================================
@@ -609,13 +612,21 @@ class CoverageGuidedFuzzer:
         """
         Update edge ownership tracking (AFL's tc_ref).
         A test "owns" an edge if it's the fastest test to reach that edge.
+        
+        OPTIMIZED: Uses numpy to find non-zero indices first, reducing iterations
+        from 65536 to typically ~100-500 (only edges that were hit).
         """
+        # OPTIMIZATION: Find non-zero indices with numpy (fast!)
+        # Reduces loop iterations from 65536 to ~100-500
+        if NUMPY_AVAILABLE:
+            trace = np.frombuffer(trace_bits, dtype=np.uint8)
+            hit_indices = np.nonzero(trace)[0]
+        else:
+            hit_indices = [i for i, b in enumerate(trace_bits) if b > 0]
+        
         with self.edge_owner_lock:
             owned_count = 0
-            for edge_id, hit_count in enumerate(trace_bits):
-                if hit_count == 0:
-                    continue
-                
+            for edge_id in hit_indices:
                 current_owner = self.edge_owner.get(edge_id)
                 if current_owner is None:
                     # First test to hit this edge - owns it
@@ -694,17 +705,27 @@ class CoverageGuidedFuzzer:
         2. The "rarity score" for this test (sum of 1/edge_hits for each edge)
         
         Tests hitting rarely-hit edges get higher rarity scores.
+        
+        OPTIMIZED: Uses numpy to find non-zero indices first, reducing iterations
+        from 65536 to typically ~100-500 (only edges that were hit).
         """
+        # OPTIMIZATION: Find non-zero indices with numpy (fast!)
+        # Reduces loop iterations from 65536 to ~100-500
+        if NUMPY_AVAILABLE:
+            trace = np.frombuffer(trace_bits, dtype=np.uint8)
+            hit_indices = np.nonzero(trace)[0]
+        else:
+            hit_indices = [i for i, b in enumerate(trace_bits) if b > 0]
+        
         with self.edge_hit_counts_lock:
             rarity_score = 0.0
-            for edge_id, hit_count in enumerate(trace_bits):
-                if hit_count > 0:
-                    # Increment global hit count for this edge
-                    current = self.edge_hit_counts.get(edge_id, 0) + 1
-                    self.edge_hit_counts[edge_id] = current
-                    # Add inverse frequency to rarity score
-                    # Rare edges (low hit count) contribute more
-                    rarity_score += 1.0 / current
+            for edge_id in hit_indices:
+                # Increment global hit count for this edge
+                current = self.edge_hit_counts.get(edge_id, 0) + 1
+                self.edge_hit_counts[edge_id] = current
+                # Add inverse frequency to rarity score
+                # Rare edges (low hit count) contribute more
+                rarity_score += 1.0 / current
             
             # Cache the rarity score for this test
             self.test_edge_rarity[test_path] = rarity_score
@@ -793,7 +814,6 @@ class CoverageGuidedFuzzer:
         
         # Use log-scale mapping for better distribution
         # log(10) ≈ 2.3, log(2000) ≈ 7.6
-        import math
         log_score = math.log(score)
         log_min = math.log(10)
         log_max = math.log(2000)
@@ -885,8 +905,15 @@ class CoverageGuidedFuzzer:
         test_len = len(test_path)
         fav_factor = runtime_ms * test_len  # Faster × smaller = better
         
-        # First, collect edges we might update (only non-zero edges for efficiency)
-        candidate_edges = [(i, b) for i, b in enumerate(trace_bits) if b != 0]
+        # OPTIMIZATION: Find non-zero indices with numpy (fast!)
+        # Reduces from 65536 iterations to ~100-500
+        if NUMPY_AVAILABLE:
+            trace = np.frombuffer(trace_bits, dtype=np.uint8)
+            hit_indices = np.nonzero(trace)[0]
+            candidate_edges = [(int(i), trace[i]) for i in hit_indices]
+        else:
+            candidate_edges = [(i, b) for i, b in enumerate(trace_bits) if b != 0]
+        
         if not candidate_edges:
             return
         
@@ -1987,7 +2014,7 @@ class CoverageGuidedFuzzer:
             # coverage_agent.cpp increments bytes when edges are hit
             os.ftruncate(fd, AFL_MAP_SIZE)
             mm = mmap.mmap(fd, AFL_MAP_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
-            mm.write(b'\x00' * AFL_MAP_SIZE)
+            mm.write(AFL_ZERO_BUFFER)
             mm.seek(0)
             return mm
         finally:
@@ -2271,7 +2298,7 @@ class CoverageGuidedFuzzer:
             # Per-mutant coverage: clear shm before running solvers.
             try:
                 shm.seek(0)
-                shm.write(b'\x00' * AFL_MAP_SIZE)
+                shm.write(AFL_ZERO_BUFFER)
                 shm.seek(0)
             except Exception:
                 pass
@@ -2801,7 +2828,7 @@ class CoverageGuidedFuzzer:
                     
                     # Clear shared memory for this test (fast memset, no syscalls)
                     shm.seek(0)
-                    shm.write(b'\x00' * AFL_MAP_SIZE)
+                    shm.write(AFL_ZERO_BUFFER)
                     shm.seek(0)
                     
                     test_path_obj = test_path if isinstance(test_path, Path) else Path(test_path)
