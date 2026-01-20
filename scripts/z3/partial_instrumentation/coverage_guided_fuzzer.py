@@ -2353,36 +2353,42 @@ class CoverageGuidedFuzzer:
             else:
                 self._inc_stat('mutants_with_existing_coverage')
 
-            # Track path frequency (AFL's n_fuzz) using coverage hash
-            path_freq = 1
-            if coverage_hash:
-                path_freq = self._update_path_frequency(coverage_hash, str(pending_path))
-            
-            # Update edge ownership (AFL's tc_ref) and edge hit counts using trace_bits
-            if edges_hit > 0:
-                self._update_edge_ownership(trace_bits, runtime_i * 1000, str(pending_path))
-                self._update_edge_hit_counts(trace_bits, str(pending_path))
-
-            # Set newcomer bonus for new mutants
-            # Mutants with NEW coverage get big bonus (8x) to encourage exploration
-            # Mutants with existing coverage get smaller bonus (2x)
-            newcomer_bonus = 8 if has_new else 2
-            self._set_newcomer(str(pending_path), newcomer_bonus)
-            
-            # Update running averages for score calculation
-            self._update_running_averages(runtime_i * 1000, edges_hit)
-            
-            # Store calibration data for scoring (S and C factors)
-            self._store_calibration_data(str(pending_path), runtime_i, edges_hit)
-
-            # Calculate full perf_score = S×C×N×D×F×U for this mutant
             mutant_path_str = str(pending_path)
-            runtime_ms = runtime_i * 1000
-            path_freq = self._get_test_path_frequency(mutant_path_str)
-            owned_edges = self._get_owned_edges_count(mutant_path_str)
-            perf_score = self._calculate_perf_score(
-                runtime_ms, edges_hit, generation + 1, mutant_path_str, path_freq, owned_edges
-            )
+            
+            # OPTIMIZATION: Only do full scoring for tests with NEW coverage
+            # Tests with only existing coverage get minimal processing (saves CPU)
+            if has_new:
+                # Full scoring for NEW coverage
+                path_freq = 1
+                if coverage_hash:
+                    path_freq = self._update_path_frequency(coverage_hash, mutant_path_str)
+                
+                # Update edge ownership (AFL's tc_ref) and edge hit counts
+                if edges_hit > 0:
+                    self._update_edge_ownership(trace_bits, runtime_i * 1000, mutant_path_str)
+                    self._update_edge_hit_counts(trace_bits, mutant_path_str)
+
+                # Big newcomer bonus for NEW coverage (8x)
+                self._set_newcomer(mutant_path_str, 8)
+                
+                # Update running averages for score calculation
+                self._update_running_averages(runtime_i * 1000, edges_hit)
+                
+                # Store calibration data for scoring (S and C factors)
+                self._store_calibration_data(mutant_path_str, runtime_i, edges_hit)
+
+                # Calculate full perf_score = S×C×N×D×F×U
+                runtime_ms = runtime_i * 1000
+                path_freq = self._get_test_path_frequency(mutant_path_str)
+                owned_edges = self._get_owned_edges_count(mutant_path_str)
+                perf_score = self._calculate_perf_score(
+                    runtime_ms, edges_hit, generation + 1, mutant_path_str, path_freq, owned_edges
+                )
+            else:
+                # Minimal processing for EXISTING coverage only
+                # Still queue (can be mutated later) but skip expensive scoring
+                self._set_newcomer(mutant_path_str, 1)  # Small bonus
+                perf_score = 0.1  # Low default score
             
             # Queue item format: (perf_score, cov_rank, generation, seq, path)
             mutant_item = (perf_score, cov_rank, generation + 1, self._next_seq(), mutant_path_str)
