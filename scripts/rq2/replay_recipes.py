@@ -274,9 +274,9 @@ def extract_static_branch_counts(
             
             # Run gcov with intermediate format to get static branch structure
             # -i: intermediate format, -b: branches, -a: all blocks
-            # -o gcno_dir: tells gcov where the .gcno file is
+            # --object-file: specify the .gcno file directly (avoids naming issues)
             result = subprocess.run(
-                ['gcov', '-i', '-b', '-a', '-o', gcno_dir, full_source_path],
+                ['gcov', '-i', '-b', '-a', '--object-file', str(gcno_file), full_source_path],
                 capture_output=True,
                 text=True,
                 timeout=30,
