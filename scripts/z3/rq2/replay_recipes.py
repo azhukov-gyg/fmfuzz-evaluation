@@ -166,7 +166,8 @@ def load_changed_functions(changed_functions_file: str) -> tuple:
 def extract_static_branch_counts(
     build_dir: str,
     source_files: Set[str],
-    exact_function_ranges: Dict[str, tuple]
+    exact_function_ranges: Dict[str, tuple],
+    filter_system_branches: bool = True
 ) -> Dict[str, int]:
     """
     Extract static branch counts from .gcno files using gcov intermediate format.
@@ -175,6 +176,7 @@ def extract_static_branch_counts(
         build_dir: Directory containing .gcno/.gcda files
         source_files: Set of source file paths (relative, like "src/math/lp/nra_solver.cpp")
         exact_function_ranges: Dict mapping "file:start_line" -> (start, end)
+        filter_system_branches: If True, exclude branches from system headers (default: True)
     
     Returns:
         Dict mapping "file:start_line" -> total_branches_in_function
@@ -280,6 +282,8 @@ def extract_static_branch_counts(
             import json
             function_branches = {}  # {range_key: count}
             total_branches = 0
+            total_branches_unfiltered = 0
+            system_branches_filtered = 0
             
             try:
                 gcov_data = json.loads(result.stdout)
@@ -291,6 +295,20 @@ def extract_static_branch_counts(
                 
                 for file_data in files:
                     file_path = file_data.get('file', '')
+                    
+                    # Check if this is a system/library file that should be filtered
+                    is_system_file = False
+                    if filter_system_branches:
+                        # Filter out system headers, standard library, compiler internals
+                        if any(pattern in file_path for pattern in [
+                            '/usr/include/',
+                            '/usr/lib/',
+                            '/usr/local/include/',
+                            'bits/',  # STL implementation details
+                            'c++/',   # C++ standard library (when not in /usr/include)
+                        ]):
+                            is_system_file = True
+                    
                     # Normalize to relative path
                     current_file = file_path
                     if '/cvc5/' in file_path:
@@ -309,6 +327,13 @@ def extract_static_branch_counts(
                         branches = line_data.get('branches', [])
                         
                         if branches:
+                            total_branches_unfiltered += len(branches)
+                            
+                            # Skip system branches if filtering is enabled
+                            if is_system_file:
+                                system_branches_filtered += len(branches)
+                                continue
+                            
                             total_branches += len(branches)
                             
                             # Find which function this line belongs to
@@ -346,7 +371,12 @@ def extract_static_branch_counts(
             
             branch_counts.update(function_branches)
             log(f"[BRANCH DEBUG] Parsing complete for {source_file}:")
-            log(f"[BRANCH DEBUG]   Total branches in file: {total_branches}")
+            if filter_system_branches:
+                log(f"[BRANCH DEBUG]   Total branches (unfiltered): {total_branches_unfiltered}")
+                log(f"[BRANCH DEBUG]   System branches filtered out: {system_branches_filtered}")
+                log(f"[BRANCH DEBUG]   Total branches (filtered): {total_branches}")
+            else:
+                log(f"[BRANCH DEBUG]   Total branches in file: {total_branches}")
             log(f"[BRANCH DEBUG]   Branches mapped to changed functions: {sum(function_branches.values())}")
             log(f"[BRANCH DEBUG]   Changed functions with branches: {len(function_branches)}")
             
@@ -650,7 +680,8 @@ def extract_coverage_fastcov(
                 static_branch_counts = extract_static_branch_counts(
                     build_dir, 
                     source_files_for_branches,
-                    exact_function_ranges
+                    exact_function_ranges,
+                    filter_system_branches=True  # Filter out system/STL branches by default
                 )
                 
                 log(f"[BRANCH DEBUG] Returned from extract_static_branch_counts")
