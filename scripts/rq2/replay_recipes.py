@@ -315,10 +315,18 @@ def extract_static_branch_counts(
             
             log(f"[BRANCH DEBUG] gcov succeeded, parsing output ({len(result.stdout)} bytes)")
             
+            # Show sample of actual gcov output for debugging
+            lines_sample = result.stdout.split('\n')[:50]
+            log(f"[BRANCH DEBUG] First 50 lines of gcov output:")
+            for idx, line in enumerate(lines_sample[:20]):
+                log(f"[BRANCH DEBUG]   [{idx}] {line[:100]}")
+            
             # Parse intermediate format output
             current_file = None
             function_branches = {}  # {range_key: count}
             total_branches = 0
+            file_lines_seen = 0
+            branch_lines_seen = 0
             
             for line in result.stdout.split('\n'):
                 line = line.strip()
@@ -326,6 +334,7 @@ def extract_static_branch_counts(
                     continue
                 
                 if line.startswith('file:'):
+                    file_lines_seen += 1
                     current_file = line[5:]
                     # Normalize to relative path
                     if '/cvc5/' in current_file:
@@ -335,6 +344,7 @@ def extract_static_branch_counts(
                     log(f"[BRANCH DEBUG]   file: {current_file}")
                 
                 elif line.startswith('branch:'):
+                    branch_lines_seen += 1
                     total_branches += 1
                     # Format: branch:LINE_NUM,taken or branch:LINE_NUM,nottaken
                     parts = line[7:].split(',')
@@ -354,7 +364,13 @@ def extract_static_branch_counts(
                             pass
             
             branch_counts.update(function_branches)
-            log(f"[BRANCH DEBUG] {source_file}: found {total_branches} total branches, mapped {sum(function_branches.values())} to {len(function_branches)} functions")
+            log(f"[BRANCH DEBUG] Parsing complete for {source_file}:")
+            log(f"[BRANCH DEBUG]   Total lines parsed: {len(result.stdout.split(chr(10)))}")
+            log(f"[BRANCH DEBUG]   File lines seen (file:): {file_lines_seen}")
+            log(f"[BRANCH DEBUG]   Branch lines seen (branch:): {branch_lines_seen}")
+            log(f"[BRANCH DEBUG]   Total branches counted: {total_branches}")
+            log(f"[BRANCH DEBUG]   Branches mapped to functions: {sum(function_branches.values())}")
+            log(f"[BRANCH DEBUG]   Functions with branches: {len(function_branches)}")
             
         except subprocess.TimeoutExpired:
             log(f"[BRANCH DEBUG] gcov timeout for {source_file}")
