@@ -228,6 +228,10 @@ def extract_static_branch_counts(
     import os
     from pathlib import Path
     
+    log(f"[BRANCH DEBUG] ========================================")
+    log(f"[BRANCH DEBUG] FUNCTION CALLED: extract_static_branch_counts")
+    log(f"[BRANCH DEBUG] ========================================")
+    
     branch_counts = {}
     
     # Find the source root by going up from build_dir
@@ -236,25 +240,41 @@ def extract_static_branch_counts(
     
     log(f"[BRANCH DEBUG] Source root: {source_root}")
     log(f"[BRANCH DEBUG] Build dir: {build_dir}")
-    log(f"[BRANCH DEBUG] Processing {len(source_files)} source files")
+    log(f"[BRANCH DEBUG] Input source_files ({len(source_files)}): {source_files}")
+    log(f"[BRANCH DEBUG] Input exact_function_ranges ({len(exact_function_ranges)} entries)")
+    for key in list(exact_function_ranges.keys())[:5]:
+        log(f"[BRANCH DEBUG]   {key} -> {exact_function_ranges[key]}")
     
     # Build a map of source filenames to their .gcno files
     # .gcno files are in CMake subdirs like: build/src/math/lp/CMakeFiles/lp.dir/nra_solver.cpp.gcno
+    log(f"[BRANCH DEBUG] Searching for .gcno files in: {build_dir}")
     gcno_map = {}
     build_path = Path(build_dir)
+    gcno_count = 0
     for gcno_file in build_path.rglob("*.gcno"):
+        gcno_count += 1
         # Extract the source filename (e.g., "nra_solver.cpp" from "nra_solver.cpp.gcno")
         source_name = gcno_file.name
         if source_name.endswith('.gcno'):
             source_name = source_name[:-5]  # Remove .gcno
         gcno_map[source_name] = gcno_file
+        if gcno_count <= 3:
+            log(f"[BRANCH DEBUG]   Sample .gcno: {gcno_file} -> {source_name}")
     
-    log(f"[BRANCH DEBUG] Found {len(gcno_map)} .gcno files in build directory")
+    log(f"[BRANCH DEBUG] Found {len(gcno_map)} .gcno files (iterated {gcno_count} total)")
+    if len(gcno_map) > 0:
+        log(f"[BRANCH DEBUG] Sample entries from gcno_map:")
+        for key in list(gcno_map.keys())[:5]:
+            log(f"[BRANCH DEBUG]   '{key}' -> {gcno_map[key]}")
     
-    for source_file in source_files:
+    log(f"[BRANCH DEBUG] Starting to process {len(source_files)} source files...")
+    for idx, source_file in enumerate(source_files):
+        log(f"[BRANCH DEBUG] [{idx+1}/{len(source_files)}] Processing: {source_file}")
         try:
             # Construct full path to source file
             full_source_path = os.path.join(source_root, source_file)
+            log(f"[BRANCH DEBUG]   Full path: {full_source_path}")
+            log(f"[BRANCH DEBUG]   Exists: {os.path.exists(full_source_path)}")
             
             if not os.path.exists(full_source_path):
                 log(f"[BRANCH DEBUG] Source file not found: {full_source_path}")
@@ -262,8 +282,12 @@ def extract_static_branch_counts(
             
             # Find the corresponding .gcno file
             source_filename = os.path.basename(source_file)
+            log(f"[BRANCH DEBUG]   Basename: {source_filename}")
+            log(f"[BRANCH DEBUG]   In gcno_map: {source_filename in gcno_map}")
+            
             if source_filename not in gcno_map:
                 log(f"[BRANCH DEBUG] No .gcno file found for {source_filename}")
+                log(f"[BRANCH DEBUG]   Available keys: {list(gcno_map.keys())[:10]}")
                 continue
             
             gcno_file = gcno_map[source_filename]
@@ -630,20 +654,35 @@ def extract_coverage_fastcov(
                                 pass
             
             # Extract static branch counts for ALL functions (including uncalled)
+            log(f"[BRANCH DEBUG] Checking if should extract static branches...")
+            log(f"[BRANCH DEBUG]   exact_function_ranges is None: {exact_function_ranges is None}")
+            log(f"[BRANCH DEBUG]   exact_function_ranges length: {len(exact_function_ranges) if exact_function_ranges else 0}")
+            
             if exact_function_ranges:
-                log(f"[BRANCH DEBUG] Extracting static branch counts from .gcno files...")
+                log(f"[BRANCH DEBUG] ============================================")
+                log(f"[BRANCH DEBUG] EXTRACTING STATIC BRANCH COUNTS FROM .GCNO FILES")
+                log(f"[BRANCH DEBUG] ============================================")
+                
                 source_files_for_branches = set()
                 for range_key in exact_function_ranges.keys():
                     file_path = range_key.rsplit(':', 1)[0]
                     source_files_for_branches.add(file_path)
                 
+                log(f"[BRANCH DEBUG] Prepared {len(source_files_for_branches)} source files for branch extraction:")
+                for sf in source_files_for_branches:
+                    log(f"[BRANCH DEBUG]   - {sf}")
+                
+                log(f"[BRANCH DEBUG] Calling extract_static_branch_counts...")
                 static_branch_counts = extract_static_branch_counts(
                     build_dir, 
                     source_files_for_branches,
                     exact_function_ranges
                 )
                 
+                log(f"[BRANCH DEBUG] Returned from extract_static_branch_counts")
                 log(f"[BRANCH DEBUG] Got static branch counts for {len(static_branch_counts)} functions")
+            else:
+                log(f"[BRANCH DEBUG] Skipping static branch extraction (no exact_function_ranges)")
                 
                 # Recalculate branches_total using static counts
                 # Keep branches_taken as is (from fastcov execution data)
