@@ -81,31 +81,66 @@ def log(msg: str, flush: bool = True):
     print(f"[{timestamp}] {msg}", flush=flush)
 
 
-def load_changed_functions(json_file: str) -> Tuple[Set[str], Dict[str, tuple]]:
+def load_changed_functions(changed_functions_file: str) -> tuple:
     """
-    Load changed functions and their exact line ranges from changed_functions.json.
+    Load changed function names and their exact line ranges from JSON file.
     
     Returns:
-        - Set of function keys in format "file:function"
-        - Dict of exact function ranges: "file:start_line" -> (start, end)
+        (functions: Set[str], function_ranges: Dict[str, tuple])
+        - functions: Set of function keys like "src/file.cpp:func_name:123"
+        - function_ranges: Dict mapping "src/file.cpp:123" -> (start_line, end_line)
     """
-    with open(json_file, 'r') as f:
-        data = json.load(f)
-    
-    changed_functions = set()
-    exact_function_ranges = {}
-    
-    for entry in data:
-        file_path = entry['file']
-        function_name = entry['function']
-        func_key = f"{file_path}:{function_name}"
-        changed_functions.add(func_key)
+    try:
+        with open(changed_functions_file, 'r') as f:
+            data = json.load(f)
         
-        if 'start_line' in entry and 'end_line' in entry:
-            range_key = f"{file_path}:{entry['start_line']}"
-            exact_function_ranges[range_key] = (entry['start_line'], entry['end_line'])
-    
-    return changed_functions, exact_function_ranges
+        functions = set()
+        function_ranges = {}  # Maps "file:start_line" -> (start, end)
+        
+        # Load function_info_map if available (has exact start/end lines)
+        function_info_map = data.get('function_info_map', {})
+        
+        if 'functions' in data:
+            for fn in data['functions']:
+                if isinstance(fn, dict):
+                    name = fn.get('function') or fn.get('name') or fn.get('mangled_name')
+                    if name:
+                        functions.add(name)
+                elif isinstance(fn, str):
+                    functions.add(fn)
+        elif 'changed_functions' in data:
+            for fn in data['changed_functions']:
+                if isinstance(fn, dict):
+                    name = fn.get('function') or fn.get('name')
+                    if name:
+                        functions.add(name)
+                elif isinstance(fn, str):
+                    functions.add(fn)
+        
+        # Extract exact line ranges from function_info_map
+        for func_key, info in function_info_map.items():
+            if isinstance(info, dict):
+                file_path = info.get('file', '')
+                start = info.get('start', 0)
+                end = info.get('end', 0)
+                if file_path and start and end:
+                    # Normalize path to relative format (strip /cvc5/ prefix if present)
+                    normalized_path = file_path
+                    if '/cvc5/' in file_path:
+                        normalized_path = file_path.split('/cvc5/', 1)[1]
+                    # Key format: "file_path:start_line"
+                    range_key = f"{normalized_path}:{start}"
+                    function_ranges[range_key] = (start, end)
+        
+        if function_ranges:
+            log(f"Loaded {len(function_ranges)} exact function ranges from function_info_map")
+        else:
+            log("No function_info_map found - will use GCOV heuristics for line ranges")
+        
+        return functions, function_ranges
+    except Exception as e:
+        log(f"Error loading changed functions: {e}")
+        return set(), {}
 
 
 def reset_gcda_files(build_dir: str):
