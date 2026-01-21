@@ -724,7 +724,7 @@ def replay_recipes_timeline(
                     'checkpoint_number': checkpoint_num,
                     'wall_time_seconds': wall_elapsed,
                     'recipes_processed': recipes_processed['count'],
-                    'lines_hit': coverage_data['lines_hit'],
+                    'lines_hit': coverage_data['summary']['lines_hit'],
                     'lines_total': coverage_data['summary']['lines_total'],
                     'branches_taken': coverage_data['summary']['branches_taken'],
                     'branches_total': coverage_data['summary']['branches_total'],
