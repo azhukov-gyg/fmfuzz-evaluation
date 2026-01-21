@@ -181,6 +181,7 @@ def extract_static_branch_counts(
     """
     import subprocess
     import os
+    from pathlib import Path
     
     branch_counts = {}
     
@@ -192,6 +193,19 @@ def extract_static_branch_counts(
     log(f"[BRANCH DEBUG] Build dir: {build_dir}")
     log(f"[BRANCH DEBUG] Processing {len(source_files)} source files")
     
+    # Build a map of source filenames to their .gcno files
+    # .gcno files are in CMake subdirs like: build/src/math/lp/CMakeFiles/lp.dir/nra_solver.cpp.gcno
+    gcno_map = {}
+    build_path = Path(build_dir)
+    for gcno_file in build_path.rglob("*.gcno"):
+        # Extract the source filename (e.g., "nra_solver.cpp" from "nra_solver.cpp.gcno")
+        source_name = gcno_file.name
+        if source_name.endswith('.gcno'):
+            source_name = source_name[:-5]  # Remove .gcno
+        gcno_map[source_name] = gcno_file
+    
+    log(f"[BRANCH DEBUG] Found {len(gcno_map)} .gcno files in build directory")
+    
     for source_file in source_files:
         try:
             # Construct full path to source file
@@ -201,12 +215,23 @@ def extract_static_branch_counts(
                 log(f"[BRANCH DEBUG] Source file not found: {full_source_path}")
                 continue
             
+            # Find the corresponding .gcno file
+            source_filename = os.path.basename(source_file)
+            if source_filename not in gcno_map:
+                log(f"[BRANCH DEBUG] No .gcno file found for {source_filename}")
+                continue
+            
+            gcno_file = gcno_map[source_filename]
+            gcno_dir = str(gcno_file.parent)
+            
             log(f"[BRANCH DEBUG] Running gcov on: {full_source_path}")
+            log(f"[BRANCH DEBUG]   .gcno location: {gcno_file}")
             
             # Run gcov with intermediate format to get static branch structure
             # -i: intermediate format, -b: branches, -a: all blocks
+            # -o gcno_dir: tells gcov where the .gcno file is
             result = subprocess.run(
-                ['gcov', '-i', '-b', '-a', '-o', build_dir, full_source_path],
+                ['gcov', '-i', '-b', '-a', '-o', gcno_dir, full_source_path],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -234,7 +259,9 @@ def extract_static_branch_counts(
                 if line.startswith('file:'):
                     current_file = line[5:]
                     # Normalize to relative path
-                    if '/z3/' in current_file:
+                    if '/cvc5/' in current_file:
+                        current_file = current_file.split('/cvc5/', 1)[1]
+                    elif '/z3/' in current_file:
                         current_file = current_file.split('/z3/', 1)[1]
                     log(f"[BRANCH DEBUG]   file: {current_file}")
                 
