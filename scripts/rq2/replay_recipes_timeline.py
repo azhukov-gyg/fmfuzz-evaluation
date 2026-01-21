@@ -260,44 +260,46 @@ def extract_coverage_fastcov(
     return result
 
 
-def regenerate_mutation(seed_path: str, rng_seed: int, iteration: int, chain: List[int]) -> Optional[str]:
+def regenerate_mutation(seed_path: str, rng_seed: int, iteration: int) -> Optional[str]:
     """Regenerate a mutation from a recipe."""
     if not YINYANG_AVAILABLE:
         return None
     
     try:
-        with mutation_timeout(MUTATION_TIMEOUT):
-            # Parse seed
-            with open(seed_path, 'r') as f:
-                seed_content = f.read()
-            
-            formula = InlineTypeFuzz.parse_formula_cached(seed_content, seed_path)
-            if formula is None:
-                return None
-            
-            # If chain exists, regenerate chain first
-            if chain:
-                formula = InlineTypeFuzz.regenerate_chain(formula, seed_path, rng_seed, chain, dry=True)
-                if formula is None:
-                    return None
-            
-            # Generate the target mutation
-            mutator = InlineTypeFuzz(str(seed_path))
-            random.seed(rng_seed)
-            mutator.rng = random.Random(rng_seed)
-            
-            for _ in range(iteration):
-                mutator.rng.randint(0, 1000000)
-            
-            mutated = mutator.mutate_formula(formula, is_typed=True)
-            if mutated is None:
-                return None
-            
-            return str(mutated)
+        # Create fuzzer from seed file
+        fuzzer = InlineTypeFuzz(Path(seed_path))
+        
+        # Parse with timeout
+        try:
+            with mutation_timeout(PARSE_TIMEOUT):
+                parse_ok = fuzzer.parse()
+        except MutationTimeout:
+            log(f"  PARSE TIMEOUT {seed_path}")
+            return None
+        
+        if not parse_ok:
+            log(f"  PARSE FAILED {seed_path}")
+            return None
+        
+        # Initialize RNG
+        random.seed(rng_seed)
+        
+        # Generate mutations up to target iteration
+        mutant = None
+        success = False
+        try:
+            with mutation_timeout(MUTATION_TIMEOUT):
+                for i in range(iteration + 1):
+                    mutant, success = fuzzer.mutate()
+        except MutationTimeout:
+            log(f"  MUTATION TIMEOUT {seed_path} iter={iteration}")
+            return None
+        
+        if success and mutant:
+            return mutant
+        else:
+            return None
     
-    except MutationTimeout:
-        log(f"  TIMEOUT regenerating {seed_path} iter={iteration}")
-        return None
     except Exception as e:
         log(f"  ERROR regenerating {seed_path}: {e}")
         return None
@@ -478,8 +480,14 @@ def replay_recipes_timeline(
         if (idx + 1) % 100 == 0:
             log(f"Processing recipe {idx+1}/{len(recipes_with_ts)} (t={recipe['timestamp']:.1f}s)...")
         
+        # Skip recipes with chains (not supported in timeline mode)
+        if chain:
+            log(f"  SKIPPED {seed_path} (chains not supported in timeline mode)")
+            failed += 1
+            continue
+        
         # Regenerate mutation
-        mutated_content = regenerate_mutation(seed_path, rng_seed, iteration, chain)
+        mutated_content = regenerate_mutation(seed_path, rng_seed, iteration)
         if mutated_content is None:
             failed += 1
             continue
