@@ -298,10 +298,11 @@ def extract_static_branch_counts(
             
             # Run gcov with JSON format to get static branch structure  
             # -t: output to stdout (not file)
+            # -b: include branch probabilities (required for branch data in JSON)
             # --json-format: machine-readable JSON output
             # --object-file: specify the .gcno file directly (avoids naming issues)
             result = subprocess.run(
-                ['gcov', '-t', '--json-format', '--object-file', str(gcno_file), full_source_path],
+                ['gcov', '-t', '-b', '--json-format', '--object-file', str(gcno_file), full_source_path],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -719,18 +720,23 @@ def extract_coverage_fastcov(
                 
                 log(f"[BRANCH DEBUG] Returned from extract_static_branch_counts")
                 log(f"[BRANCH DEBUG] Got static branch counts for {len(static_branch_counts)} functions")
-            else:
-                log(f"[BRANCH DEBUG] Skipping static branch extraction (no exact_function_ranges)")
                 
-                # Recalculate branches_total using static counts
+                # Recalculate branches_total using static counts from .gcno files
+                # This ensures we count ALL branches in changed functions, even in uncalled functions
                 # Keep branches_taken as is (from fastcov execution data)
                 if static_branch_counts:
+                    old_total = result["summary"]["branches_total"]
                     # Clear and recalculate total branches
                     result["summary"]["branches_total"] = 0
                     
                     for range_key, static_count in static_branch_counts.items():
                         result["summary"]["branches_total"] += static_count
                         log(f"[BRANCH DEBUG]   {range_key}: {static_count} branches (static)")
+                    
+                    log(f"[BRANCH DEBUG] Updated branches_total: {old_total} (fastcov) -> {result['summary']['branches_total']} (static)")
+                    log(f"[BRANCH DEBUG] Branches taken (unchanged): {result['summary']['branches_taken']}")
+            else:
+                log(f"[BRANCH DEBUG] Skipping static branch extraction (no exact_function_ranges)")
             
             log(f"[GCOV DEBUG] Total functions found: {total_funcs_found}")
             log(f"[GCOV DEBUG] Found {len(all_funcs)} functions with >0 execution count")
