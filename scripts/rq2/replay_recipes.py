@@ -145,13 +145,25 @@ def extract_command_line_flags(test_path: str) -> str:
     return command_line
 
 
-def load_changed_functions(changed_functions_file: str) -> Set[str]:
-    """Load changed function names from JSON file."""
+def load_changed_functions(changed_functions_file: str) -> tuple:
+    """
+    Load changed function names and their exact line ranges from JSON file.
+    
+    Returns:
+        (functions: Set[str], function_ranges: Dict[str, tuple])
+        - functions: Set of function keys like "src/file.cpp:func_name:123"
+        - function_ranges: Dict mapping "src/file.cpp:123" -> (start_line, end_line)
+    """
     try:
         with open(changed_functions_file, 'r') as f:
             data = json.load(f)
         
         functions = set()
+        function_ranges = {}  # Maps "file:start_line" -> (start, end)
+        
+        # Load function_info_map if available (has exact start/end lines)
+        function_info_map = data.get('function_info_map', {})
+        
         if 'functions' in data:
             for fn in data['functions']:
                 if isinstance(fn, dict):
@@ -169,19 +181,41 @@ def load_changed_functions(changed_functions_file: str) -> Set[str]:
                 elif isinstance(fn, str):
                     functions.add(fn)
         
-        return functions
+        # Extract exact line ranges from function_info_map
+        for func_key, info in function_info_map.items():
+            if isinstance(info, dict):
+                file_path = info.get('file', '')
+                start = info.get('start', 0)
+                end = info.get('end', 0)
+                if file_path and start and end:
+                    # Key format: "file_path:start_line"
+                    range_key = f"{file_path}:{start}"
+                    function_ranges[range_key] = (start, end)
+                    log(f"[FUNC RANGE] Loaded exact range: {file_path}:{start}-{end}")
+        
+        if function_ranges:
+            log(f"Loaded {len(function_ranges)} exact function ranges from function_info_map")
+        else:
+            log("No function_info_map found - will use GCOV heuristics for line ranges")
+        
+        return functions, function_ranges
     except Exception as e:
         log(f"Error loading changed functions: {e}")
-        return set()
+        return set(), {}
 
 
 def extract_coverage_fastcov(
     build_dir: str,
     gcov_cmd: str,
-    changed_functions: Set[str]
+    changed_functions: Set[str],
+    exact_function_ranges: Dict[str, tuple] = None
 ) -> Dict[str, any]:
     """
     Extract function, line, and branch coverage from gcov data using fastcov.
+    
+    Args:
+        exact_function_ranges: Optional dict mapping "file:start_line" -> (start, end)
+                               for 100% accurate function boundaries.
     
     Returns dict with:
         - function_counts: {func_key: call_count}
@@ -335,11 +369,35 @@ def extract_coverage_fastcov(
                         marker = " <-- WANTED" if sl in wanted else ""
                         log(f"[GCOV DEBUG]     line {sl}: {ec} calls{marker}")
                 
+                # First: collect all function start lines in this file to estimate end lines
+                # GCOV doesn't provide end_line, so we use next function's start_line - 1
+                all_func_starts = sorted(set(fd.get('start_line', 0) for fd in funcs.values()))
+                
+                # Get max line number from lines_data for last-function fallback
+                max_file_line = max((int(ln) for ln in lines_data.keys()), default=0) if lines_data else 0
+                
+                def get_end_line(file_path: str, start: int) -> int:
+                    """Get function end line - use exact range if available, else estimate."""
+                    # Try exact range from function_info_map first
+                    if exact_function_ranges:
+                        range_key = f"{file_path}:{start}"
+                        if range_key in exact_function_ranges:
+                            exact_start, exact_end = exact_function_ranges[range_key]
+                            return exact_end
+                    
+                    # Fallback: estimate from next function start
+                    for next_start in all_func_starts:
+                        if next_start > start:
+                            return next_start - 1
+                    # Last function in file - use max known line from GCOV data
+                    return max_file_line if max_file_line > start else start + 200
+                
                 # Extract function counts and build line ranges for changed functions
                 for func_name, func_data in funcs.items():
                     exec_count = func_data.get('execution_count', 0)
                     start_line = func_data.get('start_line', 0)
-                    end_line = func_data.get('end_line', start_line)  # Default to start if no end
+                    # Use exact range if available, else GCOV's end_line, else estimate
+                    end_line = func_data.get('end_line') or get_end_line(source_relative, start_line)
                     
                     if exec_count > 0:
                         all_funcs.append((func_name, exec_count))
@@ -349,6 +407,12 @@ def extract_coverage_fastcov(
                     if match_key in changed_file_lines:
                         full_key = changed_file_lines[match_key]
                         result["function_counts"][full_key] = result["function_counts"].get(full_key, 0) + exec_count
+                        
+                        # Warn if function range is suspiciously short (likely declaration-only)
+                        range_size = end_line - start_line + 1
+                        if range_size <= 3:
+                            log(f"[GCOV DEBUG] WARNING: very short function range {start_line}-{end_line} ({range_size} lines) - may be declaration only")
+                        
                         if exec_count > 0:
                             log(f"[GCOV DEBUG] MATCHED: {source_relative}:{start_line}-{end_line} -> {exec_count} calls")
                         
@@ -1210,10 +1274,12 @@ def replay_recipes_two_phase(
             json.dump(results, f, indent=2)
         return results
     
-    # Load changed functions
+    # Load changed functions and their exact line ranges
     log(f"Loading changed functions from: {changed_functions_file}")
-    changed_functions = load_changed_functions(changed_functions_file)
+    changed_functions, exact_function_ranges = load_changed_functions(changed_functions_file)
     log(f"Tracking {len(changed_functions)} changed functions")
+    if exact_function_ranges:
+        log(f"Using {len(exact_function_ranges)} exact function line ranges from function_info_map")
     
     # Group recipes by seed
     log("Grouping recipes by seed...")
@@ -1420,7 +1486,7 @@ def replay_recipes_two_phase(
     log("Extracting coverage data")
     log("=" * 60)
     
-    coverage_data = extract_coverage_fastcov(build_dir, gcov_cmd, changed_functions)
+    coverage_data = extract_coverage_fastcov(build_dir, gcov_cmd, changed_functions, exact_function_ranges)
     function_counts = coverage_data.get("function_counts", {})
     total_function_calls = sum(function_counts.values())
     
@@ -1569,10 +1635,12 @@ def replay_recipes_optimized(
             json.dump(results, f, indent=2)
         return results
     
-    # Load changed functions
+    # Load changed functions and their exact line ranges
     log(f"Loading changed functions from: {changed_functions_file}")
-    changed_functions = load_changed_functions(changed_functions_file)
+    changed_functions, exact_function_ranges = load_changed_functions(changed_functions_file)
     log(f"Tracking {len(changed_functions)} changed functions")
+    if exact_function_ranges:
+        log(f"Using {len(exact_function_ranges)} exact function line ranges from function_info_map")
     
     # Group recipes by seed for efficient processing
     log("Grouping recipes by seed...")
@@ -1806,7 +1874,7 @@ def replay_recipes_optimized(
     # Extract coverage once at the end (all .gcda files have accumulated)
     log("")
     log("All workers finished. Extracting coverage (functions, lines, branches)...")
-    coverage_data = extract_coverage_fastcov(build_dir, gcov_cmd, changed_functions)
+    coverage_data = extract_coverage_fastcov(build_dir, gcov_cmd, changed_functions, exact_function_ranges)
     
     # Initialize function counts with zeros for all tracked functions
     function_counts: Dict[str, int] = {fn: 0 for fn in changed_functions}
