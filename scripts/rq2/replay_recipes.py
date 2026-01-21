@@ -208,6 +208,83 @@ def load_changed_functions(changed_functions_file: str) -> tuple:
         return set(), {}
 
 
+def extract_static_branch_counts(
+    build_dir: str,
+    source_files: Set[str],
+    exact_function_ranges: Dict[str, tuple]
+) -> Dict[str, int]:
+    """
+    Extract static branch counts from .gcno files using gcov intermediate format.
+    
+    Args:
+        build_dir: Directory containing .gcno/.gcda files
+        source_files: Set of source file paths to process
+        exact_function_ranges: Dict mapping "file:start_line" -> (start, end)
+    
+    Returns:
+        Dict mapping "file:start_line" -> total_branches_in_function
+    """
+    import subprocess
+    
+    branch_counts = {}
+    
+    for source_file in source_files:
+        try:
+            # Run gcov with intermediate format to get static branch structure
+            # -i: intermediate format, -b: branches, -a: all blocks
+            result = subprocess.run(
+                ['gcov', '-i', '-b', '-a', '-o', build_dir, source_file],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode != 0:
+                continue
+            
+            # Parse intermediate format output
+            current_file = None
+            function_branches = {}  # {range_key: count}
+            
+            for line in result.stdout.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                if line.startswith('file:'):
+                    current_file = line[5:]
+                    # Normalize to relative path
+                    if '/cvc5/' in current_file:
+                        current_file = current_file.split('/cvc5/', 1)[1]
+                
+                elif line.startswith('branch:'):
+                    # Format: branch:LINE_NUM,taken or branch:LINE_NUM,nottaken
+                    parts = line[7:].split(',')
+                    if len(parts) >= 1:
+                        try:
+                            branch_line = int(parts[0])
+                            # Find which function this branch belongs to
+                            for range_key, (start, end) in exact_function_ranges.items():
+                                file_path, start_str = range_key.rsplit(':', 1)
+                                func_start = int(start_str)
+                                if current_file == file_path and start <= branch_line <= end:
+                                    if range_key not in function_branches:
+                                        function_branches[range_key] = 0
+                                    function_branches[range_key] += 1
+                                    break
+                        except (ValueError, IndexError):
+                            pass
+            
+            branch_counts.update(function_branches)
+            log(f"[BRANCH DEBUG] {source_file}: extracted {len(function_branches)} functions with branches")
+            
+        except Exception as e:
+            log(f"[BRANCH DEBUG] Error processing {source_file}: {e}")
+            continue
+    
+    return branch_counts
+
+
 def extract_coverage_fastcov(
     build_dir: str,
     gcov_cmd: str,
@@ -324,6 +401,18 @@ def extract_coverage_fastcov(
             # {relative_path: [(start_line, end_line), ...]} for changed functions only
             func_line_ranges = {}
             
+            # PRE-POPULATE with exact function ranges so uncalled functions are still counted
+            if exact_function_ranges:
+                for range_key, (start, end) in exact_function_ranges.items():
+                    # range_key format: "src/theory/arith/linear_equality.cpp:51"
+                    parts = range_key.rsplit(':', 1)
+                    if len(parts) == 2:
+                        file_path = parts[0]
+                        if file_path not in func_line_ranges:
+                            func_line_ranges[file_path] = []
+                        func_line_ranges[file_path].append((start, end))
+                        log(f"[GCOV DEBUG] PRE-POPULATED range: {file_path}:{start}-{end}")
+            
             # Show sample of functions found
             all_funcs = []
             for source_file, source_data in sources.items():
@@ -421,9 +510,12 @@ def extract_coverage_fastcov(
                             log(f"[GCOV DEBUG] MATCHED: {source_relative}:{start_line}-{end_line} -> {exec_count} calls")
                         
                         # Record this function's line range for filtering line/branch coverage
+                        # Only add if not already pre-populated from exact_function_ranges
                         if source_relative not in func_line_ranges:
                             func_line_ranges[source_relative] = []
-                        func_line_ranges[source_relative].append((start_line, end_line))
+                        range_tuple = (start_line, end_line)
+                        if range_tuple not in func_line_ranges[source_relative]:
+                            func_line_ranges[source_relative].append(range_tuple)
                 
                 # Helper to check if a line is within any changed function's range
                 def line_in_changed_function(file_path: str, line: int) -> bool:
@@ -434,39 +526,74 @@ def extract_coverage_fastcov(
                     return False
                 
                 # Extract line coverage ONLY for lines within changed functions
-                if is_target_file and lines_data and source_relative in func_line_ranges:
-                    for line_num_str, hit_count in lines_data.items():
-                        try:
-                            line_num = int(line_num_str)
-                            # Only count if this line is within a changed function
-                            if line_in_changed_function(source_relative, line_num):
+                if is_target_file and source_relative in func_line_ranges:
+                    if lines_data:
+                        for line_num_str, hit_count in lines_data.items():
+                            try:
+                                line_num = int(line_num_str)
+                                # Only count if this line is within a changed function
+                                if line_in_changed_function(source_relative, line_num):
+                                    line_key = f"{source_relative}:{line_num}"
+                                    result["line_coverage"][line_key] = hit_count
+                                    result["summary"]["lines_total"] += 1
+                                    if hit_count > 0:
+                                        result["summary"]["lines_hit"] += 1
+                            except (ValueError, TypeError):
+                                pass
+                    else:
+                        # No GCOV data (all functions uncalled) - count lines with 0 hits
+                        for start_line, end_line in func_line_ranges[source_relative]:
+                            for line_num in range(start_line, end_line + 1):
                                 line_key = f"{source_relative}:{line_num}"
-                                result["line_coverage"][line_key] = hit_count
+                                result["line_coverage"][line_key] = 0
                                 result["summary"]["lines_total"] += 1
-                                if hit_count > 0:
-                                    result["summary"]["lines_hit"] += 1
-                        except (ValueError, TypeError):
-                            pass
                 
                 # Extract branch coverage ONLY for branches within changed functions
                 # fastcov branch format with --branch-coverage: {line_num_str: [taken_count, taken_count, ...]}
                 # Each pair of values represents taken/not-taken for a branch
-                if is_target_file and branches_data and isinstance(branches_data, dict) and source_relative in func_line_ranges:
-                    for line_num_str, branch_counts in branches_data.items():
-                        try:
-                            line_num = int(line_num_str)
-                            # Only count if this branch is within a changed function
-                            if line_in_changed_function(source_relative, line_num):
-                                # branch_counts is a list of taken counts for all branches on this line
-                                # Process pairs: branch_counts[0::2] are one direction, [1::2] are other
-                                for branch_idx, taken_count in enumerate(branch_counts):
-                                    branch_key = f"{source_relative}:{line_num}:{branch_idx}"
-                                    result["branch_coverage"][branch_key] = taken_count
-                                    result["summary"]["branches_total"] += 1
-                                    if taken_count > 0:
-                                        result["summary"]["branches_taken"] += 1
-                        except (ValueError, TypeError):
-                            pass
+                if is_target_file and source_relative in func_line_ranges:
+                    if branches_data and isinstance(branches_data, dict):
+                        for line_num_str, branch_counts in branches_data.items():
+                            try:
+                                line_num = int(line_num_str)
+                                # Only count if this branch is within a changed function
+                                if line_in_changed_function(source_relative, line_num):
+                                    # branch_counts is a list of taken counts for all branches on this line
+                                    # Process pairs: branch_counts[0::2] are one direction, [1::2] are other
+                                    for branch_idx, taken_count in enumerate(branch_counts):
+                                        branch_key = f"{source_relative}:{line_num}:{branch_idx}"
+                                        result["branch_coverage"][branch_key] = taken_count
+                                        result["summary"]["branches_total"] += 1
+                                        if taken_count > 0:
+                                            result["summary"]["branches_taken"] += 1
+                            except (ValueError, TypeError):
+                                pass
+            
+            # Extract static branch counts for ALL functions (including uncalled)
+            if exact_function_ranges:
+                log(f"[BRANCH DEBUG] Extracting static branch counts from .gcno files...")
+                source_files_for_branches = set()
+                for range_key in exact_function_ranges.keys():
+                    file_path = range_key.rsplit(':', 1)[0]
+                    source_files_for_branches.add(file_path)
+                
+                static_branch_counts = extract_static_branch_counts(
+                    build_dir, 
+                    source_files_for_branches,
+                    exact_function_ranges
+                )
+                
+                log(f"[BRANCH DEBUG] Got static branch counts for {len(static_branch_counts)} functions")
+                
+                # Recalculate branches_total using static counts
+                # Keep branches_taken as is (from fastcov execution data)
+                if static_branch_counts:
+                    # Clear and recalculate total branches
+                    result["summary"]["branches_total"] = 0
+                    
+                    for range_key, static_count in static_branch_counts.items():
+                        result["summary"]["branches_total"] += static_count
+                        log(f"[BRANCH DEBUG]   {range_key}: {static_count} branches (static)")
             
             log(f"[GCOV DEBUG] Total functions found: {total_funcs_found}")
             log(f"[GCOV DEBUG] Found {len(all_funcs)} functions with >0 execution count")
