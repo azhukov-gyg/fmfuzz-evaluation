@@ -143,8 +143,12 @@ def load_changed_functions(changed_functions_file: str) -> tuple:
                 start = info.get('start', 0)
                 end = info.get('end', 0)
                 if file_path and start and end:
+                    # Normalize path to relative format (strip /z3/ prefix if present)
+                    normalized_path = file_path
+                    if '/z3/' in file_path:
+                        normalized_path = file_path.split('/z3/', 1)[1]
                     # Key format: "file_path:start_line"
-                    range_key = f"{file_path}:{start}"
+                    range_key = f"{normalized_path}:{start}"
                     function_ranges[range_key] = (start, end)
                     log(f"[FUNC RANGE] Loaded exact range: {file_path}:{start}-{end}")
         
