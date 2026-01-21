@@ -12,6 +12,11 @@ on:
         required: false
         type: boolean
         default: false
+      timeline_mode:
+        description: 'Enable timeline mode for cumulative coverage tracking (default: false)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   # ============================================================
@@ -335,9 +340,35 @@ jobs:
           echo "=== Starting recipe replay for job ${{ matrix.job_id }} ==="
           echo "    Seeds file: $SEEDS_FILE"
           echo "    Seeds count: ${{ steps.job-params.outputs.seed_count }}"
-          
+          echo "    Timeline mode: ${{ inputs.timeline_mode }}"
           # Run from z3/ directory so seed paths in recipes resolve correctly
-          python3 ${{ github.workspace }}/scripts/z3/rq2/replay_recipes.py \
+          if [ "${{ inputs.timeline_mode }}" = "true" ]; then
+            echo "Using timeline mode (exact timestamp order processing)"
+            python3 ${{ github.workspace }}/scripts/z3/rq2/replay_recipes_timeline.py \
+              --recipe-file ../recipes.jsonl \
+              --solver-path ./build/z3 \
+              --build-dir ./build \
+              --changed-functions ../changed_functions.json \
+              --output ../measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}.json \
+              --gcov-cmd gcov-14 \
+              --timeout 120 \
+              --seeds-file "$SEEDS_FILE" \
+              --z3-memory-mb 4096 \
+              --checkpoint-interval 60
+          else
+            echo "Using standard mode (parallel, grouped by seed)"
+            python3 ${{ github.workspace }}/scripts/z3/rq2/replay_recipes.py \
+              ../recipes.jsonl \
+              --solver ./build/z3 \
+              --build-dir ./build \
+              --changed-functions ../changed_functions.json \
+              --output ../measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}.json \
+              --gcov gcov-14 \
+              --timeout 120 \
+              --num-workers 4 \
+              --seeds-file "$SEEDS_FILE" \
+              --legacy
+          fi
             ../recipes.jsonl \
             --solver ./build/z3 \
             --build-dir ./build \
@@ -347,7 +378,8 @@ jobs:
             --timeout 120 \
             --num-workers 4 \
             --seeds-file "$SEEDS_FILE" \
-            --legacy
+            --legacy \
+            ${{ inputs.timeline_mode && '--timeline-mode --checkpoint-interval 60' || '' }}
           
           echo "=== Measurement complete for job ${{ matrix.job_id }} ==="
       
@@ -367,7 +399,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: baseline-measurement-result-${{ matrix.commit }}-job${{ matrix.job_id }}
-          path: measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}.json
+          path: |
+            measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}.json
+            measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}_timeline.jsonl
           if-no-files-found: ignore
 
   # ============================================================
@@ -404,7 +438,7 @@ jobs:
       
       - name: Merge job results
         run: |
-          RESULT_FILES=$(find results-artifacts -name "measurement_result_*.json" | sort)
+          RESULT_FILES=$(find results-artifacts -name "measurement_result_*.json" -not -name "*_timeline.jsonl" | sort)
           FILE_COUNT=$(echo "$RESULT_FILES" | grep -c . || echo 0)
           
           echo "Found $FILE_COUNT result files to merge"
@@ -421,6 +455,27 @@ jobs:
           echo ""
           echo "=== MERGED MEASUREMENT RESULTS ==="
           cat merged_measurement_${{ matrix.commit }}.json | python3 -m json.tool
+      
+      - name: Merge timeline data
+        if: inputs.timeline_mode
+        run: |
+          TIMELINE_FILES=$(find results-artifacts -name "*_timeline.jsonl" | sort)
+          FILE_COUNT=$(echo "$TIMELINE_FILES" | grep -c . || echo 0)
+          
+          echo "Found $FILE_COUNT timeline files to merge"
+          
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "⚠️ No timeline files found"
+          else
+            python3 scripts/rq2/merge_timelines.py \
+              $TIMELINE_FILES \
+              --output cumulative_timeline_${{ matrix.commit }}.json \
+              --checkpoint-interval 60
+            
+            echo ""
+            echo "=== CUMULATIVE TIMELINE ==="
+            cat cumulative_timeline_${{ matrix.commit }}.json | python3 -m json.tool
+          fi
       
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5.1.0
@@ -448,3 +503,23 @@ jobs:
             --body measurement_${COMMIT_HASH}.json.gz
           
           echo "✅ Uploaded baseline measurement results to S3: $S3_KEY"
+      
+      - name: Upload timeline to S3
+        if: always() && !inputs.dry_run && inputs.timeline_mode
+        run: |
+          COMMIT_HASH="${{ matrix.commit }}"
+          S3_KEY="evaluation/rq2/z3/measurement-results/baseline/timeline-${COMMIT_HASH}.json.gz"
+          
+          if [ ! -f "cumulative_timeline_${{ matrix.commit }}.json" ]; then
+            echo "⚠️ Timeline file not found, skipping upload"
+            exit 0
+          fi
+          
+          gzip -c "cumulative_timeline_${{ matrix.commit }}.json" > timeline_${COMMIT_HASH}.json.gz
+          
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body timeline_${COMMIT_HASH}.json.gz
+          
+          echo "✅ Uploaded baseline timeline to S3: $S3_KEY"
