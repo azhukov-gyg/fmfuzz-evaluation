@@ -341,6 +341,7 @@ jobs:
           echo "    Seeds file: $SEEDS_FILE"
           echo "    Seeds count: ${{ steps.job-params.outputs.seed_count }}"
           echo "    Timeline mode: ${{ inputs.timeline_mode }}"
+          
           # Run from z3/ directory so seed paths in recipes resolve correctly
           if [ "${{ inputs.timeline_mode }}" = "true" ]; then
             echo "Using timeline mode (exact timestamp order processing)"
@@ -369,17 +370,6 @@ jobs:
               --seeds-file "$SEEDS_FILE" \
               --legacy
           fi
-            ../recipes.jsonl \
-            --solver ./build/z3 \
-            --build-dir ./build \
-            --changed-functions ../changed_functions.json \
-            --output ../measurement_result_${{ matrix.commit }}_job${{ matrix.job_id }}.json \
-            --gcov gcov-14 \
-            --timeout 120 \
-            --num-workers 4 \
-            --seeds-file "$SEEDS_FILE" \
-            --legacy \
-            ${{ inputs.timeline_mode && '--timeline-mode --checkpoint-interval 60' || '' }}
           
           echo "=== Measurement complete for job ${{ matrix.job_id }} ==="
       
