@@ -388,8 +388,7 @@ def extract_coverage_fastcov(
     build_dir: str,
     gcov_cmd: str,
     changed_functions: Set[str],
-    exact_function_ranges: Dict[str, tuple] = None,
-    static_branch_counts: Dict[str, int] = None
+    exact_function_ranges: Dict[str, tuple] = None
 ) -> Dict[str, any]:
     """
     Extract function, line, and branch coverage from gcov data using fastcov.
@@ -554,8 +553,8 @@ def extract_coverage_fastcov(
                             except (ValueError, TypeError):
                                 pass
             
-            # Use pre-computed static branch counts if provided, otherwise extract them
-            if static_branch_counts is None and exact_function_ranges:
+            # Extract static branch counts from .gcno files
+            if exact_function_ranges:
                 source_files_for_branches = set()
                 for range_key in exact_function_ranges.keys():
                     file_path = range_key.rsplit(':', 1)[0]
@@ -567,11 +566,10 @@ def extract_coverage_fastcov(
                     exact_function_ranges,
                     filter_system_branches=True
                 )
-            
-            # Use static counts for total (whether pre-computed or just extracted)
-            if static_branch_counts:
-                # Use static counts for total, keep execution data for taken
-                result["summary"]["branches_total"] = sum(static_branch_counts.values())
+                
+                if static_branch_counts:
+                    # Use static counts for total, keep execution data for taken
+                    result["summary"]["branches_total"] = sum(static_branch_counts.values())
     
     except Exception as e:
         log(f"WARNING: fastcov error: {e}")
@@ -828,26 +826,6 @@ def replay_recipes_timeline(
     log("Resetting gcda files...")
     reset_gcda_files(build_dir)
     
-    # Extract static branch counts ONCE before any tests run
-    # This ensures all checkpoints use the same denominators
-    log("Extracting static branch counts from .gcno files...")
-    source_files_for_branches = set()
-    if exact_function_ranges:
-        for range_key in exact_function_ranges.keys():
-            file_path = range_key.rsplit(':', 1)[0]
-            source_files_for_branches.add(file_path)
-        
-        static_branch_counts_cache = extract_static_branch_counts(
-            build_dir,
-            source_files_for_branches,
-            exact_function_ranges,
-            filter_system_branches=True
-        )
-        log(f"Loaded {len(static_branch_counts_cache)} static branch counts")
-    else:
-        static_branch_counts_cache = {}
-        log("No exact_function_ranges - skipping static branch extraction")
-    
     # Create temp directory for test files
     test_output_dir = tempfile.mkdtemp(prefix='timeline_tests_')
     log(f"Test directory: {test_output_dir}")
@@ -879,8 +857,7 @@ def replay_recipes_timeline(
                     build_dir=build_dir,
                     gcov_cmd=gcov_cmd,
                     changed_functions=changed_functions,
-                    exact_function_ranges=exact_function_ranges,
-                    static_branch_counts=static_branch_counts_cache
+                    exact_function_ranges=exact_function_ranges
                 )
                 
                 extract_time = time.time() - extract_start
@@ -975,8 +952,7 @@ def replay_recipes_timeline(
         build_dir=build_dir,
         gcov_cmd=gcov_cmd,
         changed_functions=changed_functions,
-        exact_function_ranges=exact_function_ranges,
-        static_branch_counts=static_branch_counts_cache
+        exact_function_ranges=exact_function_ranges
     )
     
     final_checkpoint = {
