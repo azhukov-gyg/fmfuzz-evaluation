@@ -162,97 +162,234 @@ def extract_static_branch_counts(
     filter_system_branches: bool = True
 ) -> Dict[str, int]:
     """
-    Extract static branch counts for changed functions from .gcno files.
+    Extract static branch counts from .gcno files using gcov intermediate format.
     
     Args:
-        build_dir: Build directory containing .gcno files
-        source_files: Set of relative source file paths we care about
+        build_dir: Directory containing .gcno/.gcda files
+        source_files: Set of source file paths (relative, like "src/math/lp/nra_solver.cpp")
         exact_function_ranges: Dict mapping "file:start_line" -> (start, end)
-        filter_system_branches: If True, exclude branches from system/STL/utility code
+        filter_system_branches: If True, exclude branches from system headers (default: True)
     
     Returns:
-        Dict mapping "file:start_line" -> branch_count
+        Dict mapping "file:start_line" -> total_branches_in_function
     """
-    result = {}
+    import subprocess
+    import os
+    from pathlib import Path
     
-    # Find all .gcno files
-    gcno_files = list(Path(build_dir).rglob("*.gcno"))
+    log(f"[BRANCH DEBUG] ========================================")
+    log(f"[BRANCH DEBUG] FUNCTION CALLED: extract_static_branch_counts")
+    log(f"[BRANCH DEBUG] ========================================")
     
-    for gcno_path in gcno_files:
-        # Try to match .gcno to a source file we care about
-        # .gcno filename is usually based on .cpp filename
-        gcno_name = gcno_path.stem  # e.g., "nlsat_explain" from "nlsat_explain.gcno"
-        
-        # Find matching source file(s)
-        matching_sources = [sf for sf in source_files if gcno_name in sf]
-        if not matching_sources:
-            continue
-        
-        # Run gcov to get branch information
+    branch_counts = {}
+    
+    # Find the source root by going up from build_dir
+    # build_dir is typically /path/to/z3/build, source root is /path/to/z3
+    source_root = os.path.dirname(build_dir)
+    
+    log(f"[BRANCH DEBUG] Source root: {source_root}")
+    log(f"[BRANCH DEBUG] Build dir: {build_dir}")
+    log(f"[BRANCH DEBUG] Input source_files ({len(source_files)}): {source_files}")
+    log(f"[BRANCH DEBUG] Input exact_function_ranges ({len(exact_function_ranges)} entries)")
+    for key in list(exact_function_ranges.keys())[:5]:
+        log(f"[BRANCH DEBUG]   {key} -> {exact_function_ranges[key]}")
+    
+    # Build a map of source filenames to their .gcno files
+    # .gcno files are in CMake subdirs like: build/src/math/lp/CMakeFiles/lp.dir/nra_solver.cpp.gcno
+    log(f"[BRANCH DEBUG] Searching for .gcno files in: {build_dir}")
+    gcno_map = {}
+    build_path = Path(build_dir)
+    gcno_count = 0
+    for gcno_file in build_path.rglob("*.gcno"):
+        gcno_count += 1
+        # Extract the source filename (e.g., "nra_solver.cpp" from "nra_solver.cpp.gcno")
+        source_name = gcno_file.name
+        if source_name.endswith('.gcno'):
+            source_name = source_name[:-5]  # Remove .gcno
+        gcno_map[source_name] = gcno_file
+        if gcno_count <= 3:
+            log(f"[BRANCH DEBUG]   Sample .gcno: {gcno_file} -> {source_name}")
+    
+    log(f"[BRANCH DEBUG] Found {len(gcno_map)} .gcno files (iterated {gcno_count} total)")
+    if len(gcno_map) > 0:
+        log(f"[BRANCH DEBUG] Sample entries from gcno_map:")
+        for key in list(gcno_map.keys())[:5]:
+            log(f"[BRANCH DEBUG]   '{key}' -> {gcno_map[key]}")
+    
+    log(f"[BRANCH DEBUG] Starting to process {len(source_files)} source files...")
+    for idx, source_file in enumerate(source_files):
+        log(f"[BRANCH DEBUG] [{idx+1}/{len(source_files)}] Processing: {source_file}")
         try:
-            result_gcov = subprocess.run(
-                ["gcov", "-b", "-c", str(gcno_path)],
-                capture_output=True,
-                text=True,
-                cwd=gcno_path.parent,
-                timeout=30
-            )
+            # Construct full path to source file
+            full_source_path = os.path.join(source_root, source_file)
+            log(f"[BRANCH DEBUG]   Full path: {full_source_path}")
+            log(f"[BRANCH DEBUG]   Exists: {os.path.exists(full_source_path)}")
             
-            if result_gcov.returncode != 0:
+            if not os.path.exists(full_source_path):
+                log(f"[BRANCH DEBUG] Source file not found: {full_source_path}")
                 continue
             
-            # Parse gcov output to count branches per function
-            # gcov format: "function <name> called <count> returned <pct>% blocks executed <pct>%"
-            # followed by "branch <num> ..." lines
-            current_func_name = None
-            current_func_line = None
-            current_branch_count = 0
+            # Find the corresponding .gcno file
+            source_filename = os.path.basename(source_file)
+            log(f"[BRANCH DEBUG]   Basename: {source_filename}")
+            log(f"[BRANCH DEBUG]   In gcno_map: {source_filename in gcno_map}")
             
-            for line in result_gcov.stdout.split('\n'):
-                line = line.strip()
+            if source_filename not in gcno_map:
+                log(f"[BRANCH DEBUG] No .gcno file found for {source_filename}")
+                log(f"[BRANCH DEBUG]   Available keys: {list(gcno_map.keys())[:10]}")
+                continue
+            
+            gcno_file = gcno_map[source_filename]
+            gcno_dir = str(gcno_file.parent)
+            
+            log(f"[BRANCH DEBUG] Running gcov on: {full_source_path}")
+            log(f"[BRANCH DEBUG]   .gcno location: {gcno_file}")
+            
+            # Run gcov with JSON format to get static branch structure  
+            # -t: output to stdout (not file)
+            # -b: include branch probabilities (required for branch data in JSON)
+            # --json-format: machine-readable JSON output
+            # --object-file: specify the .gcno file directly (avoids naming issues)
+            result = subprocess.run(
+                ['gcov', '-t', '-b', '--json-format', '--object-file', str(gcno_file), full_source_path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=source_root
+            )
+            
+            if result.returncode != 0:
+                log(f"[BRANCH DEBUG] gcov failed (rc={result.returncode}) for {source_file}")
+                if result.stderr:
+                    log(f"[BRANCH DEBUG] stderr: {result.stderr[:200]}")
+                continue
+            
+            log(f"[BRANCH DEBUG] gcov succeeded, parsing output ({len(result.stdout)} bytes)")
+            
+            # Show sample of actual gcov output for debugging
+            log(f"[BRANCH DEBUG] First 500 chars of gcov output:")
+            log(f"[BRANCH DEBUG] {result.stdout[:500]}")
+            
+            # Parse JSON format output
+            import json
+            function_branches = {}  # {range_key: count}
+            total_branches = 0
+            total_branches_unfiltered = 0
+            system_branches_filtered = 0
+            
+            try:
+                gcov_data = json.loads(result.stdout)
+                log(f"[BRANCH DEBUG] Successfully parsed JSON, keys: {list(gcov_data.keys())}")
                 
-                if line.startswith('function '):
-                    # Save previous function's data
-                    if current_func_name and current_func_line:
-                        for src_file in matching_sources:
-                            func_key = f"{src_file}:{current_func_line}"
-                            if func_key in exact_function_ranges:
-                                result[func_key] = current_branch_count
+                # JSON format has 'files' array
+                files = gcov_data.get('files', [])
+                log(f"[BRANCH DEBUG] Found {len(files)} files in JSON")
+                
+                for file_data in files:
+                    file_path = file_data.get('file', '')
                     
-                    # Start new function
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        current_func_name = parts[1]
-                        current_branch_count = 0
-                        current_func_line = None
-                
-                elif line.startswith('branch '):
-                    # Count this branch
-                    # Apply filtering if requested
+                    # Check if this is a system/library file that should be filtered
+                    is_system_file = False
                     if filter_system_branches:
-                        # Skip branches from system/STL code indicators
-                        # These often show up as template instantiations
-                        skip_markers = [
-                            'std::', '__gnu', '_GLIBCXX', 
-                            'vector<', 'unique_ptr<', 'shared_ptr<',
-                            'basic_string<', 'allocator<'
-                        ]
-                        if any(marker in line for marker in skip_markers):
-                            continue
+                        # Filter out system headers, standard library, compiler internals
+                        if any(pattern in file_path for pattern in [
+                            '/usr/include/',
+                            '/usr/lib/',
+                            '/usr/local/include/',
+                            'bits/',  # STL implementation details
+                            'c++/',   # C++ standard library (when not in /usr/include)
+                        ]):
+                            is_system_file = True
                     
-                    current_branch_count += 1
-        
+                    # Normalize to relative path
+                    current_file = file_path
+                    if '/cvc5/' in file_path:
+                        current_file = file_path.split('/cvc5/', 1)[1]
+                    elif '/z3/' in file_path:
+                        current_file = file_path.split('/z3/', 1)[1]
+                    
+                    log(f"[BRANCH DEBUG]   Processing file from JSON: {current_file}")
+                    
+                    # Get lines data which includes branch information
+                    lines = file_data.get('lines', [])
+                    log(f"[BRANCH DEBUG]     {len(lines)} lines in file")
+                    
+                    for line_data in lines:
+                        line_number = line_data.get('line_number')
+                        branches = line_data.get('branches', [])
+                        
+                        if branches:
+                            total_branches_unfiltered += len(branches)
+                            
+                            # Skip system branches if filtering is enabled
+                            if is_system_file:
+                                system_branches_filtered += len(branches)
+                                continue
+                            
+                            total_branches += len(branches)
+                            
+                            # Find which function this line belongs to
+                            for range_key, (start, end) in exact_function_ranges.items():
+                                file_path_key, start_str = range_key.rsplit(':', 1)
+                                if current_file == file_path_key and start <= line_number <= end:
+                                    if range_key not in function_branches:
+                                        function_branches[range_key] = 0
+                                    function_branches[range_key] += len(branches)
+                                    break
+                
+            except json.JSONDecodeError as e:
+                log(f"[BRANCH DEBUG] Failed to parse JSON: {e}")
+                log(f"[BRANCH DEBUG] Output was not JSON, trying standard format parse...")
+                # Fallback: count from summary line if available
+                for line in result.stdout.split('\n'):
+                    if 'Branches executed:' in line and '% of' in line:
+                        # Extract total from "Branches executed:31.57% of 1552"
+                        try:
+                            parts = line.split('of')
+                            if len(parts) > 1:
+                                total_in_file = int(parts[1].strip())
+                                log(f"[BRANCH DEBUG] Found {total_in_file} total branches from summary")
+                                # Assign all to the main source file's functions
+                                # This is approximate but better than 0
+                                for range_key in exact_function_ranges.keys():
+                                    file_path_key = range_key.rsplit(':', 1)[0]
+                                    if source_file in file_path_key:
+                                        if range_key not in function_branches:
+                                            function_branches[range_key] = 0
+                                        # Distribute evenly (rough approximation)
+                                total_branches = total_in_file
+                        except (ValueError, IndexError):
+                            pass
+            
+            branch_counts.update(function_branches)
+            log(f"[BRANCH DEBUG] Parsing complete for {source_file}:")
+            if filter_system_branches:
+                log(f"[BRANCH DEBUG]   Total branches (unfiltered): {total_branches_unfiltered}")
+                log(f"[BRANCH DEBUG]   System branches filtered out: {system_branches_filtered}")
+                log(f"[BRANCH DEBUG]   Total branches (filtered): {total_branches}")
+            else:
+                log(f"[BRANCH DEBUG]   Total branches in file: {total_branches}")
+            log(f"[BRANCH DEBUG]   Branches mapped to changed functions: {sum(function_branches.values())}")
+            log(f"[BRANCH DEBUG]   Changed functions with branches: {len(function_branches)}")
+            
+        except subprocess.TimeoutExpired:
+            log(f"[BRANCH DEBUG] gcov timeout for {source_file}")
+            continue
         except Exception as e:
+            log(f"[BRANCH DEBUG] Error processing {source_file}: {e}")
+            import traceback
+            log(f"[BRANCH DEBUG] Traceback: {traceback.format_exc()}")
             continue
     
-    return result
+    return branch_counts
 
 
 def extract_coverage_fastcov(
     build_dir: str,
     gcov_cmd: str,
     changed_functions: Set[str],
-    exact_function_ranges: Dict[str, tuple] = None
+    exact_function_ranges: Dict[str, tuple] = None,
+    static_branch_counts: Dict[str, int] = None
 ) -> Dict[str, any]:
     """
     Extract function, line, and branch coverage from gcov data using fastcov.
@@ -417,8 +554,8 @@ def extract_coverage_fastcov(
                             except (ValueError, TypeError):
                                 pass
             
-            # Extract static branch counts from .gcno files
-            if exact_function_ranges:
+            # Use pre-computed static branch counts if provided, otherwise extract them
+            if static_branch_counts is None and exact_function_ranges:
                 source_files_for_branches = set()
                 for range_key in exact_function_ranges.keys():
                     file_path = range_key.rsplit(':', 1)[0]
@@ -430,10 +567,11 @@ def extract_coverage_fastcov(
                     exact_function_ranges,
                     filter_system_branches=True
                 )
-                
-                if static_branch_counts:
-                    # Use static counts for total, keep execution data for taken
-                    result["summary"]["branches_total"] = sum(static_branch_counts.values())
+            
+            # Use static counts for total (whether pre-computed or just extracted)
+            if static_branch_counts:
+                # Use static counts for total, keep execution data for taken
+                result["summary"]["branches_total"] = sum(static_branch_counts.values())
     
     except Exception as e:
         log(f"WARNING: fastcov error: {e}")
@@ -695,6 +833,26 @@ def replay_recipes_timeline(
     log("Resetting gcda files...")
     reset_gcda_files(build_dir)
     
+    # Extract static branch counts ONCE before any tests run
+    # This ensures all checkpoints use the same denominators
+    log("Extracting static branch counts from .gcno files...")
+    source_files_for_branches = set()
+    if exact_function_ranges:
+        for range_key in exact_function_ranges.keys():
+            file_path = range_key.rsplit(':', 1)[0]
+            source_files_for_branches.add(file_path)
+        
+        static_branch_counts_cache = extract_static_branch_counts(
+            build_dir,
+            source_files_for_branches,
+            exact_function_ranges,
+            filter_system_branches=True
+        )
+        log(f"Loaded {len(static_branch_counts_cache)} static branch counts")
+    else:
+        static_branch_counts_cache = {}
+        log("No exact_function_ranges - skipping static branch extraction")
+    
     # Create temp directory for test files
     test_output_dir = tempfile.mkdtemp(prefix='timeline_tests_')
     log(f"Test directory: {test_output_dir}")
@@ -726,7 +884,8 @@ def replay_recipes_timeline(
                     build_dir=build_dir,
                     gcov_cmd=gcov_cmd,
                     changed_functions=changed_functions,
-                    exact_function_ranges=exact_function_ranges
+                    exact_function_ranges=exact_function_ranges,
+                    static_branch_counts=static_branch_counts_cache
                 )
                 
                 extract_time = time.time() - extract_start
@@ -821,7 +980,8 @@ def replay_recipes_timeline(
         build_dir=build_dir,
         gcov_cmd=gcov_cmd,
         changed_functions=changed_functions,
-        exact_function_ranges=exact_function_ranges
+        exact_function_ranges=exact_function_ranges,
+        static_branch_counts=static_branch_counts_cache
     )
     
     final_checkpoint = {
