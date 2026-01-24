@@ -325,22 +325,16 @@ def extract_coverage_fastcov(
     build_dir: str,
     gcov_cmd: str,
     changed_functions: Set[str],
-    exact_function_ranges: Dict[str, tuple] = None,
-    static_lines_total: int = None,
-    static_branches_total: int = None
+    exact_function_ranges: Dict[str, tuple] = None
 ) -> Dict[str, any]:
     """
     Extract function, line, and branch coverage from gcov data using fastcov.
-    
-    Args:
-        static_lines_total: Pre-calculated total lines (for consistent denominators)
-        static_branches_total: Pre-calculated total branches (for consistent denominators)
     
     Returns dict with:
         - function_counts: {func_key: call_count}
         - line_coverage: {file:line: hit_count}
         - branch_coverage: {file:line:branch_id: taken_count}
-        - summary: {lines_hit, lines_total, branches_taken, branches_total}
+        - summary: {lines_hit, branches_taken} (no totals/denominators)
     """
     result = {
         "function_counts": {},
@@ -348,9 +342,7 @@ def extract_coverage_fastcov(
         "branch_coverage": {},
         "summary": {
             "lines_hit": 0,
-            "lines_total": static_lines_total if static_lines_total is not None else 0,
             "branches_taken": 0,
-            "branches_total": static_branches_total if static_branches_total is not None else 0,
         }
     }
     fastcov_output = None
@@ -450,51 +442,27 @@ def extract_coverage_fastcov(
                         if range_tuple not in func_line_ranges[source_relative]:
                             func_line_ranges[source_relative].append(range_tuple)
                 
-                # Extract line coverage
+                # Extract line coverage - just count hits from execution data
                 if is_target_file and source_relative in func_line_ranges:
-                    # If static totals provided, only count hits (don't recalculate totals)
-                    if static_lines_total is not None:
-                        # Just count hits from execution data
-                        if lines_data:
-                            for line_num_str, hit_count in lines_data.items():
-                                try:
-                                    line_num = int(line_num_str)
-                                    # Check if line is in a changed function
-                                    line_in_range = False
-                                    for start_line, end_line in func_line_ranges[source_relative]:
-                                        if start_line <= line_num <= end_line:
-                                            line_in_range = True
-                                            break
-                                    if line_in_range:
-                                        line_key = f"{source_relative}:{line_num}"
-                                        result["line_coverage"][line_key] = hit_count
-                                        if hit_count > 0:
-                                            result["summary"]["lines_hit"] += 1
-                                except (ValueError, TypeError):
-                                    pass
-                    else:
-                        # Legacy behavior: count all lines and then overlay execution data
-                        for start_line, end_line in func_line_ranges[source_relative]:
-                            for line_num in range(start_line, end_line + 1):
-                                line_key = f"{source_relative}:{line_num}"
-                                if line_key not in result["line_coverage"]:
-                                    result["line_coverage"][line_key] = 0
-                                    result["summary"]["lines_total"] += 1
-                        
-                        # Overlay execution data
-                        if lines_data:
-                            for line_num_str, hit_count in lines_data.items():
-                                try:
-                                    line_num = int(line_num_str)
+                    if lines_data:
+                        for line_num_str, hit_count in lines_data.items():
+                            try:
+                                line_num = int(line_num_str)
+                                # Check if line is in a changed function
+                                line_in_range = False
+                                for start_line, end_line in func_line_ranges[source_relative]:
+                                    if start_line <= line_num <= end_line:
+                                        line_in_range = True
+                                        break
+                                if line_in_range:
                                     line_key = f"{source_relative}:{line_num}"
-                                    if line_key in result["line_coverage"]:
-                                        result["line_coverage"][line_key] = hit_count
-                                        if hit_count > 0:
-                                            result["summary"]["lines_hit"] += 1
-                                except (ValueError, TypeError):
-                                    pass
+                                    result["line_coverage"][line_key] = hit_count
+                                    if hit_count > 0:
+                                        result["summary"]["lines_hit"] += 1
+                            except (ValueError, TypeError):
+                                pass
                 
-                # Extract branch coverage
+                # Extract branch coverage - just count branches taken
                 if is_target_file and source_relative in func_line_ranges:
                     def line_in_changed_function(file_path: str, line: int) -> bool:
                         ranges = func_line_ranges.get(file_path, [])
@@ -511,38 +479,10 @@ def extract_coverage_fastcov(
                                     for branch_idx, taken_count in enumerate(branch_counts):
                                         branch_key = f"{source_relative}:{line_num}:{branch_idx}"
                                         result["branch_coverage"][branch_key] = taken_count
-                                        # Only increment total if not using static totals
-                                        if static_branches_total is None:
-                                            result["summary"]["branches_total"] += 1
                                         if taken_count > 0:
                                             result["summary"]["branches_taken"] += 1
                             except (ValueError, TypeError):
                                 pass
-            
-            # Extract static branch counts only if not provided (legacy behavior)
-            if exact_function_ranges and static_branches_total is None:
-                source_files_for_branches = set()
-                for range_key in exact_function_ranges.keys():
-                    file_path = range_key.rsplit(':', 1)[0]
-                    source_files_for_branches.add(file_path)
-                
-                static_branch_counts = extract_static_branch_counts(
-                    build_dir,
-                    source_files_for_branches,
-                    exact_function_ranges,
-                    filter_system_branches=True  # Filter out system/STL branches by default
-                )
-                
-                # Recalculate branches_total using static counts from .gcno files
-                # This ensures we count ALL branches in changed functions, even in uncalled functions
-                # Keep branches_taken as is (from fastcov execution data)
-                if static_branch_counts:
-                    old_total = result["summary"]["branches_total"]
-                    # Clear and recalculate total branches
-                    result["summary"]["branches_total"] = 0
-                    
-                    for range_key, static_count in static_branch_counts.items():
-                        result["summary"]["branches_total"] += static_count
     
     except Exception as e:
         log(f"WARNING: fastcov error: {e}")
@@ -799,30 +739,6 @@ def replay_recipes_timeline(
     log("Resetting gcda files...")
     reset_gcda_files(build_dir)
     
-    # Pre-calculate static branch and line totals ONCE for consistency across checkpoints
-    log("Pre-calculating static coverage totals...")
-    source_files_for_static = set()
-    for range_key in exact_function_ranges.keys():
-        file_path = range_key.rsplit(':', 1)[0]
-        source_files_for_static.add(file_path)
-    
-    static_branch_counts = extract_static_branch_counts(
-        build_dir,
-        source_files_for_static,
-        exact_function_ranges,
-        filter_system_branches=True
-    )
-    
-    # Calculate fixed totals
-    static_branches_total = sum(static_branch_counts.values())
-    static_lines_total = 0
-    for range_key, (start, end) in exact_function_ranges.items():
-        static_lines_total += (end - start + 1)
-    
-    log(f"Static totals (fixed for all checkpoints):")
-    log(f"  Lines: {static_lines_total}")
-    log(f"  Branches: {static_branches_total}")
-    
     # Create temp directory for test files
     test_output_dir = tempfile.mkdtemp(prefix='timeline_tests_')
     log(f"Test directory: {test_output_dir}")
@@ -854,9 +770,7 @@ def replay_recipes_timeline(
                     build_dir=build_dir,
                     gcov_cmd=gcov_cmd,
                     changed_functions=changed_functions,
-                    exact_function_ranges=exact_function_ranges,
-                    static_lines_total=static_lines_total,
-                    static_branches_total=static_branches_total
+                    exact_function_ranges=exact_function_ranges
                 )
                 
                 extract_time = time.time() - extract_start
@@ -866,19 +780,15 @@ def replay_recipes_timeline(
                     'wall_time_seconds': wall_elapsed,
                     'recipes_processed': recipes_processed['count'],
                     'lines_hit': coverage_data['summary']['lines_hit'],
-                    'lines_total': coverage_data['summary']['lines_total'],
                     'branches_taken': coverage_data['summary']['branches_taken'],
-                    'branches_total': coverage_data['summary']['branches_total'],
                     'function_calls': sum(coverage_data['function_counts'].values()),
                     'extract_time_seconds': extract_time
                 }
                 
                 checkpoints.append(checkpoint)
                 
-                branches_pct = 100.0 * checkpoint['branches_taken'] / checkpoint['branches_total'] if checkpoint['branches_total'] > 0 else 0
-                lines_pct = 100.0 * coverage_data['summary']['lines_hit'] / checkpoint['lines_total'] if checkpoint['lines_total'] > 0 else 0
-                log(f"[CHECKPOINT {checkpoint_num}] Lines: {coverage_data['summary']['lines_hit']}/{checkpoint['lines_total']} ({lines_pct:.1f}%)")
-                log(f"[CHECKPOINT {checkpoint_num}] Branches: {checkpoint['branches_taken']}/{checkpoint['branches_total']} ({branches_pct:.1f}%)")
+                log(f"[CHECKPOINT {checkpoint_num}] Lines hit: {coverage_data['summary']['lines_hit']}")
+                log(f"[CHECKPOINT {checkpoint_num}] Branches taken: {checkpoint['branches_taken']}")
                 log(f"[CHECKPOINT {checkpoint_num}] Recipes processed: {recipes_processed['count']}/{len(recipes_with_ts)}")
                 log(f"[CHECKPOINT {checkpoint_num}] Extraction took {extract_time:.1f}s\n")
             except Exception as e:
@@ -951,9 +861,7 @@ def replay_recipes_timeline(
         build_dir=build_dir,
         gcov_cmd=gcov_cmd,
         changed_functions=changed_functions,
-        exact_function_ranges=exact_function_ranges,
-        static_lines_total=static_lines_total,
-        static_branches_total=static_branches_total
+        exact_function_ranges=exact_function_ranges
     )
     
     final_checkpoint = {
@@ -961,9 +869,7 @@ def replay_recipes_timeline(
         'wall_time_seconds': time.time() - start_time,
         'recipes_processed': len(recipes_with_ts),
         'lines_hit': final_coverage['summary']['lines_hit'],
-        'lines_total': final_coverage['summary']['lines_total'],
         'branches_taken': final_coverage['summary']['branches_taken'],
-        'branches_total': final_coverage['summary']['branches_total'],
         'function_calls': sum(final_coverage['function_counts'].values()),
         'is_final': True
     }
@@ -985,9 +891,7 @@ def replay_recipes_timeline(
         "recipes_per_second": len(recipes_with_ts) / elapsed if elapsed > 0 else 0,
         "final_coverage": {
             "lines_hit": final_checkpoint['lines_hit'],
-            "lines_total": final_checkpoint['lines_total'],
             "branches_taken": final_checkpoint['branches_taken'],
-            "branches_total": final_checkpoint['branches_total'],
             "function_calls": final_checkpoint['function_calls']
         }
     }
@@ -1003,7 +907,7 @@ def replay_recipes_timeline(
     log(f"Processed: {len(recipes_with_ts)} recipes ({successful} ok, {failed} failed)")
     log(f"Checkpoints: {len(checkpoints)}")
     log(f"Total time: {elapsed/60:.1f} minutes")
-    log(f"Final coverage: {final_checkpoint['branches_taken']}/{final_checkpoint['branches_total']} branches")
+    log(f"Final coverage: {final_checkpoint['lines_hit']} lines, {final_checkpoint['branches_taken']} branches")
     log(f"Results saved to: {output_file}")
     log("=" * 60)
     
