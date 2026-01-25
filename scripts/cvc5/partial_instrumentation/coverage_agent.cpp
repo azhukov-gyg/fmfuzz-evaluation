@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <cstdlib>
 #include <cstdio>
+#include <cerrno>
 
 // AFL-style bitmap for edge coverage (1KB)
 constexpr size_t BITMAP_SIZE = 1024;
@@ -30,9 +31,19 @@ static void init_shm(const char* shm_name) {
     if (g_bitmap) return;
 
     g_shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
-    if (g_shm_fd == -1) return;
+    if (g_shm_fd == -1) {
+        if (getenv("COVERAGE_AGENT_DEBUG")) {
+            fprintf(stderr, "[coverage_agent] ERROR: shm_open(%s) failed: %s (errno=%d)\n", 
+                    shm_name, strerror(errno), errno);
+        }
+        return;
+    }
 
     if (ftruncate(g_shm_fd, BITMAP_SIZE) == -1) {
+        if (getenv("COVERAGE_AGENT_DEBUG")) {
+            fprintf(stderr, "[coverage_agent] ERROR: ftruncate(%s) failed: %s (errno=%d)\n", 
+                    shm_name, strerror(errno), errno);
+        }
         close(g_shm_fd);
         g_shm_fd = -1;
         return;
@@ -41,9 +52,18 @@ static void init_shm(const char* shm_name) {
     g_bitmap = (uint8_t*)mmap(nullptr, BITMAP_SIZE, PROT_READ | PROT_WRITE,
                               MAP_SHARED, g_shm_fd, 0);
     if (g_bitmap == MAP_FAILED) {
+        if (getenv("COVERAGE_AGENT_DEBUG")) {
+            fprintf(stderr, "[coverage_agent] ERROR: mmap(%s) failed: %s (errno=%d)\n", 
+                    shm_name, strerror(errno), errno);
+        }
         close(g_shm_fd);
         g_shm_fd = -1;
         g_bitmap = nullptr;
+    } else {
+        if (getenv("COVERAGE_AGENT_DEBUG")) {
+            fprintf(stderr, "[coverage_agent] SUCCESS: attached to shm %s, bitmap=%p\n", 
+                    shm_name, (void*)g_bitmap);
+        }
     }
 }
 
@@ -107,7 +127,11 @@ static void init_coverage_agent() {
     
     // Debug output (set COVERAGE_AGENT_DEBUG=1 to see total edges)
     if (getenv("COVERAGE_AGENT_DEBUG")) {
-        fprintf(stderr, "[coverage_agent] total_edges=%u\n", g_total_edges);
+        fprintf(stderr, "[coverage_agent] total_edges=%u, bitmap=%p, shm_fd=%d\n", 
+                g_total_edges, (void*)g_bitmap, g_shm_fd);
+        if (!g_bitmap) {
+            fprintf(stderr, "[coverage_agent] WARNING: No shared memory attached - coverage will not be recorded!\n");
+        }
     }
 }
 
