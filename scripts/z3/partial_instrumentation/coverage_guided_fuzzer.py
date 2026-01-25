@@ -2202,6 +2202,8 @@ class CoverageGuidedFuzzer:
         Returns (exit_code, bug_files, runtime_seconds_total, []).
         """
         if not test_path.exists():
+            print(f"[WORKER {worker_id}] [INLINE] ERROR: Test file not found: {test_path}", file=sys.stderr)
+            print(f"[WORKER {worker_id}] [INLINE] Current working directory: {Path.cwd()}", file=sys.stderr)
             return (1, [], 0.0, [])
         
         # Use provided iterations or fall back to max for time budget
