@@ -205,10 +205,11 @@ class InlineTypeFuzz:
                 start_new_session=True
             )
             
-            # Print coverage agent debug output if enabled
+            # Print only coverage_agent debug lines (suppress solver warnings)
             if r.stderr and env and env.get('COVERAGE_AGENT_DEBUG') == '1':
-                if '[coverage_agent]' in r.stderr:
-                    print(r.stderr, end='', flush=True, file=sys.stderr)
+                for line in r.stderr.splitlines():
+                    if line.startswith('[coverage_agent]'):
+                        print(line, flush=True, file=sys.stderr)
             
             return r.stdout, r.stderr, r.returncode
         except subprocess.TimeoutExpired as te:
