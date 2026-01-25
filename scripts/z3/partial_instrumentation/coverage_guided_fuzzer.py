@@ -2129,6 +2129,7 @@ class CoverageGuidedFuzzer:
         # Set up environment with shared memory ID for coverage
         env = os.environ.copy()
         env['__AFL_SHM_ID'] = str(shm_id)
+        env['COVERAGE_AGENT_DEBUG'] = '1'  # Enable coverage agent diagnostics
         
         # Use configured per-test timeout
         timeout = self.per_test_timeout
@@ -2198,6 +2199,7 @@ class CoverageGuidedFuzzer:
         
         env = os.environ.copy()
         env['__AFL_SHM_ID'] = shm_id
+        env['COVERAGE_AGENT_DEBUG'] = '1'  # Enable coverage agent diagnostics
         env['LLVM_PROFILE_FILE'] = str(self.profraw_dir / f"worker_{worker_id}_%p_%m.profraw")
         env['ASAN_OPTIONS'] = 'abort_on_error=0:detect_leaks=0'
         
@@ -2493,6 +2495,7 @@ class CoverageGuidedFuzzer:
             env = os.environ.copy()
             # Set shared memory ID for coverage agent (afl_shm_{ID})
             env['__AFL_SHM_ID'] = shm_id
+            env['COVERAGE_AGENT_DEBUG'] = '1'  # Enable coverage agent diagnostics
             # PGO profiling - use %p (pid) and %m (merge pool) for unique files per solver invocation
             # typefuzz runs solvers multiple times, each needs its own profraw file
             # Use %c for continuous mode - writes profile data continuously (survives crashes/kills)

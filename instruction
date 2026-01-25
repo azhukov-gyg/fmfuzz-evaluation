@@ -1,0 +1,34 @@
+**Bug Verification Task**
+
+I will provide:
+- **Solver**: (z3 or cvc5)
+- **Suspect commit**: (commit hash where bug may have been introduced)
+- **Fix commits**: (one or more commit hashes that fixed the issue)
+- **Test case**: (SMT-LIB code that triggers the bug)
+- **Fix diff** (optional): (code changes that fixed the issue)
+
+**Your task**: Using git history analysis on the existing repository at `/Users/andrei.zhukov/study/thesis/fmfuzz-evaluation/{solver}`, determine:
+1. Was the bug introduced in the suspect commit?
+2. Does the fix directly address the issue introduced by that commit?
+3. What specifically changed between the buggy and fixed versions?
+
+**Requirements**:
+- Use git commands only (git log, git show, git blame, git diff)
+- No code execution or building
+- NO file writing
+- Output all analysis and findings directly in chat
+
+**Example input format**:
+```
+Solver: z3
+Suspect commit: abc123...
+Fix commits: def456..., ghi789...
+
+Test case:
+(assert ...)
+(check-sat)
+
+Fix diff (optional):
+-    old_code();
++    new_code();
+```
