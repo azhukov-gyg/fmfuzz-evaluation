@@ -463,9 +463,17 @@ class CoverageGuidedFuzzer:
         """
         avg_cov = self._get_avg_coverage()
         
-        # Prevent division by zero
+        # If avg_cov is 0 (no coverage tracked yet), use absolute edges
+        # This ensures tests with calibrated edges are prioritized even if
+        # runtime coverage tracking fails (e.g., shm attachment issues)
         if avg_cov <= 0:
-            return 1.0
+            # Use absolute edge count brackets (based on calibration data)
+            if edges_hit >= 100:  return 5.0   # High coverage (100+ edges)
+            if edges_hit >= 50:   return 4.0
+            if edges_hit >= 20:   return 3.0
+            if edges_hit >= 10:   return 2.0
+            if edges_hit >= 1:    return 1.5   # Any coverage
+            return 1.0  # No coverage
         
         ratio = edges_hit / avg_cov
         
