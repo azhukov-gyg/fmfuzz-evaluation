@@ -2152,6 +2152,12 @@ class CoverageGuidedFuzzer:
                 timeout=timeout,
             )
             exit_code = result.returncode
+            
+            # Print coverage agent debug output if enabled
+            if result.stderr and env.get('COVERAGE_AGENT_DEBUG') == '1':
+                stderr_text = result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr
+                if '[coverage_agent]' in stderr_text:
+                    print(stderr_text, end='', flush=True, file=sys.stderr)
         except subprocess.TimeoutExpired:
             exit_code = -1
         except Exception:
@@ -2525,6 +2531,12 @@ class CoverageGuidedFuzzer:
             
             exit_code = result.returncode
             runtime = time.time() - start_time
+            
+            # Print coverage agent debug output if enabled
+            if result.stderr and env.get('COVERAGE_AGENT_DEBUG') == '1':
+                if '[coverage_agent]' in result.stderr:
+                    print(result.stderr, end='', flush=True, file=sys.stderr)
+            
             bug_files = self._collect_bug_files(bugs_folder)
             
             # Collect mutant files from scratch folder

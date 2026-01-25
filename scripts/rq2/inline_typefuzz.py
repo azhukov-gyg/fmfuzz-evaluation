@@ -204,6 +204,12 @@ class InlineTypeFuzz:
                 env=env,
                 start_new_session=True
             )
+            
+            # Print coverage agent debug output if enabled
+            if r.stderr and env and env.get('COVERAGE_AGENT_DEBUG') == '1':
+                if '[coverage_agent]' in r.stderr:
+                    print(r.stderr, end='', flush=True, file=sys.stderr)
+            
             return r.stdout, r.stderr, r.returncode
         except subprocess.TimeoutExpired as te:
             stdout = te.stdout.decode() if te.stdout else ""
