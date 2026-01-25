@@ -757,47 +757,59 @@ class CoverageGuidedFuzzer:
         owned_edges: int = 0,
     ) -> float:
         """
-        Calculate AFL-style performance score with geometric mean balancing.
+        Calculate performance score with power law: coverage-first, speed-aware.
         Higher score = more iterations deserved AND higher selection probability.
         
-        Score = BASE × S × GeometricMean(C, N, D, F, U, E)
+        Score = BASE × C² × √S × GeometricMean(N, D, F, U, E)
         
-        Speed (S) stays multiplicative - fast tests should get many more iterations.
-        Interest factors (C,N,D,F,U,E) combined via geometric mean to prevent explosion.
+        Design rationale:
+        - Coverage (C) is SQUARED: tests with more edges get exponentially higher priority
+        - Speed (S) is SQUARE-ROOTED: fast tests get bonus but slow tests aren't penalized much
+        - Secondary factors (N,D,F,U,E) use geometric mean to prevent explosion
+        
+        This ensures:
+        - 200-edge test ALWAYS beats 5-edge test, regardless of speed
+        - Among similar coverage, faster tests win
+        - Very slow tests (>10s) are viable if they have high coverage
         
         Factors:
-          S: [0.1, 3.0]  - speed multiplier (multiplicative)
-          C: [1.0, 5.0]  - coverage relative to average
+          C: [1.0, 5.0]  - coverage multiplier (SQUARED)
+          S: [0.1, 3.0]  - speed multiplier (SQUARE-ROOTED)
           N: [1.0, 8.0]  - newcomer bonus (decays)
           D: [1.0, 4.5]  - depth/generation bonus
           F: [0.25, 4.0] - path rarity
           U: [1.0, 4.0]  - owned edges
-          E: [1.0, 8.0]  - edge rarity (NEW - exploration bonus)
+          E: [1.0, 8.0]  - edge rarity (exploration bonus)
         
-        Score ranges with geometric mean:
-          - Max (fast + all bonuses): 100 × 3.0 × 5.3 ≈ 1,590
-          - Fast + no bonuses: 100 × 3.0 × 1.0 = 300
-          - Slow + rare edges: 100 × 0.2 × 1.4 = 28
-          - Very slow: 100 × 0.1 × 1.0 = 10
+        Score examples:
+          - Fast (S=3.0), 0 edges (C=1.0):   100 × 1² × 1.73 = 173
+          - Fast (S=3.0), 5 edges (C=1.5):   100 × 2.25 × 1.73 = 389
+          - Normal (S=1.0), 184 edges (C=5.0): 100 × 25 × 1.0 = 2,500
+          - Slow-5s (S=0.5), 200 edges (C=5.0): 100 × 25 × 0.71 = 1,775
+          - Slow-15s (S=0.1), 200 edges (C=5.0): 100 × 25 × 0.32 = 800
         """
         BASE = 100  # Baseline score
         
-        # Speed factor (multiplicative - most important)
+        # Critical factors with power law
+        C = self._get_coverage_multiplier(edges_hit)
         S = self._get_speed_multiplier(runtime_ms)
         
-        # Interest factors (combined via geometric mean to prevent explosion)
-        C = self._get_coverage_multiplier(edges_hit)
+        # Power law: C² (coverage dominates), √S (speed bonus dampened)
+        coverage_score = C * C
+        speed_score = S ** 0.5
+        
+        # Secondary interest factors (geometric mean for balance)
         N, _ = self._get_newcomer_multiplier(test_path)
         D = self._get_depth_multiplier(generation)
         F = self._get_rarity_multiplier(path_frequency)
         U = self._get_owned_edges_multiplier(owned_edges)
         E = self._get_edge_rarity_multiplier(test_path)
         
-        # Geometric mean of 6 interest factors: (C×N×D×F×U×E)^(1/6)
-        interest_product = C * N * D * F * U * E
-        interest = interest_product ** (1/6)
+        # Geometric mean of 5 secondary factors: (N×D×F×U×E)^(1/5)
+        interest_product = N * D * F * U * E
+        interest = interest_product ** (1/5)
         
-        return BASE * S * interest
+        return BASE * coverage_score * speed_score * interest
     
     def _score_to_iterations(self, score: float) -> int:
         """
