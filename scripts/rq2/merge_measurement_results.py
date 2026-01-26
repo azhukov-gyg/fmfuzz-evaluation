@@ -38,7 +38,7 @@ def merge_measurement_results(result_files: list, output_file: str) -> dict:
         # Branch coverage
         "branch_coverage": {},
         "branches_taken": 0,
-        "branches_total": 0,
+        "branches_total": 0,  # Will be set from static analysis in individual jobs
         "elapsed_seconds": 0,
     }
     
@@ -60,6 +60,13 @@ def merge_measurement_results(result_files: list, output_file: str) -> dict:
             if data.get("changed_functions_tracked", 0) > merged["changed_functions_tracked"]:
                 merged["changed_functions_tracked"] = data["changed_functions_tracked"]
             
+            # Preserve static branch/line totals from individual measurements
+            # (All jobs should have the same totals since they measure the same functions)
+            if data.get("lines_total", 0) > merged["lines_total"]:
+                merged["lines_total"] = data["lines_total"]
+            if data.get("branches_total", 0) > merged["branches_total"]:
+                merged["branches_total"] = data["branches_total"]
+            
             # Sum function counts
             for func, count in data.get("function_counts", {}).items():
                 merged["function_counts"][func] = merged["function_counts"].get(func, 0) + count
@@ -79,13 +86,14 @@ def merge_measurement_results(result_files: list, output_file: str) -> dict:
     
     merged["total_function_calls"] = sum(merged["function_counts"].values())
     
-    # Compute line coverage aggregates (unique lines hit vs total unique lines)
+    # Compute coverage aggregates
+    # Note: lines_hit and branches_taken count unique lines/branches with >0 hits
+    # But lines_total and branches_total come from static analysis (already set above)
     merged["lines_hit"] = sum(1 for v in merged["line_coverage"].values() if v > 0)
-    merged["lines_total"] = len(merged["line_coverage"])
-    
-    # Compute branch coverage aggregates (unique branches taken vs total unique branches)
     merged["branches_taken"] = sum(1 for v in merged["branch_coverage"].values() if v > 0)
-    merged["branches_total"] = len(merged["branch_coverage"])
+    
+    # lines_total and branches_total were already set from individual jobs above
+    # They come from static analysis (.gcno files) and should be the same across all jobs
     
     # Calculate rate
     if merged["elapsed_seconds"] > 0:
