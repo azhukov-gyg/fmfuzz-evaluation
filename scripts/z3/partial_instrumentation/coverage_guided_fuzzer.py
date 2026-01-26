@@ -2719,11 +2719,15 @@ class CoverageGuidedFuzzer:
                     original_test_path = test_path  # Keep original for re-queueing
                     
                     # Handle string paths:
-                    # - Seeds (generation==0): relative to tests_root
+                    # - Seeds (generation==0): relative to tests_root (or already full path from calibration)
                     # - Mutants (generation>0): stored as full path string
                     if isinstance(test_path, str):
                         if generation == 0:
-                            test_path = self.tests_root / test_path
+                            # Check if path already includes tests_root (from calibration storage)
+                            if not test_path.startswith(str(self.tests_root)):
+                                test_path = self.tests_root / test_path
+                            else:
+                                test_path = Path(test_path)
                         else:
                             test_path = Path(test_path)
                     
