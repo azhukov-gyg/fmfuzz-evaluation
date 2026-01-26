@@ -555,6 +555,8 @@ def extract_coverage_fastcov(
             
             # PRE-POPULATE with exact function ranges so uncalled functions are still counted
             if exact_function_ranges:
+                log(f"[GCOV DEBUG] PRE-POPULATING function ranges from exact_function_ranges ({len(exact_function_ranges)} functions)")
+                expected_lines_per_file = {}
                 for range_key, (start, end) in exact_function_ranges.items():
                     # range_key format: "src/theory/arith/linear_equality.cpp:51"
                     parts = range_key.rsplit(':', 1)
@@ -563,7 +565,17 @@ def extract_coverage_fastcov(
                         if file_path not in func_line_ranges:
                             func_line_ranges[file_path] = []
                         func_line_ranges[file_path].append((start, end))
-                        log(f"[GCOV DEBUG] PRE-POPULATED range: {file_path}:{start}-{end}")
+                        # Count expected lines
+                        line_count = end - start + 1
+                        expected_lines_per_file[file_path] = expected_lines_per_file.get(file_path, 0) + line_count
+                        log(f"[GCOV DEBUG] PRE-POPULATED range: {file_path}:{start}-{end} ({line_count} lines)")
+                
+                log(f"[GCOV DEBUG] Expected lines_total by file:")
+                total_expected_lines = 0
+                for fp in sorted(expected_lines_per_file.keys()):
+                    log(f"[GCOV DEBUG]   {fp}: {expected_lines_per_file[fp]} lines")
+                    total_expected_lines += expected_lines_per_file[fp]
+                log(f"[GCOV DEBUG] Total expected lines: {total_expected_lines}")
             
             # Show sample of functions found
             all_funcs = []
@@ -680,12 +692,16 @@ def extract_coverage_fastcov(
                 # Extract line coverage ONLY for lines within changed functions
                 if is_target_file and source_relative in func_line_ranges:
                     # First, count ALL lines in all function ranges (initializes to 0)
+                    lines_added_this_file = 0
                     for start_line, end_line in func_line_ranges[source_relative]:
                         for line_num in range(start_line, end_line + 1):
                             line_key = f"{source_relative}:{line_num}"
                             if line_key not in result["line_coverage"]:
                                 result["line_coverage"][line_key] = 0
                                 result["summary"]["lines_total"] += 1
+                                lines_added_this_file += 1
+                    if lines_added_this_file > 0:
+                        log(f"[LINES DEBUG] Added {lines_added_this_file} lines for {source_relative} (ranges: {len(func_line_ranges[source_relative])})")
                     
                     # Then overlay execution data from GCOV
                     if lines_data:
@@ -773,6 +789,27 @@ def extract_coverage_fastcov(
             log(f"[GCOV DEBUG] Found {len(all_funcs)} functions with >0 execution count")
             log(f"[GCOV DEBUG] Function-level coverage (only lines within changed functions):")
             log(f"[GCOV DEBUG]   Changed function ranges: {sum(len(v) for v in func_line_ranges.values())} functions in {len(func_line_ranges)} files")
+            
+            # Debug: show lines contribution per file
+            log(f"[LINES TOTAL DEBUG] Lines per source file:")
+            files_with_lines = {}
+            for line_key in result["line_coverage"].keys():
+                file_part = line_key.rsplit(':', 1)[0]
+                files_with_lines[file_part] = files_with_lines.get(file_part, 0) + 1
+            for fp in sorted(files_with_lines.keys()):
+                log(f"[LINES TOTAL DEBUG]   {fp}: {files_with_lines[fp]} lines")
+            
+            # Debug: compare expected files vs actual
+            expected_files = set(func_line_ranges.keys())
+            actual_files = set(files_with_lines.keys())
+            if expected_files != actual_files:
+                missing = expected_files - actual_files
+                if missing:
+                    log(f"[LINES TOTAL DEBUG] WARNING: Expected files missing from line coverage: {missing}")
+                extra = actual_files - expected_files
+                if extra:
+                    log(f"[LINES TOTAL DEBUG] WARNING: Unexpected files in line coverage: {extra}")
+            
             for fp, ranges in list(func_line_ranges.items())[:3]:
                 log(f"[GCOV DEBUG]     {fp}: {ranges}")
             log(f"[GCOV DEBUG]   Lines hit: {result['summary']['lines_hit']}/{result['summary']['lines_total']}")
@@ -2189,6 +2226,25 @@ def replay_recipes_optimized(
     line_coverage = coverage_data["line_coverage"]
     branch_coverage = coverage_data["branch_coverage"]
     coverage_summary = coverage_data["summary"]
+    
+    # Debug: verify lines_total calculation
+    log(f"")
+    log(f"[COVERAGE TOTALS DEBUG] Final verification:")
+    log(f"[COVERAGE TOTALS DEBUG]   lines_total from summary: {coverage_summary['lines_total']}")
+    log(f"[COVERAGE TOTALS DEBUG]   lines in line_coverage dict: {len(line_coverage)}")
+    log(f"[COVERAGE TOTALS DEBUG]   branches_total from summary: {coverage_summary['branches_total']}")
+    log(f"[COVERAGE TOTALS DEBUG]   branches in branch_coverage dict: {len(branch_coverage)}")
+    log(f"[COVERAGE TOTALS DEBUG]   changed_functions count: {len(changed_functions)}")
+    if exact_function_ranges:
+        log(f"[COVERAGE TOTALS DEBUG]   exact_function_ranges count: {len(exact_function_ranges)}")
+        expected_files = set(key.rsplit(':', 1)[0] for key in exact_function_ranges.keys())
+        log(f"[COVERAGE TOTALS DEBUG]   Expected source files from exact ranges: {len(expected_files)}")
+        actual_files = set(key.rsplit(':', 1)[0] for key in line_coverage.keys())
+        log(f"[COVERAGE TOTALS DEBUG]   Actual source files in line_coverage: {len(actual_files)}")
+        missing_files = expected_files - actual_files
+        if missing_files:
+            log(f"[COVERAGE TOTALS DEBUG]   WARNING: Missing files: {missing_files}")
+    log(f"")
     
     log(f"Total function calls: {sum(function_counts.values()):,}")
     log(f"Line coverage: {coverage_summary['lines_hit']}/{coverage_summary['lines_total']} lines hit")
