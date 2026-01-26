@@ -1019,56 +1019,51 @@ class CoverageGuidedFuzzer:
         """
         Recalculate perf_score for all queued items using current averages.
         
-        AFL++ does this every iteration. We do it every 10 tests or 5 minutes
-        since Python is slower. This ensures:
+        This ensures:
         - Running averages affect existing queue items (S and C factors)
         - Favored status changes propagate (U factor)
         - Path frequency changes propagate (F factor)
         
-        Cost: O(n log n) where n = queue size. ~50ms for n=200.
+        Cost: O(n) where n = queue size.
         """
-        # Drain the current queue
-        items = []
-        drained = 0
-        while not self._queue_empty():
-            item = self._queue_pop(timeout=0.01)
-            if item:
-                items.append(item)
-                drained += 1
-            else:
-                break
-        
-        if not items:
+        if not self.calibration_done.is_set():
+            # Don't recalculate during calibration
             return
         
-        # Recalculate scores with current state (all 6 factors: S×C×N×D×F×U)
-        new_items = []
-        for old_score, new_cov_rank, generation, seq, path in items:
-            # Get calibration data if available
-            with self.calibration_data_lock:
-                cal_data = self.calibration_data.get(path)
+        with self._work_queue_lock:
+            if len(self._work_queue_list) == 0:
+                return
             
-            if cal_data:
-                runtime_ms = cal_data[0] * 1000
-                edges = cal_data[1]
-            else:
-                # Use current averages for uncalibrated items
-                runtime_ms = self._get_avg_runtime_ms()
-                edges = max(1, int(self._get_avg_coverage()))
+            items = list(self._work_queue_list)
             
-            # Recalculate full perf_score with current averages and state
-            path_freq = self._get_test_path_frequency(path)
-            owned_edges = self._get_owned_edges_count(path)
-            new_score = self._calculate_perf_score(
-                runtime_ms, edges, generation, path, path_freq, owned_edges
-            )
+            # Recalculate scores with current state (all 6 factors: S×C×N×D×F×U)
+            new_items = []
+            for old_score, new_cov_rank, generation, seq, path in items:
+                # Get calibration data if available
+                with self.calibration_data_lock:
+                    cal_data = self.calibration_data.get(path)
+                
+                if cal_data:
+                    runtime_ms = cal_data[0] * 1000
+                    edges = cal_data[1]
+                else:
+                    # Use current averages for uncalibrated items
+                    runtime_ms = self._get_avg_runtime_ms()
+                    edges = max(1, int(self._get_avg_coverage()))
+                
+                # Recalculate full perf_score with current averages and state
+                path_freq = self._get_test_path_frequency(path)
+                owned_edges = self._get_owned_edges_count(path)
+                new_score = self._calculate_perf_score(
+                    runtime_ms, edges, generation, path, path_freq, owned_edges
+                )
+                
+                # Queue item format: (perf_score, cov_rank, generation, seq, path)
+                new_items.append((new_score, new_cov_rank, generation, seq, path))
             
-            # Queue item format: (perf_score, cov_rank, generation, seq, path)
-            new_items.append((new_score, new_cov_rank, generation, seq, path))
-        
-        # Sort by score DESCENDING (high score = higher priority)
-        new_items.sort(reverse=True)
-        self._queue_push_batch(new_items)
+            # Sort by score DESCENDING and replace queue contents
+            new_items.sort(reverse=True)
+            self._work_queue_list[:] = new_items
         
         print(f"[RECALC] Recalculated perf_score for {len(new_items)} queued items", flush=True)
     
