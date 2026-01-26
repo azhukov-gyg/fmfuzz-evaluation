@@ -810,6 +810,32 @@ def extract_coverage_fastcov(
                 if extra:
                     log(f"[LINES TOTAL DEBUG] WARNING: Unexpected files in line coverage: {extra}")
             
+            # CRITICAL FIX: Force-add lines from files that fastcov didn't process
+            # This ensures lines_total is deterministic across all variants
+            # Missing files typically occur when .gcda files are missing/corrupt due to timeouts
+            missing_files = expected_files - actual_files
+            if missing_files:
+                log(f"[CRITICAL FIX] Forcing zero coverage for {len(missing_files)} missing files")
+                lines_before_fix = result["summary"]["lines_total"]
+                
+                for file_path in missing_files:
+                    log(f"[CRITICAL FIX] Adding missing file: {file_path}")
+                    lines_added = 0
+                    
+                    # Add all lines from this file's changed functions
+                    for start_line, end_line in func_line_ranges[file_path]:
+                        for line_num in range(start_line, end_line + 1):
+                            line_key = f"{file_path}:{line_num}"
+                            if line_key not in result["line_coverage"]:
+                                result["line_coverage"][line_key] = 0
+                                result["summary"]["lines_total"] += 1
+                                lines_added += 1
+                    
+                    log(f"[CRITICAL FIX]   Added {lines_added} lines for {file_path}")
+                
+                lines_after_fix = result["summary"]["lines_total"]
+                log(f"[CRITICAL FIX] lines_total: {lines_before_fix} → {lines_after_fix} (+{lines_after_fix - lines_before_fix})")
+            
             for fp, ranges in list(func_line_ranges.items())[:3]:
                 log(f"[GCOV DEBUG]     {fp}: {ranges}")
             log(f"[GCOV DEBUG]   Lines hit: {result['summary']['lines_hit']}/{result['summary']['lines_total']}")
