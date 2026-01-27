@@ -124,10 +124,10 @@ else
 fi
 
 # Let CVC5's production profile handle optimization flags
-# We only add our instrumentation flags + -fno-inline to prevent inlining
-# (inlined functions bypass coverage guards, causing 0 edges hit)
-export CFLAGS="$SANCOV_FLAGS $PGO_FLAGS -fno-inline"
-export CXXFLAGS="$SANCOV_FLAGS $PGO_FLAGS -fno-inline"
+# We only add our instrumentation flags
+# Note: Removed -fno-inline to allow compiler optimizations
+export CFLAGS="$SANCOV_FLAGS $PGO_FLAGS"
+export CXXFLAGS="$SANCOV_FLAGS $PGO_FLAGS"
 export LDFLAGS="$PGO_LDFLAGS"
 
 echo "  CFLAGS: $CFLAGS"
