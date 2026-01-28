@@ -126,13 +126,13 @@ cd "$BUILD_DIR"
 
 # Phase 5b: Configure Z3 with CMake
 # Z3 uses CMake directly (no configure.sh like CVC5)
-# Build with RelWithDebInfo for optimized performance (variant2 only)
-# - Variant1 (baseline) uses: Debug (-O0)
-# - Variant2 (coverage-guided) uses: RelWithDebInfo (-O2 + debug symbols + sancov)
-# This tests whether optimization improves variant2's mutation throughput
-log "Phase 5b: Configuring Z3 with CMake (RelWithDebInfo)"
+# Build in Debug mode with assertions to match simple fuzzer build
+# This ensures we're comparing apples to apples:
+# - Simple fuzzer uses: Debug build with assertions
+# - Coverage-guided now uses: Debug build with assertions (+ sancov)
+log "Phase 5b: Configuring Z3 with CMake"
 cmake \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_BUILD_TYPE=Debug \
     -DCMAKE_C_FLAGS="${CFLAGS}" \
     -DCMAKE_CXX_FLAGS="${CXXFLAGS}" \
     -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS} ${AGENT_OBJ}" \
