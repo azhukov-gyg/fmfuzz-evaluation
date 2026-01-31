@@ -674,14 +674,19 @@ def replay_recipes_timeline(
     timeout: int = 60,
     seeds_file: Optional[str] = None,
     z3_memory_mb: int = 4096,
-    checkpoint_interval: int = 60
+    checkpoint_interval: int = 60,
+    max_duration_minutes: int = 20
 ) -> dict:
     """
     Replay recipes in exact timestamp order with periodic coverage extraction.
+
+    Args:
+        max_duration_minutes: Maximum runtime in minutes (default: 20)
     """
     log("=" * 60)
     log(f"TIMELINE RECIPE REPLAY")
     log(f"Checkpoint interval: {checkpoint_interval}s (wall-clock time)")
+    log(f"Time limit: {max_duration_minutes} minutes")
     log("=" * 60)
     
     solver_path = os.path.abspath(solver_path)
@@ -739,8 +744,45 @@ def replay_recipes_timeline(
     log(f"Loading changed functions from: {changed_functions_file}")
     changed_functions, exact_function_ranges = load_changed_functions(changed_functions_file)
     log(f"Tracking {len(changed_functions)} changed functions")
-    
+
+    # Calculate static coverage totals (like legacy mode)
+    log("=" * 60)
+    log("Calculating static coverage totals...")
+    log("=" * 60)
+
+    # Calculate lines_total from exact function ranges
+    lines_total = 0
+    if exact_function_ranges:
+        for range_key, (start, end) in exact_function_ranges.items():
+            line_count = end - start + 1
+            lines_total += line_count
+        log(f"Static lines_total: {lines_total} (from {len(exact_function_ranges)} functions)")
+    else:
+        log("WARNING: No exact function ranges - lines_total will be 0")
+
+    # Calculate branches_total from .gcno files (static branch counts)
+    branches_total = 0
+    if exact_function_ranges:
+        source_files_for_branches = set()
+        for range_key in exact_function_ranges.keys():
+            file_path = range_key.rsplit(':', 1)[0]
+            source_files_for_branches.add(file_path)
+
+        log(f"Extracting static branch counts from {len(source_files_for_branches)} source files...")
+        static_branch_counts = extract_static_branch_counts(
+            build_dir,
+            source_files_for_branches,
+            exact_function_ranges,
+            filter_system_branches=True
+        )
+
+        branches_total = sum(static_branch_counts.values())
+        log(f"Static branches_total: {branches_total} (from {len(static_branch_counts)} functions)")
+    else:
+        log("WARNING: No exact function ranges - branches_total will be 0")
+
     # Reset coverage
+    log("")
     log("Resetting gcda files...")
     reset_gcda_files(build_dir)
     
@@ -753,22 +795,23 @@ def replay_recipes_timeline(
     checkpoints = []
     stop_monitoring = threading.Event()
     start_time = time.time()
-    
+    max_duration_seconds = max_duration_minutes * 60
+
     def checkpoint_monitor():
         """Background thread that extracts coverage every checkpoint_interval seconds"""
         checkpoint_num = 0
         while not stop_monitoring.is_set():
             time.sleep(checkpoint_interval)
-            
+
             if stop_monitoring.is_set():
                 break
-            
+
             checkpoint_num += 1
             wall_elapsed = time.time() - start_time
-            
+
             log(f"\n[CHECKPOINT {checkpoint_num}] at wall-time {wall_elapsed:.1f}s")
             log(f"[CHECKPOINT {checkpoint_num}] Extracting coverage...")
-            
+
             extract_start = time.time()
             try:
                 coverage_data = extract_coverage_fastcov(
@@ -777,23 +820,34 @@ def replay_recipes_timeline(
                     changed_functions=changed_functions,
                     exact_function_ranges=exact_function_ranges
                 )
-                
+
                 extract_time = time.time() - extract_start
-                
+
+                lines_hit = coverage_data['summary']['lines_hit']
+                branches_taken = coverage_data['summary']['branches_taken']
+
+                # Calculate percentages (like legacy mode)
+                lines_coverage_pct = 100.0 * lines_hit / lines_total if lines_total > 0 else 0.0
+                branches_coverage_pct = 100.0 * branches_taken / branches_total if branches_total > 0 else 0.0
+
                 checkpoint = {
                     'checkpoint_number': checkpoint_num,
                     'wall_time_seconds': wall_elapsed,
                     'recipes_processed': recipes_processed['count'],
-                    'lines_hit': coverage_data['summary']['lines_hit'],
-                    'branches_taken': coverage_data['summary']['branches_taken'],
+                    'lines_hit': lines_hit,
+                    'lines_total': lines_total,
+                    'lines_coverage_pct': lines_coverage_pct,
+                    'branches_taken': branches_taken,
+                    'branches_total': branches_total,
+                    'branches_coverage_pct': branches_coverage_pct,
                     'function_calls': sum(coverage_data['function_counts'].values()),
                     'extract_time_seconds': extract_time
                 }
-                
+
                 checkpoints.append(checkpoint)
-                
-                log(f"[CHECKPOINT {checkpoint_num}] Lines hit: {coverage_data['summary']['lines_hit']}")
-                log(f"[CHECKPOINT {checkpoint_num}] Branches taken: {checkpoint['branches_taken']}")
+
+                log(f"[CHECKPOINT {checkpoint_num}] Lines: {lines_hit}/{lines_total} ({lines_coverage_pct:.2f}%)")
+                log(f"[CHECKPOINT {checkpoint_num}] Branches: {branches_taken}/{branches_total} ({branches_coverage_pct:.2f}%)")
                 log(f"[CHECKPOINT {checkpoint_num}] Recipes processed: {recipes_processed['count']}/{len(recipes_with_ts)}")
                 log(f"[CHECKPOINT {checkpoint_num}] Extraction took {extract_time:.1f}s\n")
             except Exception as e:
@@ -812,22 +866,33 @@ def replay_recipes_timeline(
     
     successful = 0
     failed = 0
-    
+    time_limit_reached = False
+
     for idx, recipe in enumerate(recipes_with_ts):
+        # Check time limit
+        elapsed_time = time.time() - start_time
+        if elapsed_time > max_duration_seconds:
+            log(f"\n⏱️  TIME LIMIT REACHED: {elapsed_time:.1f}s > {max_duration_seconds}s")
+            log(f"   Stopping after processing {idx} recipes")
+            time_limit_reached = True
+            break
+
         seed_path = recipe.get('seed_path')
         rng_seed = recipe.get('rng_seed', 42)
         iteration = recipe.get('iteration', 0)
         chain = recipe.get('chain', [])
-        
+
         if (idx + 1) % 100 == 0:
-            log(f"Processing recipe {idx+1}/{len(recipes_with_ts)} (t={recipe['timestamp']:.1f}s)...")
-        
+            elapsed = time.time() - start_time
+            remaining = max_duration_seconds - elapsed
+            log(f"Processing recipe {idx+1}/{len(recipes_with_ts)} (t={recipe['timestamp']:.1f}s, elapsed={elapsed:.0f}s, remaining={remaining:.0f}s)...")
+
         # Regenerate mutation (with chain support)
         mutated_content = regenerate_mutation(seed_path, rng_seed, iteration, chain)
         if mutated_content is None:
             failed += 1
             continue
-        
+
         # Write to temp file
         test_file = Path(test_output_dir) / f"test_{idx}.smt2"
         try:
@@ -837,16 +902,16 @@ def replay_recipes_timeline(
             log(f"  ERROR writing test file: {e}")
             failed += 1
             continue
-        
+
         # Run solver to generate coverage
         success = run_solver_with_coverage(str(test_file), solver_path, timeout, z3_memory_mb)
         if success:
             successful += 1
         else:
             failed += 1
-        
+
         recipes_processed['count'] = idx + 1
-        
+
         # Clean up test file
         try:
             test_file.unlink()
@@ -868,15 +933,25 @@ def replay_recipes_timeline(
         changed_functions=changed_functions,
         exact_function_ranges=exact_function_ranges
     )
-    
+
+    lines_hit_final = final_coverage['summary']['lines_hit']
+    branches_taken_final = final_coverage['summary']['branches_taken']
+    lines_coverage_pct_final = 100.0 * lines_hit_final / lines_total if lines_total > 0 else 0.0
+    branches_coverage_pct_final = 100.0 * branches_taken_final / branches_total if branches_total > 0 else 0.0
+
     final_checkpoint = {
         'checkpoint_number': len(checkpoints) + 1,
         'wall_time_seconds': time.time() - start_time,
-        'recipes_processed': len(recipes_with_ts),
-        'lines_hit': final_coverage['summary']['lines_hit'],
-        'branches_taken': final_coverage['summary']['branches_taken'],
+        'recipes_processed': recipes_processed['count'],
+        'lines_hit': lines_hit_final,
+        'lines_total': lines_total,
+        'lines_coverage_pct': lines_coverage_pct_final,
+        'branches_taken': branches_taken_final,
+        'branches_total': branches_total,
+        'branches_coverage_pct': branches_coverage_pct_final,
         'function_calls': sum(final_coverage['function_counts'].values()),
-        'is_final': True
+        'is_final': True,
+        'time_limit_reached': time_limit_reached
     }
     checkpoints.append(final_checkpoint)
     
@@ -887,16 +962,27 @@ def replay_recipes_timeline(
         "recipe_file": recipe_file,
         "timeline_mode": True,
         "checkpoint_interval_seconds": checkpoint_interval,
-        "recipes_processed": len(recipes_with_ts),
+        "max_duration_minutes": max_duration_minutes,
+        "time_limit_reached": time_limit_reached,
+        "recipes_processed": recipes_processed['count'],
+        "total_recipes_in_file": len(recipes_with_ts),
         "successful_runs": successful,
         "failed_runs": failed,
         "num_checkpoints": len(checkpoints),
         "checkpoints": checkpoints,
         "elapsed_seconds": elapsed,
-        "recipes_per_second": len(recipes_with_ts) / elapsed if elapsed > 0 else 0,
+        "recipes_per_second": recipes_processed['count'] / elapsed if elapsed > 0 else 0,
+        "static_coverage": {
+            "lines_total": lines_total,
+            "branches_total": branches_total
+        },
         "final_coverage": {
             "lines_hit": final_checkpoint['lines_hit'],
+            "lines_total": lines_total,
+            "lines_coverage_pct": lines_coverage_pct_final,
             "branches_taken": final_checkpoint['branches_taken'],
+            "branches_total": branches_total,
+            "branches_coverage_pct": branches_coverage_pct_final,
             "function_calls": final_checkpoint['function_calls']
         }
     }
@@ -908,11 +994,19 @@ def replay_recipes_timeline(
     
     log("")
     log("=" * 60)
-    log("✅ TIMELINE REPLAY COMPLETE")
-    log(f"Processed: {len(recipes_with_ts)} recipes ({successful} ok, {failed} failed)")
+    if time_limit_reached:
+        log("⏱️  TIMELINE REPLAY COMPLETE (TIME LIMIT REACHED)")
+    else:
+        log("✅ TIMELINE REPLAY COMPLETE")
+    log(f"Processed: {recipes_processed['count']}/{len(recipes_with_ts)} recipes ({successful} ok, {failed} failed)")
     log(f"Checkpoints: {len(checkpoints)}")
     log(f"Total time: {elapsed/60:.1f} minutes")
-    log(f"Final coverage: {final_checkpoint['lines_hit']} lines, {final_checkpoint['branches_taken']} branches")
+    log(f"")
+    log(f"FINAL COVERAGE:")
+    log(f"  Lines: {final_checkpoint['lines_hit']}/{lines_total} ({lines_coverage_pct_final:.2f}%)")
+    log(f"  Branches: {final_checkpoint['branches_taken']}/{branches_total} ({branches_coverage_pct_final:.2f}%)")
+    log(f"  Function calls: {final_checkpoint['function_calls']:,}")
+    log(f"")
     log(f"Results saved to: {output_file}")
     log("=" * 60)
     
@@ -937,9 +1031,10 @@ def main():
     parser.add_argument("--seeds-file", help="Optional seeds file to filter recipes")
     parser.add_argument("--z3-memory-mb", type=int, default=4096, help="Z3 memory limit in MB")
     parser.add_argument("--checkpoint-interval", type=int, default=60, help="Coverage checkpoint interval in seconds")
-    
+    parser.add_argument("--max-duration-minutes", type=int, default=20, help="Maximum runtime in minutes (default: 20)")
+
     args = parser.parse_args()
-    
+
     result = replay_recipes_timeline(
         recipe_file=args.recipe_file,
         solver_path=args.solver_path,
@@ -950,7 +1045,8 @@ def main():
         timeout=args.timeout,
         seeds_file=args.seeds_file,
         z3_memory_mb=args.z3_memory_mb,
-        checkpoint_interval=args.checkpoint_interval
+        checkpoint_interval=args.checkpoint_interval,
+        max_duration_minutes=args.max_duration_minutes
     )
     
     if "error" in result:
