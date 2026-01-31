@@ -916,66 +916,67 @@ def replay_recipes_timeline(
     if len(buckets) > 5:
         log(f"  ... and {len(buckets) - 5} more buckets")
 
-    # Process buckets in order with parallel workers
+    # Process buckets sequentially with wall-clock checkpoints
     log("")
     log("=" * 60)
-    log("Processing buckets in parallel (4 workers per bucket)...")
+    log("Processing recipes with wall-clock checkpoints every 60s...")
     log("=" * 60)
 
     successful = 0
     failed = 0
     time_limit_reached = False
     recipes_count = 0
+    next_checkpoint_wall_time = start_time + checkpoint_interval
+    checkpoint_num = 0
 
     for bucket_time in sorted(buckets.keys()):
-        # Check wall-clock time limit
-        elapsed_time = time.time() - start_time
-        if elapsed_time > max_duration_seconds:
-            log(f"\n⏱️  TIME LIMIT REACHED: {elapsed_time:.1f}s > {max_duration_seconds}s")
-            log(f"   Stopping before bucket fuzzing-time {bucket_time}s")
-            time_limit_reached = True
-            break
-
         bucket_recipes = buckets[bucket_time]
-        log(f"\n[BUCKET fuzzing-time ≤ {bucket_time}s] Processing {len(bucket_recipes)} recipes with {num_workers} workers...")
+        log(f"\n[BUCKET fuzzing-time ≤ {bucket_time}s] Starting {len(bucket_recipes)} recipes...")
 
-        # Prepare arguments for parallel workers
-        worker_args = [
-            (recipe, solver_path, timeout, test_output_dir)
-            for recipe in bucket_recipes
-        ]
+        # Process recipes in batches (checkpoint between batches if needed)
+        batch_size = num_workers  # Process 4 recipes at a time
+        for i in range(0, len(bucket_recipes), batch_size):
+            # Check wall-clock time limit (20 minutes)
+            elapsed_time = time.time() - start_time
+            if elapsed_time > max_duration_seconds:
+                log(f"\n⏱️  TIME LIMIT REACHED: {elapsed_time:.1f}s > {max_duration_seconds}s")
+                time_limit_reached = True
+                break
 
-        # Execute bucket in parallel
-        bucket_start = time.time()
-        with multiprocessing.Pool(num_workers) as pool:
-            results = pool.map(execute_recipe_worker, worker_args)
+            # Check if we should record a checkpoint
+            current_time = time.time()
+            if current_time >= next_checkpoint_wall_time:
+                checkpoint_num += 1
+                log(f"\n[CHECKPOINT {checkpoint_num}] Wall-clock checkpoint at {elapsed_time:.1f}s")
+                log(f"  Current bucket: fuzzing-time ≤ {bucket_time}s")
+                log(f"  Recipes processed so far: {recipes_count}/{len(recipes_with_ts)}")
+                record_checkpoint(bucket_time, recipes_count)
+                next_checkpoint_wall_time += checkpoint_interval
 
-        bucket_elapsed = time.time() - bucket_start
+            # Process batch
+            batch = bucket_recipes[i:i+batch_size]
+            worker_args = [
+                (recipe, solver_path, timeout, test_output_dir)
+                for recipe in batch
+            ]
 
-        # Count successes/failures
-        for success, _ in results:
-            if success:
-                successful += 1
-            else:
-                failed += 1
+            with multiprocessing.Pool(num_workers) as pool:
+                results = pool.map(execute_recipe_worker, worker_args)
 
-        recipes_count += len(bucket_recipes)
+            # Count successes/failures
+            for success, _ in results:
+                if success:
+                    successful += 1
+                else:
+                    failed += 1
 
-        log(f"[BUCKET fuzzing-time ≤ {bucket_time}s] Completed in {bucket_elapsed:.1f}s ({len(bucket_recipes)/bucket_elapsed:.1f} recipes/s)")
+            recipes_count += len(results)
 
-        # Record checkpoint after bucket completes
-        record_checkpoint(bucket_time, recipes_count)
-
-        # Update next checkpoint time for any remaining checkpoints
-        next_checkpoint_fuzzing_time = bucket_time + checkpoint_interval
-
-        # Check time limit again after bucket completes (buckets can take a long time)
-        elapsed_time = time.time() - start_time
-        if elapsed_time > max_duration_seconds:
-            log(f"\n⏱️  TIME LIMIT REACHED after bucket: {elapsed_time:.1f}s > {max_duration_seconds}s")
-            log(f"   Stopping after completing bucket fuzzing-time {bucket_time}s")
-            time_limit_reached = True
+        if time_limit_reached:
             break
+
+        elapsed = time.time() - start_time
+        log(f"[BUCKET fuzzing-time ≤ {bucket_time}s] Completed all {len(bucket_recipes)} recipes (total time: {elapsed:.1f}s)")
 
     log("")
     log("=" * 60)
