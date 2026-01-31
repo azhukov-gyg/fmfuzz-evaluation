@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
-Timeline Recipe Replay for Z3 - Processes recipes in exact timestamp order with periodic coverage checkpoints.
+Timeline Recipe Replay for Z3 - Processes recipes by fuzzing timestamp with periodic coverage checkpoints.
 
-TIMELINE MODE: Recipes processed one-by-one in exact fuzzing timestamp order.
-- Recipes sorted by their 'timestamp' field (fuzzing time when generated)
-- Coverage extracted every N seconds of wall-clock measurement time
-- No grouping/batching - trades efficiency for accurate timeline replay
+TIMELINE MODE: Recipes grouped into fuzzing time buckets and processed in parallel.
+- Recipes sorted by their 'timestamp' field (fuzzing time when discovered)
+- Grouped into buckets by fuzzing time (e.g., 0-60s, 60-120s, 120-180s)
+- Within each bucket: parallel execution with 4 workers for speed
+- Coverage checkpoints at bucket boundaries (fuzzing t=60s, 120s, 180s, etc.)
+- Wall-clock time limit (20 minutes) prevents excessive measurement time
+
+Correctness: Coverage accumulation is order-independent within buckets. All recipes
+with timestamp ≤ T are executed before checkpoint T, ensuring accurate timeline.
 
 Used for generating cumulative coverage timelines to compare fuzzing strategies.
+Shows "how fast did fuzzing discover coverage?" not "how fast can we execute recipes?"
 """
 
 import argparse
 import json
+import multiprocessing
 import os
 import random
 import shutil
@@ -19,7 +26,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -649,7 +655,7 @@ def run_solver_with_coverage(test_file: str, solver_path: str, timeout: int, z3_
     try:
         env = os.environ.copy()
         env['Z3_MAX_MEMORY'] = str(z3_memory_mb)
-        
+
         result = subprocess.run(
             [solver_path, test_file],
             capture_output=True,
@@ -664,6 +670,49 @@ def run_solver_with_coverage(test_file: str, solver_path: str, timeout: int, z3_
         return False
 
 
+def execute_recipe_worker(args: tuple) -> tuple:
+    """
+    Worker function to execute a single recipe in parallel.
+
+    Args:
+        args: (recipe_dict, solver_path, timeout, z3_memory_mb, test_output_dir)
+
+    Returns:
+        (success: bool, recipe_index: int)
+    """
+    recipe, solver_path, timeout, z3_memory_mb, test_output_dir = args
+
+    seed_path = recipe.get('seed_path')
+    rng_seed = recipe.get('rng_seed', 42)
+    iteration = recipe.get('iteration', 0)
+    chain = recipe.get('chain', [])
+    recipe_idx = recipe.get('_idx', 0)  # For unique test file naming
+
+    try:
+        # Regenerate mutation
+        mutated_content = regenerate_mutation(seed_path, rng_seed, iteration, chain)
+        if mutated_content is None:
+            return (False, recipe_idx)
+
+        # Write to temp file with unique name
+        test_file = Path(test_output_dir) / f"test_{os.getpid()}_{recipe_idx}.smt2"
+        with open(test_file, 'w') as f:
+            f.write(mutated_content)
+
+        # Run solver
+        success = run_solver_with_coverage(str(test_file), solver_path, timeout, z3_memory_mb)
+
+        # Clean up
+        try:
+            test_file.unlink()
+        except:
+            pass
+
+        return (success, recipe_idx)
+    except Exception as e:
+        return (False, recipe_idx)
+
+
 def replay_recipes_timeline(
     recipe_file: str,
     solver_path: str,
@@ -675,18 +724,22 @@ def replay_recipes_timeline(
     seeds_file: Optional[str] = None,
     z3_memory_mb: int = 4096,
     checkpoint_interval: int = 60,
-    max_duration_minutes: int = 20
+    max_duration_minutes: int = 20,
+    num_workers: int = 4
 ) -> dict:
     """
     Replay recipes in exact timestamp order with periodic coverage extraction.
 
     Args:
-        max_duration_minutes: Maximum runtime in minutes (default: 20)
+        checkpoint_interval: Record coverage every N seconds of fuzzing time (default: 60)
+        max_duration_minutes: Maximum wall-clock runtime in minutes (default: 20)
+        num_workers: Number of parallel workers within each fuzzing time bucket (default: 4)
     """
     log("=" * 60)
     log(f"TIMELINE RECIPE REPLAY")
-    log(f"Checkpoint interval: {checkpoint_interval}s (wall-clock time)")
-    log(f"Time limit: {max_duration_minutes} minutes")
+    log(f"Checkpoint interval: {checkpoint_interval}s (fuzzing time)")
+    log(f"Time limit: {max_duration_minutes} minutes (wall-clock time)")
+    log(f"Parallel workers: {num_workers} per fuzzing time bucket")
     log("=" * 60)
     
     solver_path = os.path.abspath(solver_path)
@@ -790,143 +843,141 @@ def replay_recipes_timeline(
     test_output_dir = tempfile.mkdtemp(prefix='timeline_tests_')
     log(f"Test directory: {test_output_dir}")
     
-    # Shared state for monitoring
-    recipes_processed = {'count': 0}
+    # Checkpoint state
     checkpoints = []
-    stop_monitoring = threading.Event()
+    next_checkpoint_fuzzing_time = checkpoint_interval  # First checkpoint at fuzzing t=60s
+    checkpoint_num = 0
     start_time = time.time()
     max_duration_seconds = max_duration_minutes * 60
 
-    def checkpoint_monitor():
-        """Background thread that extracts coverage every checkpoint_interval seconds"""
-        checkpoint_num = 0
-        while not stop_monitoring.is_set():
-            time.sleep(checkpoint_interval)
+    def record_checkpoint(current_fuzzing_time: float, recipes_count: int):
+        """Extract and record a checkpoint at the current fuzzing timestamp."""
+        nonlocal checkpoint_num
+        checkpoint_num += 1
+        wall_elapsed = time.time() - start_time
 
-            if stop_monitoring.is_set():
-                break
+        log(f"\n[CHECKPOINT {checkpoint_num}] at fuzzing-time {current_fuzzing_time:.1f}s (wall-time {wall_elapsed:.1f}s)")
+        log(f"[CHECKPOINT {checkpoint_num}] Extracting coverage...")
 
-            checkpoint_num += 1
-            wall_elapsed = time.time() - start_time
+        extract_start = time.time()
+        try:
+            coverage_data = extract_coverage_fastcov(
+                build_dir=build_dir,
+                gcov_cmd=gcov_cmd,
+                changed_functions=changed_functions,
+                exact_function_ranges=exact_function_ranges
+            )
 
-            log(f"\n[CHECKPOINT {checkpoint_num}] at wall-time {wall_elapsed:.1f}s")
-            log(f"[CHECKPOINT {checkpoint_num}] Extracting coverage...")
+            extract_time = time.time() - extract_start
 
-            extract_start = time.time()
-            try:
-                coverage_data = extract_coverage_fastcov(
-                    build_dir=build_dir,
-                    gcov_cmd=gcov_cmd,
-                    changed_functions=changed_functions,
-                    exact_function_ranges=exact_function_ranges
-                )
+            lines_hit = coverage_data['summary']['lines_hit']
+            branches_taken = coverage_data['summary']['branches_taken']
 
-                extract_time = time.time() - extract_start
+            # Calculate percentages (like legacy mode)
+            lines_coverage_pct = 100.0 * lines_hit / lines_total if lines_total > 0 else 0.0
+            branches_coverage_pct = 100.0 * branches_taken / branches_total if branches_total > 0 else 0.0
 
-                lines_hit = coverage_data['summary']['lines_hit']
-                branches_taken = coverage_data['summary']['branches_taken']
+            checkpoint = {
+                'checkpoint_number': checkpoint_num,
+                'fuzzing_time_seconds': current_fuzzing_time,
+                'wall_time_seconds': wall_elapsed,
+                'recipes_processed': recipes_count,
+                'lines_hit': lines_hit,
+                'lines_total': lines_total,
+                'lines_coverage_pct': lines_coverage_pct,
+                'branches_taken': branches_taken,
+                'branches_total': branches_total,
+                'branches_coverage_pct': branches_coverage_pct,
+                'function_calls': sum(coverage_data['function_counts'].values()),
+                'extract_time_seconds': extract_time
+            }
 
-                # Calculate percentages (like legacy mode)
-                lines_coverage_pct = 100.0 * lines_hit / lines_total if lines_total > 0 else 0.0
-                branches_coverage_pct = 100.0 * branches_taken / branches_total if branches_total > 0 else 0.0
+            checkpoints.append(checkpoint)
 
-                checkpoint = {
-                    'checkpoint_number': checkpoint_num,
-                    'wall_time_seconds': wall_elapsed,
-                    'recipes_processed': recipes_processed['count'],
-                    'lines_hit': lines_hit,
-                    'lines_total': lines_total,
-                    'lines_coverage_pct': lines_coverage_pct,
-                    'branches_taken': branches_taken,
-                    'branches_total': branches_total,
-                    'branches_coverage_pct': branches_coverage_pct,
-                    'function_calls': sum(coverage_data['function_counts'].values()),
-                    'extract_time_seconds': extract_time
-                }
-
-                checkpoints.append(checkpoint)
-
-                log(f"[CHECKPOINT {checkpoint_num}] Lines: {lines_hit}/{lines_total} ({lines_coverage_pct:.2f}%)")
-                log(f"[CHECKPOINT {checkpoint_num}] Branches: {branches_taken}/{branches_total} ({branches_coverage_pct:.2f}%)")
-                log(f"[CHECKPOINT {checkpoint_num}] Recipes processed: {recipes_processed['count']}/{len(recipes_with_ts)}")
-                log(f"[CHECKPOINT {checkpoint_num}] Extraction took {extract_time:.1f}s\n")
-            except Exception as e:
-                log(f"[CHECKPOINT {checkpoint_num}] ERROR: {e}")
+            log(f"[CHECKPOINT {checkpoint_num}] Lines: {lines_hit}/{lines_total} ({lines_coverage_pct:.2f}%)")
+            log(f"[CHECKPOINT {checkpoint_num}] Branches: {branches_taken}/{branches_total} ({branches_coverage_pct:.2f}%)")
+            log(f"[CHECKPOINT {checkpoint_num}] Recipes processed: {recipes_count}/{len(recipes_with_ts)}")
+            log(f"[CHECKPOINT {checkpoint_num}] Extraction took {extract_time:.1f}s\n")
+        except Exception as e:
+            log(f"[CHECKPOINT {checkpoint_num}] ERROR: {e}")
     
-    # Start monitoring thread
-    monitor_thread = threading.Thread(target=checkpoint_monitor, daemon=True)
-    monitor_thread.start()
-    log(f"Started background checkpoint monitor (every {checkpoint_interval}s)")
-    
-    # Process recipes in exact timestamp order
+    # Group recipes into fuzzing time buckets for parallel processing
     log("")
     log("=" * 60)
-    log("Processing recipes in timestamp order...")
+    log("Grouping recipes into fuzzing time buckets...")
     log("=" * 60)
-    
+
+    buckets = defaultdict(list)
+    for idx, recipe in enumerate(recipes_with_ts):
+        fuzzing_time = recipe.get('timestamp', 0)
+        # Assign to bucket based on fuzzing time (round up to next checkpoint)
+        bucket_time = ((int(fuzzing_time) // checkpoint_interval) + 1) * checkpoint_interval
+        recipe['_idx'] = idx  # Track original index for logging
+        buckets[bucket_time].append(recipe)
+
+    log(f"Created {len(buckets)} fuzzing time buckets")
+    for bucket_time in sorted(buckets.keys())[:5]:
+        log(f"  Bucket t={bucket_time}s: {len(buckets[bucket_time])} recipes")
+    if len(buckets) > 5:
+        log(f"  ... and {len(buckets) - 5} more buckets")
+
+    # Process buckets in order with parallel workers
+    log("")
+    log("=" * 60)
+    log("Processing buckets in parallel (4 workers per bucket)...")
+    log("=" * 60)
+
     successful = 0
     failed = 0
     time_limit_reached = False
+    recipes_count = 0
 
-    for idx, recipe in enumerate(recipes_with_ts):
-        # Check time limit
+    for bucket_time in sorted(buckets.keys()):
+        # Check wall-clock time limit
         elapsed_time = time.time() - start_time
         if elapsed_time > max_duration_seconds:
             log(f"\n⏱️  TIME LIMIT REACHED: {elapsed_time:.1f}s > {max_duration_seconds}s")
-            log(f"   Stopping after processing {idx} recipes")
+            log(f"   Stopping before bucket fuzzing-time {bucket_time}s")
             time_limit_reached = True
             break
 
-        seed_path = recipe.get('seed_path')
-        rng_seed = recipe.get('rng_seed', 42)
-        iteration = recipe.get('iteration', 0)
-        chain = recipe.get('chain', [])
+        bucket_recipes = buckets[bucket_time]
+        log(f"\n[BUCKET fuzzing-time ≤ {bucket_time}s] Processing {len(bucket_recipes)} recipes with {num_workers} workers...")
 
-        if (idx + 1) % 100 == 0:
-            elapsed = time.time() - start_time
-            remaining = max_duration_seconds - elapsed
-            log(f"Processing recipe {idx+1}/{len(recipes_with_ts)} (t={recipe['timestamp']:.1f}s, elapsed={elapsed:.0f}s, remaining={remaining:.0f}s)...")
+        # Prepare arguments for parallel workers
+        worker_args = [
+            (recipe, solver_path, timeout, z3_memory_mb, test_output_dir)
+            for recipe in bucket_recipes
+        ]
 
-        # Regenerate mutation (with chain support)
-        mutated_content = regenerate_mutation(seed_path, rng_seed, iteration, chain)
-        if mutated_content is None:
-            failed += 1
-            continue
+        # Execute bucket in parallel
+        bucket_start = time.time()
+        with multiprocessing.Pool(num_workers) as pool:
+            results = pool.map(execute_recipe_worker, worker_args)
 
-        # Write to temp file
-        test_file = Path(test_output_dir) / f"test_{idx}.smt2"
-        try:
-            with open(test_file, 'w') as f:
-                f.write(mutated_content)
-        except Exception as e:
-            log(f"  ERROR writing test file: {e}")
-            failed += 1
-            continue
+        bucket_elapsed = time.time() - bucket_start
 
-        # Run solver to generate coverage
-        success = run_solver_with_coverage(str(test_file), solver_path, timeout, z3_memory_mb)
-        if success:
-            successful += 1
-        else:
-            failed += 1
+        # Count successes/failures
+        for success, _ in results:
+            if success:
+                successful += 1
+            else:
+                failed += 1
+        recipes_count += len(bucket_recipes)
 
-        recipes_processed['count'] = idx + 1
+        log(f"[BUCKET fuzzing-time ≤ {bucket_time}s] Completed in {bucket_elapsed:.1f}s ({len(bucket_recipes)/bucket_elapsed:.1f} recipes/s)")
 
-        # Clean up test file
-        try:
-            test_file.unlink()
-        except:
-            pass
-    
-    # Stop monitoring and get final checkpoint
-    stop_monitoring.set()
-    monitor_thread.join(timeout=5)
-    
+        # Record checkpoint after bucket completes
+        record_checkpoint(bucket_time, recipes_count)
+
     log("")
     log("=" * 60)
     log("Extracting final coverage...")
     log("=" * 60)
-    
+
+    # Get final fuzzing timestamp from last processed recipe
+    final_fuzzing_time = recipes_with_ts[recipes_count - 1]['timestamp'] if recipes_count > 0 else 0
+
     final_coverage = extract_coverage_fastcov(
         build_dir=build_dir,
         gcov_cmd=gcov_cmd,
@@ -941,8 +992,9 @@ def replay_recipes_timeline(
 
     final_checkpoint = {
         'checkpoint_number': len(checkpoints) + 1,
+        'fuzzing_time_seconds': final_fuzzing_time,
         'wall_time_seconds': time.time() - start_time,
-        'recipes_processed': recipes_processed['count'],
+        'recipes_processed': recipes_count,
         'lines_hit': lines_hit_final,
         'lines_total': lines_total,
         'lines_coverage_pct': lines_coverage_pct_final,
@@ -961,17 +1013,18 @@ def replay_recipes_timeline(
     results = {
         "recipe_file": recipe_file,
         "timeline_mode": True,
-        "checkpoint_interval_seconds": checkpoint_interval,
-        "max_duration_minutes": max_duration_minutes,
+        "checkpoint_interval_seconds": checkpoint_interval,  # Fuzzing time intervals
+        "max_duration_minutes": max_duration_minutes,  # Wall-clock time limit
         "time_limit_reached": time_limit_reached,
-        "recipes_processed": recipes_processed['count'],
+        "recipes_processed": recipes_count,
         "total_recipes_in_file": len(recipes_with_ts),
         "successful_runs": successful,
         "failed_runs": failed,
+        "fuzzing_timespan_seconds": final_fuzzing_time,
         "num_checkpoints": len(checkpoints),
         "checkpoints": checkpoints,
         "elapsed_seconds": elapsed,
-        "recipes_per_second": recipes_processed['count'] / elapsed if elapsed > 0 else 0,
+        "recipes_per_second": recipes_count / elapsed if elapsed > 0 else 0,
         "static_coverage": {
             "lines_total": lines_total,
             "branches_total": branches_total
@@ -1005,9 +1058,10 @@ def replay_recipes_timeline(
         log("⏱️  TIMELINE REPLAY COMPLETE (TIME LIMIT REACHED)")
     else:
         log("✅ TIMELINE REPLAY COMPLETE")
-    log(f"Processed: {recipes_processed['count']}/{len(recipes_with_ts)} recipes ({successful} ok, {failed} failed)")
+    log(f"Processed: {recipes_count}/{len(recipes_with_ts)} recipes ({successful} ok, {failed} failed)")
+    log(f"Fuzzing timespan covered: 0s - {final_fuzzing_time:.1f}s")
+    log(f"Wall-clock time: {elapsed/60:.1f} minutes")
     log(f"Checkpoints: {len(checkpoints)}")
-    log(f"Total time: {elapsed/60:.1f} minutes")
     log(f"")
     log(f"FINAL COVERAGE:")
     log(f"  Lines: {final_checkpoint['lines_hit']}/{lines_total} ({lines_coverage_pct_final:.2f}%)")
@@ -1037,8 +1091,8 @@ def main():
     parser.add_argument("--timeout", type=int, default=60, help="Solver timeout in seconds")
     parser.add_argument("--seeds-file", help="Optional seeds file to filter recipes")
     parser.add_argument("--z3-memory-mb", type=int, default=4096, help="Z3 memory limit in MB")
-    parser.add_argument("--checkpoint-interval", type=int, default=60, help="Coverage checkpoint interval in seconds")
-    parser.add_argument("--max-duration-minutes", type=int, default=20, help="Maximum runtime in minutes (default: 20)")
+    parser.add_argument("--checkpoint-interval", type=int, default=60, help="Coverage checkpoint interval in fuzzing-time seconds (default: 60)")
+    parser.add_argument("--max-duration-minutes", type=int, default=20, help="Maximum wall-clock runtime in minutes (default: 20)")
 
     args = parser.parse_args()
 

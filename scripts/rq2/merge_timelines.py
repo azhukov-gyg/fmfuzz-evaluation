@@ -50,32 +50,31 @@ def merge_checkpoints_by_time(
     """
     Merge checkpoints from parallel jobs into time-aligned cumulative checkpoints.
 
-    Since jobs run in parallel on different recipes, we align checkpoints to common
-    time intervals (e.g., 60s, 120s, 180s) and aggregate metrics.
+    Since jobs run in parallel on different seed groups, we align checkpoints to common
+    FUZZING time intervals (e.g., fuzzing t=60s, 120s, 180s) and aggregate metrics.
 
-    IMPORTANT: Coverage metrics (lines_hit, branches_taken) are summed across jobs.
-    This is an approximation that assumes minimal overlap in which lines/branches
-    are covered by different jobs' recipes. The true merged coverage can only be
-    determined by merging .gcda files at the end, which the workflow does separately.
+    Each job processes recipes from its assigned seeds in fuzzing timestamp order.
+    All jobs checkpoint when they reach the same fuzzing timestamp (e.g., all jobs
+    checkpoint at fuzzing t=60s when they finish processing recipes discovered by t=60s).
 
-    The cumulative timeline shows:
-    - Total recipes processed (exact)
-    - Approximate combined coverage (may slightly overestimate if there's overlap)
+    Coverage metrics (lines_hit, branches_taken) are summed across jobs, representing
+    the combined coverage from all parallel fuzzing workers' discoveries up to that time.
 
     Args:
         checkpoints: All checkpoints from all jobs
-        checkpoint_interval: Interval in seconds (e.g., 60)
+        checkpoint_interval: Interval in fuzzing-time seconds (e.g., 60)
 
     Returns:
-        List of cumulative checkpoints aligned to time intervals
+        List of cumulative checkpoints aligned to fuzzing time intervals
     """
-    # Group checkpoints by time bucket
+    # Group checkpoints by fuzzing time bucket
     time_buckets = {}
 
     for checkpoint in checkpoints:
-        wall_time = checkpoint.get('wall_time_seconds', 0)
-        # Round to nearest interval (e.g., 65s -> 60s bucket)
-        time_bucket = round(wall_time / checkpoint_interval) * checkpoint_interval
+        # Use fuzzing_time_seconds (new) or fall back to wall_time_seconds (old)
+        fuzzing_time = checkpoint.get('fuzzing_time_seconds', checkpoint.get('wall_time_seconds', 0))
+        # Round to nearest interval (e.g., 62s -> 60s bucket)
+        time_bucket = round(fuzzing_time / checkpoint_interval) * checkpoint_interval
 
         if time_bucket not in time_buckets:
             time_buckets[time_bucket] = []
@@ -88,14 +87,15 @@ def merge_checkpoints_by_time(
     for time_bucket in sorted(time_buckets.keys()):
         bucket_checkpoints = time_buckets[time_bucket]
 
-        # Sum metrics from all jobs at this time point
+        # Sum metrics from all jobs at this fuzzing time point
         cumulative = {
-            'time_seconds': time_bucket,
+            'fuzzing_time_seconds': time_bucket,
             'num_jobs': len(bucket_checkpoints),
             'recipes_processed': sum(c.get('recipes_processed', 0) for c in bucket_checkpoints),
             'lines_hit': sum(c.get('lines_hit', 0) for c in bucket_checkpoints),
             'branches_taken': sum(c.get('branches_taken', 0) for c in bucket_checkpoints),
             'function_calls': sum(c.get('function_calls', 0) for c in bucket_checkpoints),
+            'avg_wall_time_seconds': sum(c.get('wall_time_seconds', 0) for c in bucket_checkpoints) / len(bucket_checkpoints),
         }
 
         # Take static totals from first checkpoint (should be same across all jobs)
@@ -186,7 +186,8 @@ def main():
         final = cumulative_timeline[-1]
         print("")
         print("FINAL CUMULATIVE COVERAGE:")
-        print(f"  Time: {final.get('time_seconds', 0):.0f}s")
+        print(f"  Fuzzing time: {final.get('fuzzing_time_seconds', 0):.0f}s")
+        print(f"  Avg wall time: {final.get('avg_wall_time_seconds', 0):.0f}s")
         print(f"  Recipes processed: {final.get('recipes_processed', 0):,}")
         if 'lines_coverage_pct' in final:
             print(f"  Lines: {final.get('lines_hit', 0):,}/{final.get('lines_total', 0):,} "
