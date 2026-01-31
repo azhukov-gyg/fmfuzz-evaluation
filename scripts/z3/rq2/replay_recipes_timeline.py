@@ -991,7 +991,14 @@ def replay_recipes_timeline(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, 'w') as f:
         json.dump(results, f, indent=2)
-    
+
+    # Save timeline data as JSONL (one checkpoint per line) for merging across jobs
+    timeline_file = output_path.parent / f"{output_path.stem}_timeline.jsonl"
+    with open(timeline_file, 'w') as f:
+        for checkpoint in checkpoints:
+            f.write(json.dumps(checkpoint) + '\n')
+    log(f"Timeline data saved to: {timeline_file}")
+
     log("")
     log("=" * 60)
     if time_limit_reached:
