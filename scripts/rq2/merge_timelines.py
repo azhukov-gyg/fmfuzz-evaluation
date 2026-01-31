@@ -87,13 +87,30 @@ def merge_checkpoints_by_time(
     for time_bucket in sorted(time_buckets.keys()):
         bucket_checkpoints = time_buckets[time_bucket]
 
-        # Sum metrics from all jobs at this fuzzing time point
+        # Merge coverage dictionaries from all jobs (union, not sum)
+        merged_line_coverage = {}
+        merged_branch_coverage = {}
+
+        for checkpoint in bucket_checkpoints:
+            # Merge line coverage (take union - any line hit by any job counts)
+            for line_key, hit_count in checkpoint.get('line_coverage', {}).items():
+                merged_line_coverage[line_key] = merged_line_coverage.get(line_key, 0) + hit_count
+
+            # Merge branch coverage (take union - any branch taken by any job counts)
+            for branch_key, taken_count in checkpoint.get('branch_coverage', {}).items():
+                merged_branch_coverage[branch_key] = merged_branch_coverage.get(branch_key, 0) + taken_count
+
+        # Count unique lines/branches with >0 hits (proper union)
+        lines_hit = sum(1 for v in merged_line_coverage.values() if v > 0)
+        branches_taken = sum(1 for v in merged_branch_coverage.values() if v > 0)
+
+        # Aggregate metrics across jobs
         cumulative = {
             'fuzzing_time_seconds': time_bucket,
             'num_jobs': len(bucket_checkpoints),
             'recipes_processed': sum(c.get('recipes_processed', 0) for c in bucket_checkpoints),
-            'lines_hit': sum(c.get('lines_hit', 0) for c in bucket_checkpoints),
-            'branches_taken': sum(c.get('branches_taken', 0) for c in bucket_checkpoints),
+            'lines_hit': lines_hit,
+            'branches_taken': branches_taken,
             'function_calls': sum(c.get('function_calls', 0) for c in bucket_checkpoints),
             'avg_wall_time_seconds': sum(c.get('wall_time_seconds', 0) for c in bucket_checkpoints) / len(bucket_checkpoints),
         }

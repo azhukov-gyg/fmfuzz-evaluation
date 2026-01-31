@@ -889,7 +889,10 @@ def replay_recipes_timeline(
                 'branches_total': branches_total,
                 'branches_coverage_pct': branches_coverage_pct,
                 'function_calls': sum(coverage_data['function_counts'].values()),
-                'extract_time_seconds': extract_time
+                'extract_time_seconds': extract_time,
+                # Include full coverage dictionaries for proper union during merge
+                'line_coverage': coverage_data['line_coverage'],
+                'branch_coverage': coverage_data['branch_coverage']
             }
 
             checkpoints.append(checkpoint)
@@ -1016,7 +1019,10 @@ def replay_recipes_timeline(
         'branches_coverage_pct': branches_coverage_pct_final,
         'function_calls': sum(final_coverage['function_counts'].values()),
         'is_final': True,
-        'time_limit_reached': time_limit_reached
+        'time_limit_reached': time_limit_reached,
+        # Include full coverage dictionaries for proper union during merge
+        'line_coverage': final_coverage['line_coverage'],
+        'branch_coverage': final_coverage['branch_coverage']
     }
     checkpoints.append(final_checkpoint)
     
