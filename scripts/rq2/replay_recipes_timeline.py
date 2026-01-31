@@ -969,6 +969,14 @@ def replay_recipes_timeline(
         # Update next checkpoint time for any remaining checkpoints
         next_checkpoint_fuzzing_time = bucket_time + checkpoint_interval
 
+        # Check time limit again after bucket completes (buckets can take a long time)
+        elapsed_time = time.time() - start_time
+        if elapsed_time > max_duration_seconds:
+            log(f"\n⏱️  TIME LIMIT REACHED after bucket: {elapsed_time:.1f}s > {max_duration_seconds}s")
+            log(f"   Stopping after completing bucket fuzzing-time {bucket_time}s")
+            time_limit_reached = True
+            break
+
     log("")
     log("=" * 60)
     log("Extracting final coverage...")
