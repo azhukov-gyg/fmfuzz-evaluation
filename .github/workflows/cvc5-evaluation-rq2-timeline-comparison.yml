@@ -83,21 +83,7 @@ jobs:
         run: |
           if [ -f "timeline_comparison.json" ]; then
             echo "=== TIMELINE COMPARISON SUMMARY ==="
-            echo "Time axis: ${{ inputs.time_axis }}"
-            python3 -c "
-import json
-with open('timeline_comparison.json') as f:
-    data = json.load(f)
-print(f\"Status: {data['status']}\")
-print(f\"Common commits: {data['common_commits']}\")
-if data['results']:
-    print(f\"\nExample commit: {data['results'][0]['commit'][:8]}\")
-    final = data['results'][0].get('final_comparison', {})
-    if final:
-        print(f\"  Baseline final:  {final['baseline']['lines_coverage_pct']:.2f}% lines, {final['baseline']['branches_coverage_pct']:.2f}% branches\")
-        print(f\"  Variant1 final:  {final['variant1']['lines_coverage_pct']:.2f}% lines, {final['variant1']['branches_coverage_pct']:.2f}% branches\")
-        print(f\"  Variant2 final:  {final['variant2']['lines_coverage_pct']:.2f}% lines, {final['variant2']['branches_coverage_pct']:.2f}% branches\")
-"
+            python3 scripts/rq2/display_timeline_comparison.py timeline_comparison.json
           fi
 
       - name: Upload comparison to S3
