@@ -84,25 +84,32 @@ def merge_checkpoints_by_time(
     # Create cumulative checkpoints for each time bucket
     cumulative_checkpoints = []
 
+    # Initialize cumulative coverage dictionaries OUTSIDE loop (accumulate across time)
+    cumulative_line_coverage = {}
+    cumulative_branch_coverage = {}
+
     for time_bucket in sorted(time_buckets.keys()):
         bucket_checkpoints = time_buckets[time_bucket]
 
-        # Merge coverage dictionaries from all jobs (union, not sum)
-        merged_line_coverage = {}
-        merged_branch_coverage = {}
-
+        # Merge coverage from jobs at this time bucket into cumulative dictionaries
         for checkpoint in bucket_checkpoints:
-            # Merge line coverage (take union - any line hit by any job counts)
+            # Merge line coverage (accumulate into cumulative dict)
             for line_key, hit_count in checkpoint.get('line_coverage', {}).items():
-                merged_line_coverage[line_key] = merged_line_coverage.get(line_key, 0) + hit_count
+                cumulative_line_coverage[line_key] = max(
+                    cumulative_line_coverage.get(line_key, 0),
+                    hit_count
+                )
 
-            # Merge branch coverage (take union - any branch taken by any job counts)
+            # Merge branch coverage (accumulate into cumulative dict)
             for branch_key, taken_count in checkpoint.get('branch_coverage', {}).items():
-                merged_branch_coverage[branch_key] = merged_branch_coverage.get(branch_key, 0) + taken_count
+                cumulative_branch_coverage[branch_key] = max(
+                    cumulative_branch_coverage.get(branch_key, 0),
+                    taken_count
+                )
 
-        # Count unique lines/branches with >0 hits (proper union)
-        lines_hit = sum(1 for v in merged_line_coverage.values() if v > 0)
-        branches_taken = sum(1 for v in merged_branch_coverage.values() if v > 0)
+        # Count unique lines/branches from cumulative coverage (monotonically increasing)
+        lines_hit = sum(1 for v in cumulative_line_coverage.values() if v > 0)
+        branches_taken = sum(1 for v in cumulative_branch_coverage.values() if v > 0)
 
         # Aggregate metrics across jobs
         cumulative = {
