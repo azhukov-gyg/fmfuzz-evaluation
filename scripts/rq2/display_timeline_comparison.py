@@ -22,42 +22,80 @@ def display_summary(comparison_file: str):
     print(f"Common commits: {data['common_commits']}")
 
     if not data.get('results'):
-        print("No results to display")
+        print("\nNo results to display")
         return
 
-    # Show example from first commit
-    example = data['results'][0]
-    print(f"\nExample commit: {example['commit'][:8]}")
+    print("\n" + "=" * 100)
+    print("TIMELINE PROGRESSION PER COMMIT")
+    print("=" * 100)
 
-    final = example.get('final_comparison')
-    if not final:
-        print("  No final comparison data available")
-        return
+    # Show timeline progression for all commits
+    for result in data['results']:
+        commit = result['commit']
+        print(f"\nCommit: {commit}")
+        print("=" * 100)
 
-    baseline = final.get('baseline', {})
-    variant1 = final.get('variant1', {})
-    variant2 = final.get('variant2', {})
+        baseline_timeline = result.get('baseline_timeline', [])
+        variant1_timeline = result.get('variant1_timeline', [])
+        variant2_timeline = result.get('variant2_timeline', [])
 
-    print(f"  Baseline final:  {baseline.get('lines_coverage_pct', 0):.2f}% lines, "
-          f"{baseline.get('branches_coverage_pct', 0):.2f}% branches")
-    print(f"  Variant1 final:  {variant1.get('lines_coverage_pct', 0):.2f}% lines, "
-          f"{variant1.get('branches_coverage_pct', 0):.2f}% branches")
-    print(f"  Variant2 final:  {variant2.get('lines_coverage_pct', 0):.2f}% lines, "
-          f"{variant2.get('branches_coverage_pct', 0):.2f}% branches")
+        if not (baseline_timeline or variant1_timeline or variant2_timeline):
+            print("  No timeline data available")
+            continue
 
-    # Show improvements
-    v1_vs_b = final.get('variant1_vs_baseline', {})
-    v2_vs_b = final.get('variant2_vs_baseline', {})
+        # Collect all unique time points
+        all_times = set()
+        for checkpoint in baseline_timeline:
+            all_times.add(checkpoint.get('time', 0))
+        for checkpoint in variant1_timeline:
+            all_times.add(checkpoint.get('time', 0))
+        for checkpoint in variant2_timeline:
+            all_times.add(checkpoint.get('time', 0))
 
-    if v1_vs_b:
-        print(f"\n  Variant1 vs Baseline:")
-        print(f"    Lines: {v1_vs_b.get('lines_diff', 0):+.2f}%")
-        print(f"    Branches: {v1_vs_b.get('branches_diff', 0):+.2f}%")
+        # Show table header
+        print(f"\n{'Time':>6s}  {'Baseline Lines':>15s}  {'Baseline Branches':>17s}  {'Variant1 Lines':>15s}  {'Variant1 Branches':>17s}  {'Variant2 Lines':>15s}  {'Variant2 Branches':>17s}")
+        print(f"{'(s)':>6s}  {'(hit/total/%)':>15s}  {'(taken/total/%)':>17s}  {'(hit/total/%)':>15s}  {'(taken/total/%)':>17s}  {'(hit/total/%)':>15s}  {'(taken/total/%)':>17s}")
+        print("-" * 100)
 
-    if v2_vs_b:
-        print(f"\n  Variant2 vs Baseline:")
-        print(f"    Lines: {v2_vs_b.get('lines_diff', 0):+.2f}%")
-        print(f"    Branches: {v2_vs_b.get('branches_diff', 0):+.2f}%")
+        # Create lookup dictionaries for each variant
+        baseline_by_time = {c.get('time', 0): c for c in baseline_timeline}
+        variant1_by_time = {c.get('time', 0): c for c in variant1_timeline}
+        variant2_by_time = {c.get('time', 0): c for c in variant2_timeline}
+
+        # Show progression at each time point
+        for time_point in sorted(all_times):
+            b_ck = baseline_by_time.get(time_point, {})
+            v1_ck = variant1_by_time.get(time_point, {})
+            v2_ck = variant2_by_time.get(time_point, {})
+
+            # Format baseline
+            b_lines = f"{b_ck.get('lines_hit', 0)}/{b_ck.get('lines_total', 0)} ({b_ck.get('lines_coverage_pct', 0):.1f}%)" if b_ck else "-"
+            b_branches = f"{b_ck.get('branches_taken', 0)}/{b_ck.get('branches_total', 0)} ({b_ck.get('branches_coverage_pct', 0):.1f}%)" if b_ck else "-"
+
+            # Format variant1
+            v1_lines = f"{v1_ck.get('lines_hit', 0)}/{v1_ck.get('lines_total', 0)} ({v1_ck.get('lines_coverage_pct', 0):.1f}%)" if v1_ck else "-"
+            v1_branches = f"{v1_ck.get('branches_taken', 0)}/{v1_ck.get('branches_total', 0)} ({v1_ck.get('branches_coverage_pct', 0):.1f}%)" if v1_ck else "-"
+
+            # Format variant2
+            v2_lines = f"{v2_ck.get('lines_hit', 0)}/{v2_ck.get('lines_total', 0)} ({v2_ck.get('lines_coverage_pct', 0):.1f}%)" if v2_ck else "-"
+            v2_branches = f"{v2_ck.get('branches_taken', 0)}/{v2_ck.get('branches_total', 0)} ({v2_ck.get('branches_coverage_pct', 0):.1f}%)" if v2_ck else "-"
+
+            print(f"{time_point:6.0f}  {b_lines:>15s}  {b_branches:>17s}  {v1_lines:>15s}  {v1_branches:>17s}  {v2_lines:>15s}  {v2_branches:>17s}")
+
+        # Show final comparison
+        final = result.get('final_comparison')
+        if final:
+            v1_vs_b = final.get('variant1_vs_baseline', {})
+            v2_vs_b = final.get('variant2_vs_baseline', {})
+
+            print("\n" + "-" * 100)
+            print("FINAL IMPROVEMENTS:")
+            if v1_vs_b:
+                print(f"  Variant1 vs Baseline: {v1_vs_b.get('lines_diff', 0):+.2f}% lines, "
+                      f"{v1_vs_b.get('branches_diff', 0):+.2f}% branches")
+            if v2_vs_b:
+                print(f"  Variant2 vs Baseline: {v2_vs_b.get('lines_diff', 0):+.2f}% lines, "
+                      f"{v2_vs_b.get('branches_diff', 0):+.2f}% branches")
 
 
 def main():
