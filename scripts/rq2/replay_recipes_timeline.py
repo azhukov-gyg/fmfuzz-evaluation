@@ -931,6 +931,7 @@ def replay_recipes_timeline(
     recipes_count = 0
     next_checkpoint_wall_time = start_time + checkpoint_interval
     checkpoint_num = 0
+    last_completed_fuzzing_time = 0  # Track highest fuzzing time we've FULLY processed
 
     for bucket_time in sorted(buckets.keys()):
         bucket_recipes = buckets[bucket_time]
@@ -951,9 +952,11 @@ def replay_recipes_timeline(
             if current_time >= next_checkpoint_wall_time:
                 checkpoint_num += 1
                 log(f"\n[CHECKPOINT {checkpoint_num}] Wall-clock checkpoint at {elapsed_time:.1f}s")
-                log(f"  Current bucket: fuzzing-time ≤ {bucket_time}s")
+                log(f"  Last completed fuzzing-time: {last_completed_fuzzing_time}s")
+                log(f"  Currently processing bucket: fuzzing-time ≤ {bucket_time}s")
                 log(f"  Recipes processed so far: {recipes_count}/{len(recipes_with_ts)}")
-                record_checkpoint(bucket_time, recipes_count)
+                # Record checkpoint with last COMPLETED fuzzing time, not current bucket
+                record_checkpoint(last_completed_fuzzing_time, recipes_count)
                 next_checkpoint_wall_time += checkpoint_interval
 
             # Process batch
@@ -977,6 +980,9 @@ def replay_recipes_timeline(
 
         if time_limit_reached:
             break
+
+        # Bucket completed - update last completed fuzzing time
+        last_completed_fuzzing_time = bucket_time
 
         elapsed = time.time() - start_time
         log(f"[BUCKET fuzzing-time ≤ {bucket_time}s] Completed all {len(bucket_recipes)} recipes (total time: {elapsed:.1f}s)")
