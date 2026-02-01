@@ -845,9 +845,14 @@ def replay_recipes_timeline(
     start_time = time.time()
     max_duration_seconds = max_duration_minutes * 60
 
+    # Cumulative coverage dictionaries (ensures monotonic growth)
+    cumulative_line_coverage = {}
+    cumulative_branch_coverage = {}
+    cumulative_function_counts = {}
+
     def record_checkpoint(current_fuzzing_time: float, recipes_count: int):
         """Extract and record a checkpoint at the current fuzzing timestamp."""
-        nonlocal checkpoint_num
+        nonlocal checkpoint_num, cumulative_line_coverage, cumulative_branch_coverage, cumulative_function_counts
         checkpoint_num += 1
         wall_elapsed = time.time() - start_time
 
@@ -865,8 +870,28 @@ def replay_recipes_timeline(
 
             extract_time = time.time() - extract_start
 
-            lines_hit = coverage_data['summary']['lines_hit']
-            branches_taken = coverage_data['summary']['branches_taken']
+            # Merge into cumulative dictionaries (ensures monotonic growth)
+            for line_key, hit_count in coverage_data['line_coverage'].items():
+                cumulative_line_coverage[line_key] = max(
+                    cumulative_line_coverage.get(line_key, 0),
+                    hit_count
+                )
+
+            for branch_key, taken_count in coverage_data['branch_coverage'].items():
+                cumulative_branch_coverage[branch_key] = max(
+                    cumulative_branch_coverage.get(branch_key, 0),
+                    taken_count
+                )
+
+            for func_key, call_count in coverage_data['function_counts'].items():
+                cumulative_function_counts[func_key] = max(
+                    cumulative_function_counts.get(func_key, 0),
+                    call_count
+                )
+
+            # Compute summary from cumulative data
+            lines_hit = sum(1 for v in cumulative_line_coverage.values() if v > 0)
+            branches_taken = sum(1 for v in cumulative_branch_coverage.values() if v > 0)
 
             # Calculate percentages (like legacy mode)
             lines_coverage_pct = 100.0 * lines_hit / lines_total if lines_total > 0 else 0.0
@@ -883,11 +908,11 @@ def replay_recipes_timeline(
                 'branches_taken': branches_taken,
                 'branches_total': branches_total,
                 'branches_coverage_pct': branches_coverage_pct,
-                'function_calls': sum(coverage_data['function_counts'].values()),
+                'function_calls': sum(cumulative_function_counts.values()),
                 'extract_time_seconds': extract_time,
-                # Include full coverage dictionaries for proper union during merge
-                'line_coverage': coverage_data['line_coverage'],
-                'branch_coverage': coverage_data['branch_coverage']
+                # Include cumulative coverage dictionaries (guarantees monotonic growth)
+                'line_coverage': cumulative_line_coverage.copy(),
+                'branch_coverage': cumulative_branch_coverage.copy()
             }
 
             checkpoints.append(checkpoint)
@@ -997,6 +1022,7 @@ def replay_recipes_timeline(
     # Get final fuzzing timestamp from last processed recipe
     final_fuzzing_time = recipes_with_ts[recipes_count - 1]['timestamp'] if recipes_count > 0 else 0
 
+    # Extract final coverage and merge into cumulative
     final_coverage = extract_coverage_fastcov(
         build_dir=build_dir,
         gcov_cmd=gcov_cmd,
@@ -1004,8 +1030,28 @@ def replay_recipes_timeline(
         exact_function_ranges=exact_function_ranges
     )
 
-    lines_hit_final = final_coverage['summary']['lines_hit']
-    branches_taken_final = final_coverage['summary']['branches_taken']
+    # Merge final extraction into cumulative (one last time)
+    for line_key, hit_count in final_coverage['line_coverage'].items():
+        cumulative_line_coverage[line_key] = max(
+            cumulative_line_coverage.get(line_key, 0),
+            hit_count
+        )
+
+    for branch_key, taken_count in final_coverage['branch_coverage'].items():
+        cumulative_branch_coverage[branch_key] = max(
+            cumulative_branch_coverage.get(branch_key, 0),
+            taken_count
+        )
+
+    for func_key, call_count in final_coverage['function_counts'].items():
+        cumulative_function_counts[func_key] = max(
+            cumulative_function_counts.get(func_key, 0),
+            call_count
+        )
+
+    # Compute final summary from cumulative data
+    lines_hit_final = sum(1 for v in cumulative_line_coverage.values() if v > 0)
+    branches_taken_final = sum(1 for v in cumulative_branch_coverage.values() if v > 0)
     lines_coverage_pct_final = 100.0 * lines_hit_final / lines_total if lines_total > 0 else 0.0
     branches_coverage_pct_final = 100.0 * branches_taken_final / branches_total if branches_total > 0 else 0.0
 
@@ -1020,12 +1066,12 @@ def replay_recipes_timeline(
         'branches_taken': branches_taken_final,
         'branches_total': branches_total,
         'branches_coverage_pct': branches_coverage_pct_final,
-        'function_calls': sum(final_coverage['function_counts'].values()),
+        'function_calls': sum(cumulative_function_counts.values()),
         'is_final': True,
         'time_limit_reached': time_limit_reached,
-        # Include full coverage dictionaries for proper union during merge
-        'line_coverage': final_coverage['line_coverage'],
-        'branch_coverage': final_coverage['branch_coverage']
+        # Include cumulative coverage dictionaries (guarantees monotonic growth)
+        'line_coverage': cumulative_line_coverage.copy(),
+        'branch_coverage': cumulative_branch_coverage.copy()
     }
     checkpoints.append(final_checkpoint)
     
