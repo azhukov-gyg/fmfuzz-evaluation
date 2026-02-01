@@ -931,7 +931,7 @@ def replay_recipes_timeline(
     recipes_count = 0
     next_checkpoint_wall_time = start_time + checkpoint_interval
     checkpoint_num = 0
-    last_completed_fuzzing_time = 0  # Track highest fuzzing time we've FULLY processed
+    current_fuzzing_time = 0  # Track current fuzzing time (highest timestamp processed so far)
 
     for bucket_time in sorted(buckets.keys()):
         bucket_recipes = buckets[bucket_time]
@@ -946,18 +946,6 @@ def replay_recipes_timeline(
                 log(f"\n⏱️  TIME LIMIT REACHED: {elapsed_time:.1f}s > {max_duration_seconds}s")
                 time_limit_reached = True
                 break
-
-            # Check if we should record a checkpoint
-            current_time = time.time()
-            if current_time >= next_checkpoint_wall_time:
-                checkpoint_num += 1
-                log(f"\n[CHECKPOINT {checkpoint_num}] Wall-clock checkpoint at {elapsed_time:.1f}s")
-                log(f"  Last completed fuzzing-time: {last_completed_fuzzing_time}s")
-                log(f"  Currently processing bucket: fuzzing-time ≤ {bucket_time}s")
-                log(f"  Recipes processed so far: {recipes_count}/{len(recipes_with_ts)}")
-                # Record checkpoint with last COMPLETED fuzzing time, not current bucket
-                record_checkpoint(last_completed_fuzzing_time, recipes_count)
-                next_checkpoint_wall_time += checkpoint_interval
 
             # Process batch
             batch = bucket_recipes[i:i+batch_size]
@@ -978,11 +966,25 @@ def replay_recipes_timeline(
 
             recipes_count += len(results)
 
+            # Update current fuzzing time to highest timestamp in this batch
+            if batch:
+                batch_max_time = max(recipe.get('timestamp', 0) for recipe in batch)
+                current_fuzzing_time = max(current_fuzzing_time, batch_max_time)
+
+            # Check if we should record a checkpoint (AFTER processing batch)
+            current_time = time.time()
+            if current_time >= next_checkpoint_wall_time:
+                checkpoint_num += 1
+                log(f"\n[CHECKPOINT {checkpoint_num}] Wall-clock checkpoint at {elapsed_time:.1f}s")
+                log(f"  Current fuzzing-time: {current_fuzzing_time:.1f}s")
+                log(f"  Processing bucket: fuzzing-time ≤ {bucket_time}s")
+                log(f"  Recipes processed so far: {recipes_count}/{len(recipes_with_ts)}")
+                # Record checkpoint with current fuzzing time (continuous progress)
+                record_checkpoint(current_fuzzing_time, recipes_count)
+                next_checkpoint_wall_time += checkpoint_interval
+
         if time_limit_reached:
             break
-
-        # Bucket completed - update last completed fuzzing time
-        last_completed_fuzzing_time = bucket_time
 
         elapsed = time.time() - start_time
         log(f"[BUCKET fuzzing-time ≤ {bucket_time}s] Completed all {len(bucket_recipes)} recipes (total time: {elapsed:.1f}s)")
