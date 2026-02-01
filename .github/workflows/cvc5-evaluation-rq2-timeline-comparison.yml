@@ -1,0 +1,128 @@
+name: CVC5 RQ2 Timeline Comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: Skip S3 uploads (default: false)'
+        required: false
+        type: boolean
+        default: false
+      time_axis:
+        description: 'Time axis for comparison (fuzzing_time_seconds or avg_wall_time_seconds)'
+        required: false
+        type: string
+        default: 'fuzzing_time_seconds'
+
+jobs:
+  compare-timelines:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download all timeline results
+        env:
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        run: |
+          mkdir -p timelines/baseline timelines/variant1 timelines/variant2
+
+          # Download baseline timelines
+          echo "=== Downloading baseline timelines ==="
+          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/cvc5/measurement-results/baseline/ timelines/baseline/ --exclude "*" --include "timeline-*.json.gz"
+          BASELINE_COUNT=$(ls timelines/baseline/timeline-*.json.gz 2>/dev/null | wc -l || echo 0)
+          echo "Downloaded $BASELINE_COUNT baseline timeline files"
+
+          # Download variant1 timelines
+          echo "=== Downloading variant1 timelines ==="
+          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/cvc5/measurement-results/variant1/ timelines/variant1/ --exclude "*" --include "timeline-*.json.gz"
+          VARIANT1_COUNT=$(ls timelines/variant1/timeline-*.json.gz 2>/dev/null | wc -l || echo 0)
+          echo "Downloaded $VARIANT1_COUNT variant1 timeline files"
+
+          # Download variant2 timelines
+          echo "=== Downloading variant2 timelines ==="
+          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/cvc5/measurement-results/variant2/ timelines/variant2/ --exclude "*" --include "timeline-*.json.gz"
+          VARIANT2_COUNT=$(ls timelines/variant2/timeline-*.json.gz 2>/dev/null | wc -l || echo 0)
+          echo "Downloaded $VARIANT2_COUNT variant2 timeline files"
+
+          # Decompress all
+          gunzip timelines/*/*.json.gz 2>/dev/null || true
+
+          # Show summary
+          echo ""
+          echo "=== Downloaded Timeline Files Summary ==="
+          for variant in baseline variant1 variant2; do
+            count=$(ls timelines/$variant/*.json 2>/dev/null | wc -l || echo 0)
+            echo "$variant: $count timeline files"
+          done
+
+      - name: Compare timeline results
+        run: |
+          python3 scripts/rq2/compare_timelines.py timelines \
+            --output timeline_comparison.json \
+            --time-axis ${{ inputs.time_axis }}
+
+      - name: Show timeline comparison summary
+        if: always()
+        run: |
+          if [ -f "timeline_comparison.json" ]; then
+            echo "=== TIMELINE COMPARISON SUMMARY ==="
+            echo "Time axis: ${{ inputs.time_axis }}"
+            python3 -c "
+import json
+with open('timeline_comparison.json') as f:
+    data = json.load(f)
+print(f\"Status: {data['status']}\")
+print(f\"Common commits: {data['common_commits']}\")
+if data['results']:
+    print(f\"\nExample commit: {data['results'][0]['commit'][:8]}\")
+    final = data['results'][0].get('final_comparison', {})
+    if final:
+        print(f\"  Baseline final:  {final['baseline']['lines_coverage_pct']:.2f}% lines, {final['baseline']['branches_coverage_pct']:.2f}% branches\")
+        print(f\"  Variant1 final:  {final['variant1']['lines_coverage_pct']:.2f}% lines, {final['variant1']['branches_coverage_pct']:.2f}% branches\")
+        print(f\"  Variant2 final:  {final['variant2']['lines_coverage_pct']:.2f}% lines, {final['variant2']['branches_coverage_pct']:.2f}% branches\")
+"
+          fi
+
+      - name: Upload comparison to S3
+        if: ${{ !inputs.dry_run }}
+        run: |
+          S3_KEY="evaluation/rq2/cvc5/timeline-comparison/comparison_${{ inputs.time_axis }}.json.gz"
+
+          if [ ! -f "timeline_comparison.json" ]; then
+            echo "⚠️ Timeline comparison file not found"
+            exit 0
+          fi
+
+          gzip -c "timeline_comparison.json" > timeline_comparison.json.gz
+
+          aws s3api put-object \
+            --bucket ${{ secrets.AWS_S3_BUCKET }} \
+            --key "$S3_KEY" \
+            --body timeline_comparison.json.gz
+
+          echo "✅ Uploaded timeline comparison to S3: $S3_KEY"
+
+      - name: Upload comparison artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timeline-comparison
+          path: timeline_comparison.json
+          if-no-files-found: ignore
