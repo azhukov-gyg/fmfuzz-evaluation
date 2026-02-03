@@ -17,6 +17,11 @@ on:
         required: false
         type: boolean
         default: false
+      max_duration_minutes:
+        description: 'Maximum fuzzing duration in minutes for timeline mode (default: 20)'
+        required: false
+        type: number
+        default: 20
 
 jobs:
   # ============================================================
@@ -349,7 +354,8 @@ jobs:
               --timeout 120 \
               --seeds-file "$SEEDS_FILE" \
               --z3-memory-mb 4096 \
-              --checkpoint-interval 60
+              --checkpoint-interval 60 \
+              --max-duration-minutes ${{ inputs.max_duration_minutes }}
           else
             echo "Using standard mode (parallel, grouped by seed)"
             python3 ${{ github.workspace }}/scripts/z3/rq2/replay_recipes.py \
