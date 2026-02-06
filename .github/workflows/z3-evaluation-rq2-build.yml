@@ -55,7 +55,7 @@ jobs:
             MATRIX=$(python3 -c "
           import json
           commits = ['$DEBUG_COMMIT']
-          build_types = ['fuzzing', 'instrumented']
+          build_types = ['fuzzing', 'coverage']
           include = [{'commit': c, 'build_type': b} for c in commits for b in build_types]
           print(json.dumps({'include': include}, separators=(',', ':')))
           ")
@@ -63,13 +63,13 @@ jobs:
           else
             # Get commits from generate_build_matrix.py
             COMMITS_JSON=$(python3 scripts/rq2/generate_build_matrix.py z3)
-            
+
             # Expand to include both build types for each commit
             MATRIX=$(echo "$COMMITS_JSON" | python3 -c "
           import sys, json
           data = json.load(sys.stdin)
           commits = [entry['commit'] for entry in data['include']]
-          build_types = ['fuzzing', 'instrumented']
+          build_types = ['fuzzing', 'coverage']
           include = [{'commit': c, 'build_type': b} for c in commits for b in build_types]
           print(json.dumps({'include': include}, separators=(',', ':')))
           ")
@@ -146,57 +146,90 @@ jobs:
           ./scripts/z3/collect_build_artifacts.sh z3/build .artifacts
       
       # ============================================================
-      # INSTRUMENTED BUILD (EDGE COVERAGE)
+      # COVERAGE BUILD (GCC 14 + gcov)
       # ============================================================
-      
-      - name: Install LLVM/Clang 17 for instrumented build
-        if: matrix.build_type == 'instrumented'
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: '17'
-      
-      - name: Add LLVM to PATH
-        if: matrix.build_type == 'instrumented'
-        run: echo "${{ env.LLVM_PATH }}/bin" >> $GITHUB_PATH
-      
-      - name: Build Z3 with sancov instrumentation
-        if: matrix.build_type == 'instrumented'
+
+      - name: Install GCC 14 (for coverage build)
+        if: matrix.build_type == 'coverage'
         run: |
-          echo "=== Building Z3 with sancov instrumentation ==="
-          
-          export WORKSPACE="${{ github.workspace }}"
-          export COVERAGE_AGENT="${{ github.workspace }}/scripts/z3/partial_instrumentation/coverage_agent.cpp"
-          
-          # Build with sancov instrumentation (no allowlist - instrument everything)
-          # Allowlists will be used during fuzzing workflow
-          ${{ github.workspace }}/scripts/z3/partial_instrumentation/build_z3_instrumented.sh \
-            "${{ matrix.commit }}" \
-            "" \
-            ""
-          
-          echo "✅ Build complete"
-          ls -la z3/build/z3
-      
-      - name: Verify instrumentation
-        if: matrix.build_type == 'instrumented'
-        id: verify-instrumentation
+          sudo apt-get update
+          sudo apt-get install -y gcc-14 g++-14 libstdc++-14-dev
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 60
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 60
+          sudo update-alternatives --set gcc /usr/bin/gcc-14
+          sudo update-alternatives --set g++ /usr/bin/g++-14
+
+      - name: Build Z3 coverage binary
+        if: matrix.build_type == 'coverage'
         run: |
-          echo "=== Verifying instrumentation ==="
-          SANCOV_SYM=$(nm z3/build/z3 2>/dev/null | grep -c "__sanitizer_cov" || echo "0")
-          echo "Sancov symbols: $SANCOV_SYM"
-          
-          # Count total instrumented edges from coverage agent debug output
-          echo "=== Counting total instrumented edges ==="
-          TOTAL_EDGES=$(COVERAGE_AGENT_DEBUG=1 z3/build/z3 --version 2>&1 | grep -oP 'total_edges=\K\d+' || echo "0")
-          echo "Total instrumented edges: $TOTAL_EDGES"
-          echo "total_edges=${TOTAL_EDGES}" >> $GITHUB_OUTPUT
-          
-          echo "✅ Binary works"
-      
-      - name: Collect instrumented build artifacts
-        if: matrix.build_type == 'instrumented'
+          export CXX="g++-14"
+          export CC="gcc-14"
+          cd z3
+          mkdir -p build
+          cd build
+          CFLAGS="-O0 -g --coverage" CXXFLAGS="-O0 -g --coverage" \
+            cmake -DCMAKE_BUILD_TYPE=Debug \
+                  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+                  -DZ3_BUILD_LIBZ3_SHARED=OFF \
+                  -DZ3_BUILD_EXECUTABLE=ON \
+                  -DZ3_BUILD_TEST_EXECUTABLES=OFF \
+                  -G "Unix Makefiles" ..
+          make -j$(nproc)
+          echo "✅ Built coverage binary (GCC 14 + gcov)"
+
+      - name: Collect coverage build artifacts
+        if: matrix.build_type == 'coverage'
         run: |
           ./scripts/z3/collect_build_artifacts.sh z3/build .artifacts
+
+          echo "=== Build info ==="
+          echo "  .gcno files: $(find z3/build -name '*.gcno' -type f 2>/dev/null | wc -l)"
+          echo "  Total files: $(find z3/build -type f 2>/dev/null | wc -l)"
+
+      # ============================================================
+      # INSTRUMENTED BUILD (EDGE COVERAGE) - currently unused
+      # ============================================================
+      #
+      # - name: Install LLVM/Clang 17 for instrumented build
+      #   if: matrix.build_type == 'instrumented'
+      #   uses: KyleMayes/install-llvm-action@v2
+      #   with:
+      #     version: '17'
+      #
+      # - name: Add LLVM to PATH
+      #   if: matrix.build_type == 'instrumented'
+      #   run: echo "${{ env.LLVM_PATH }}/bin" >> $GITHUB_PATH
+      #
+      # - name: Build Z3 with sancov instrumentation
+      #   if: matrix.build_type == 'instrumented'
+      #   run: |
+      #     echo "=== Building Z3 with sancov instrumentation ==="
+      #     export WORKSPACE="${{ github.workspace }}"
+      #     export COVERAGE_AGENT="${{ github.workspace }}/scripts/z3/partial_instrumentation/coverage_agent.cpp"
+      #     ${{ github.workspace }}/scripts/z3/partial_instrumentation/build_z3_instrumented.sh \
+      #       "${{ matrix.commit }}" \
+      #       "" \
+      #       ""
+      #     echo "✅ Build complete"
+      #     ls -la z3/build/z3
+      #
+      # - name: Verify instrumentation
+      #   if: matrix.build_type == 'instrumented'
+      #   id: verify-instrumentation
+      #   run: |
+      #     echo "=== Verifying instrumentation ==="
+      #     SANCOV_SYM=$(nm z3/build/z3 2>/dev/null | grep -c "__sanitizer_cov" || echo "0")
+      #     echo "Sancov symbols: $SANCOV_SYM"
+      #     echo "=== Counting total instrumented edges ==="
+      #     TOTAL_EDGES=$(COVERAGE_AGENT_DEBUG=1 z3/build/z3 --version 2>&1 | grep -oP 'total_edges=\K\d+' || echo "0")
+      #     echo "Total instrumented edges: $TOTAL_EDGES"
+      #     echo "total_edges=${TOTAL_EDGES}" >> $GITHUB_OUTPUT
+      #     echo "✅ Binary works"
+      #
+      # - name: Collect instrumented build artifacts
+      #   if: matrix.build_type == 'instrumented'
+      #   run: |
+      #     ./scripts/z3/collect_build_artifacts.sh z3/build .artifacts
       
       # ============================================================
       # UPLOAD (common for both build types)
