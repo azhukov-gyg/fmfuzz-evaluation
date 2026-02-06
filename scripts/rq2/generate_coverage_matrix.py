@@ -54,16 +54,19 @@ def main():
 
     # Filter to specific commit if provided
     if specific_commit:
-        # Check if specific_commit is in the list
+        # Check if specific_commit is in the list (exact match)
         if specific_commit in selected_commits:
             selected_commits = [specific_commit]
             print(f"📌 Filtered to specific commit: {specific_commit}", file=sys.stderr)
         else:
-            # Try matching by prefix (short hash)
-            matching = [c for c in selected_commits if c.startswith(specific_commit)]
+            # Try matching by prefix (bidirectional):
+            # 1. Does any commit in list start with specific_commit? (user provided short, S3 has full)
+            # 2. Does specific_commit start with any commit in list? (user provided full, S3 has short)
+            matching = [c for c in selected_commits
+                       if c.startswith(specific_commit) or specific_commit.startswith(c)]
             if matching:
                 selected_commits = matching
-                print(f"📌 Filtered to {len(matching)} commit(s) matching prefix: {specific_commit}", file=sys.stderr)
+                print(f"📌 Filtered to {len(matching)} commit(s) matching: {specific_commit}", file=sys.stderr)
                 for c in matching:
                     print(f"   - {c}", file=sys.stderr)
             else:
