@@ -2,6 +2,11 @@ name: CVC5 RQ2 Coverage Mapping (Variant 1)
 
 on:
   workflow_dispatch:
+    inputs:
+      commit_hash:
+        description: 'Specific commit hash to process (optional, leave empty for all commits)'
+        required: false
+        type: string
 
 jobs:
   generate-matrix:
@@ -54,6 +59,7 @@ jobs:
         env:
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
+          COMMIT_HASH: ${{ github.event.inputs.commit_hash }}
         run: |
           RESULT=$(python3 scripts/rq2/generate_coverage_matrix.py cvc5)
           

@@ -9,19 +9,30 @@ import os
 import sys
 import json
 import boto3
+import argparse
 import subprocess
 from pathlib import Path
 from botocore.exceptions import ClientError
 
 def main():
-    solver = sys.argv[1]
-    max_commits = None
-    if len(sys.argv) > 2:
-        try:
-            max_commits = int(sys.argv[2])
-        except ValueError:
-            pass
-    
+    parser = argparse.ArgumentParser(description='Generate combined matrix for coverage mapping')
+    parser.add_argument('solver', choices=['cvc5', 'z3'], help='Solver name (cvc5 or z3)')
+    parser.add_argument('--max-commits', type=int, help='Maximum number of commits to process')
+    parser.add_argument('--commit', type=str, help='Specific commit hash to process (filters to only this commit)')
+
+    args = parser.parse_args()
+    solver = args.solver
+    max_commits = args.max_commits
+
+    # Read specific commit from argument or environment variable
+    specific_commit = args.commit or os.getenv('COMMIT_HASH', '').strip()
+
+    # Log what we're processing
+    if specific_commit:
+        print(f"📌 Running coverage mapping for specific commit: {specific_commit}", file=sys.stderr)
+    else:
+        print(f"📊 Running coverage mapping for all commits", file=sys.stderr)
+
     bucket = os.getenv('AWS_S3_BUCKET')
     if not bucket:
         raise RuntimeError("AWS_S3_BUCKET environment variable not set")
@@ -40,9 +51,25 @@ def main():
     
     if not selected_commits:
         raise RuntimeError("No commits selected")
-    
+
+    # Filter to specific commit if provided
+    if specific_commit:
+        # Check if specific_commit is in the list
+        if specific_commit in selected_commits:
+            selected_commits = [specific_commit]
+            print(f"📌 Filtered to specific commit: {specific_commit}", file=sys.stderr)
+        else:
+            # Try matching by prefix (short hash)
+            matching = [c for c in selected_commits if c.startswith(specific_commit)]
+            if matching:
+                selected_commits = matching
+                print(f"📌 Filtered to {len(matching)} commit(s) matching prefix: {specific_commit}", file=sys.stderr)
+                for c in matching:
+                    print(f"   - {c}", file=sys.stderr)
+            else:
+                raise RuntimeError(f"Commit {specific_commit} not found in selected commits")
     # Limit commits if specified
-    if max_commits and max_commits > 0:
+    elif max_commits and max_commits > 0:
         selected_commits = selected_commits[:max_commits]
         print(f"📝 Limited to {len(selected_commits)} commits (max_commits={max_commits})", file=sys.stderr)
     
