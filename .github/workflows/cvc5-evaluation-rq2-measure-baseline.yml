@@ -411,8 +411,7 @@ jobs:
               --gcov gcov-14 \
               --timeout 120 \
               --num-workers 4 \
-              --seeds-file "$SEEDS_FILE" \
-              --legacy
+              --seeds-file "$SEEDS_FILE"
           fi
           
           echo "=== Measurement complete for job ${{ matrix.job_id }} ==="

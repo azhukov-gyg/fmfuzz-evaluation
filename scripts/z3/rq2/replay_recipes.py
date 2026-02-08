@@ -171,23 +171,36 @@ def extract_static_branch_counts(
 ) -> Dict[str, int]:
     """
     Extract static branch counts from .gcno files using gcov intermediate format.
-    
+
+    IMPORTANT: All .gcda files MUST be deleted before calling this function!
+    If .gcda files exist, gcov will read both .gcno (static) and .gcda (runtime),
+    causing branch counts to vary based on execution data rather than source code.
+
     Args:
-        build_dir: Directory containing .gcno/.gcda files
+        build_dir: Directory containing .gcno files (NO .gcda files should exist!)
         source_files: Set of source file paths (relative, like "src/math/lp/nra_solver.cpp")
         exact_function_ranges: Dict mapping "file:start_line" -> (start, end)
         filter_system_branches: If True, exclude branches from system headers (default: True)
-    
+
     Returns:
         Dict mapping "file:start_line" -> total_branches_in_function
     """
     import subprocess
     import os
     from pathlib import Path
-    
+
     log(f"[BRANCH DEBUG] ========================================")
     log(f"[BRANCH DEBUG] FUNCTION CALLED: extract_static_branch_counts")
     log(f"[BRANCH DEBUG] ========================================")
+
+    # Verify no .gcda files exist (they contaminate static analysis)
+    gcda_files_found = list(Path(build_dir).rglob("*.gcda"))
+    if gcda_files_found:
+        log(f"[BRANCH DEBUG] ⚠️  WARNING: Found {len(gcda_files_found)} .gcda files in build directory!")
+        log(f"[BRANCH DEBUG] ⚠️  This will contaminate static branch counts!")
+        log(f"[BRANCH DEBUG] ⚠️  Samples: {[str(f) for f in gcda_files_found[:3]]}")
+    else:
+        log(f"[BRANCH DEBUG] ✓ Verified: No .gcda files found (pure static analysis)")
     
     branch_counts = {}
     
@@ -392,19 +405,211 @@ def extract_static_branch_counts(
     return branch_counts
 
 
+def extract_static_totals(
+    build_dir: str,
+    changed_functions: Set[str],
+    gcov_cmd: str = "gcov"
+) -> dict:
+    """
+    Extract deterministic lines_total and branches_total from .gcno files.
+
+    MUST be called BEFORE any solver runs (no .gcda files should exist).
+    Uses gcov on .gcno files to discover all function boundaries and branch
+    points statically, then filters to changed functions only.
+
+    Returns:
+        {
+            "func_line_ranges": {"file.cpp": [(start, end), ...]},
+            "lines_total": int,
+            "branches_total": int,
+            "branch_counts_by_func": {"file.cpp:start": count}
+        }
+    """
+    log("[STATIC TOTALS] ========================================")
+    log("[STATIC TOTALS] Computing static totals from .gcno files")
+    log("[STATIC TOTALS] ========================================")
+
+    result = {
+        "func_line_ranges": {},
+        "lines_total": 0,
+        "branches_total": 0,
+        "branch_counts_by_func": {},
+    }
+
+    # Verify no .gcda files exist
+    gcda_files_found = list(Path(build_dir).rglob("*.gcda"))
+    if gcda_files_found:
+        log(f"[STATIC TOTALS] WARNING: Found {len(gcda_files_found)} .gcda files! Results may be inaccurate.")
+    else:
+        log("[STATIC TOTALS] Verified: No .gcda files (pure static analysis)")
+
+    source_root = os.path.dirname(build_dir)
+
+    # Parse changed_functions to get (file_path, start_line) pairs
+    changed_file_lines = {}  # {(relative_path, line): full_function_key}
+    for func_key in changed_functions:
+        parts = func_key.rsplit(':', 2)
+        if len(parts) >= 2:
+            try:
+                line_num = int(parts[-1])
+                file_path = parts[0].split(':')[0]
+                changed_file_lines[(file_path, line_num)] = func_key
+            except ValueError:
+                pass
+
+    target_files = set(fp for fp, ln in changed_file_lines.keys())
+    log(f"[STATIC TOTALS] Target files: {target_files}")
+    log(f"[STATIC TOTALS] Changed functions: {len(changed_file_lines)}")
+
+    # Build gcno_map from build_dir
+    gcno_map = {}
+    build_path = Path(build_dir)
+    for gcno_file in build_path.rglob("*.gcno"):
+        source_name = gcno_file.name
+        if source_name.endswith('.gcno'):
+            source_name = source_name[:-5]
+        gcno_map[source_name] = gcno_file
+
+    log(f"[STATIC TOTALS] Found {len(gcno_map)} .gcno files")
+
+    # Process each target source file
+    processed_files = set()
+    for source_file in target_files:
+        source_filename = os.path.basename(source_file)
+        full_source_path = os.path.join(source_root, source_file)
+
+        if not os.path.exists(full_source_path):
+            log(f"[STATIC TOTALS] Source file not found: {full_source_path}")
+            continue
+
+        if source_filename not in gcno_map:
+            log(f"[STATIC TOTALS] No .gcno file for {source_filename}")
+            continue
+
+        gcno_file = gcno_map[source_filename]
+
+        try:
+            gcov_result = subprocess.run(
+                [gcov_cmd, '-t', '-b', '--json-format', '--object-file', str(gcno_file), full_source_path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=source_root
+            )
+
+            if gcov_result.returncode != 0:
+                log(f"[STATIC TOTALS] gcov failed for {source_file}: rc={gcov_result.returncode}")
+                continue
+
+            gcov_data = json.loads(gcov_result.stdout)
+            files = gcov_data.get('files', [])
+
+            for file_data in files:
+                file_path = file_data.get('file', '')
+
+                # Filter system files
+                if any(pattern in file_path for pattern in [
+                    '/usr/include/', '/usr/lib/', '/usr/local/include/',
+                    'bits/', 'c++/',
+                ]):
+                    continue
+
+                # Normalize to relative path
+                current_file = file_path
+                if '/z3/' in file_path:
+                    current_file = file_path.split('/z3/', 1)[1]
+
+                if current_file not in target_files:
+                    continue
+
+                # Extract function ranges from gcov JSON
+                functions = file_data.get('functions', [])
+                all_func_starts = sorted(set(f.get('start_line', 0) for f in functions))
+                lines = file_data.get('lines', [])
+                max_file_line = max((ld.get('line_number', 0) for ld in lines), default=0) if lines else 0
+
+                for func_info in functions:
+                    func_start = func_info.get('start_line', 0)
+                    func_end = func_info.get('end_line', 0)
+
+                    # If no end_line from gcov, estimate from next function start
+                    if not func_end:
+                        for next_start in all_func_starts:
+                            if next_start > func_start:
+                                func_end = next_start - 1
+                                break
+                        if not func_end:
+                            func_end = max_file_line if max_file_line > func_start else func_start + 200
+
+                    # Match against changed_functions
+                    match_key = (current_file, func_start)
+                    if match_key in changed_file_lines:
+                        if current_file not in result["func_line_ranges"]:
+                            result["func_line_ranges"][current_file] = []
+                        range_tuple = (func_start, func_end)
+                        if range_tuple not in result["func_line_ranges"][current_file]:
+                            result["func_line_ranges"][current_file].append(range_tuple)
+                            log(f"[STATIC TOTALS] Function range: {current_file}:{func_start}-{func_end}")
+
+                # Count branches within matched function ranges
+                if current_file in result["func_line_ranges"]:
+                    for line_data in lines:
+                        line_number = line_data.get('line_number', 0)
+                        branches = line_data.get('branches', [])
+                        if branches:
+                            for start, end in result["func_line_ranges"][current_file]:
+                                if start <= line_number <= end:
+                                    range_key = f"{current_file}:{start}"
+                                    result["branch_counts_by_func"][range_key] = \
+                                        result["branch_counts_by_func"].get(range_key, 0) + len(branches)
+                                    break
+
+                processed_files.add(current_file)
+
+        except subprocess.TimeoutExpired:
+            log(f"[STATIC TOTALS] gcov timeout for {source_file}")
+        except json.JSONDecodeError as e:
+            log(f"[STATIC TOTALS] JSON parse error for {source_file}: {e}")
+        except Exception as e:
+            log(f"[STATIC TOTALS] Error processing {source_file}: {e}")
+
+    # Compute totals from collected ranges
+    for file_path, ranges in result["func_line_ranges"].items():
+        for start, end in ranges:
+            result["lines_total"] += (end - start + 1)
+
+    result["branches_total"] = sum(result["branch_counts_by_func"].values())
+
+    log(f"[STATIC TOTALS] ========================================")
+    log(f"[STATIC TOTALS] Results:")
+    log(f"[STATIC TOTALS]   Files processed: {len(processed_files)}")
+    log(f"[STATIC TOTALS]   Function ranges: {sum(len(v) for v in result['func_line_ranges'].values())}")
+    log(f"[STATIC TOTALS]   lines_total: {result['lines_total']}")
+    log(f"[STATIC TOTALS]   branches_total: {result['branches_total']}")
+    for rk, bc in result["branch_counts_by_func"].items():
+        log(f"[STATIC TOTALS]     {rk}: {bc} branches")
+    log(f"[STATIC TOTALS] ========================================")
+
+    return result
+
+
 def extract_coverage_fastcov(
     build_dir: str,
     gcov_cmd: str,
     changed_functions: Set[str],
-    exact_function_ranges: Dict[str, tuple] = None
+    exact_function_ranges: Dict[str, tuple] = None,
+    static_totals: dict = None
 ) -> Dict[str, any]:
     """
     Extract function, line, and branch coverage from gcov data using fastcov.
-    
+
     Args:
         exact_function_ranges: Optional dict mapping "file:start_line" -> (start, end)
                                for 100% accurate function boundaries.
-    
+        static_totals: Optional pre-computed totals from extract_static_totals().
+                       When provided, overrides lines_total and branches_total with
+                       deterministic values computed from .gcno files before measurement.
+
     Returns dict with:
         - function_counts: {func_key: call_count}
         - line_coverage: {file:line: hit_count} for lines in changed functions
@@ -498,9 +703,15 @@ def extract_coverage_fastcov(
             # We'll build function line ranges in the first pass (need GCOV's end_line data)
             # {relative_path: [(start_line, end_line), ...]} for changed functions only
             func_line_ranges = {}
-            
-            # PRE-POPULATE with exact function ranges so uncalled functions are still counted
-            if exact_function_ranges:
+
+            # PRE-POPULATE with function ranges: prefer static_totals (from .gcno), fall back to exact_function_ranges
+            if static_totals and static_totals.get("func_line_ranges"):
+                log(f"[GCOV DEBUG] PRE-POPULATING function ranges from static_totals")
+                func_line_ranges = {fp: list(ranges) for fp, ranges in static_totals["func_line_ranges"].items()}
+                for fp, ranges in func_line_ranges.items():
+                    for start, end in ranges:
+                        log(f"[GCOV DEBUG] PRE-POPULATED range (static): {fp}:{start}-{end} ({end - start + 1} lines)")
+            elif exact_function_ranges:
                 for range_key, (start, end) in exact_function_ranges.items():
                     # range_key format: "src/math/lp/nra_solver.cpp:51"
                     parts = range_key.rsplit(':', 1)
@@ -657,53 +868,71 @@ def extract_coverage_fastcov(
                             except (ValueError, TypeError):
                                 pass
             
-            # Extract static branch counts for ALL functions (including uncalled)
-            log(f"[BRANCH DEBUG] Checking if should extract static branches...")
-            log(f"[BRANCH DEBUG]   exact_function_ranges is None: {exact_function_ranges is None}")
-            log(f"[BRANCH DEBUG]   exact_function_ranges length: {len(exact_function_ranges) if exact_function_ranges else 0}")
-            
-            if exact_function_ranges:
-                log(f"[BRANCH DEBUG] ============================================")
-                log(f"[BRANCH DEBUG] EXTRACTING STATIC BRANCH COUNTS FROM .GCNO FILES")
-                log(f"[BRANCH DEBUG] ============================================")
-                
-                source_files_for_branches = set()
-                for range_key in exact_function_ranges.keys():
-                    file_path = range_key.rsplit(':', 1)[0]
-                    source_files_for_branches.add(file_path)
-                
-                log(f"[BRANCH DEBUG] Prepared {len(source_files_for_branches)} source files for branch extraction:")
-                for sf in source_files_for_branches:
-                    log(f"[BRANCH DEBUG]   - {sf}")
-                
-                log(f"[BRANCH DEBUG] Calling extract_static_branch_counts...")
-                static_branch_counts = extract_static_branch_counts(
-                    build_dir, 
-                    source_files_for_branches,
-                    exact_function_ranges,
-                    filter_system_branches=True  # Filter out system/STL branches by default
-                )
-                
-                log(f"[BRANCH DEBUG] Returned from extract_static_branch_counts")
-                log(f"[BRANCH DEBUG] Got static branch counts for {len(static_branch_counts)} functions")
-                
-                # Recalculate branches_total using static counts from .gcno files
-                # This ensures we count ALL branches in changed functions, even in uncalled functions
-                # Keep branches_taken as is (from fastcov execution data)
-                if static_branch_counts:
-                    old_total = result["summary"]["branches_total"]
-                    # Clear and recalculate total branches
-                    result["summary"]["branches_total"] = 0
-                    
-                    for range_key, static_count in static_branch_counts.items():
-                        result["summary"]["branches_total"] += static_count
-                        log(f"[BRANCH DEBUG]   {range_key}: {static_count} branches (static)")
-                    
-                    log(f"[BRANCH DEBUG] Updated branches_total: {old_total} (fastcov) -> {result['summary']['branches_total']} (static)")
-                    log(f"[BRANCH DEBUG] Branches taken (unchanged): {result['summary']['branches_taken']}")
+            # Override totals with pre-computed static values if available
+            if static_totals:
+                log(f"[STATIC OVERRIDE] Using pre-computed static totals")
+                old_lines = result["summary"]["lines_total"]
+                old_branches = result["summary"]["branches_total"]
+                result["summary"]["lines_total"] = static_totals["lines_total"]
+                result["summary"]["branches_total"] = static_totals["branches_total"]
+                log(f"[STATIC OVERRIDE] lines_total: {old_lines} (runtime) -> {static_totals['lines_total']} (static)")
+                log(f"[STATIC OVERRIDE] branches_total: {old_branches} (runtime) -> {static_totals['branches_total']} (static)")
+                log(f"[STATIC OVERRIDE] Skipping legacy static branch extraction (superseded)")
             else:
-                log(f"[BRANCH DEBUG] Skipping static branch extraction (no exact_function_ranges)")
-            
+                # Legacy path: extract static branch counts for ALL functions (including uncalled)
+                log(f"[BRANCH DEBUG] Checking if should extract static branches...")
+                log(f"[BRANCH DEBUG]   exact_function_ranges is None: {exact_function_ranges is None}")
+                log(f"[BRANCH DEBUG]   exact_function_ranges length: {len(exact_function_ranges) if exact_function_ranges else 0}")
+
+                if exact_function_ranges:
+                    log(f"[BRANCH DEBUG] ============================================")
+                    log(f"[BRANCH DEBUG] EXTRACTING STATIC BRANCH COUNTS FROM .GCNO FILES")
+                    log(f"[BRANCH DEBUG] ============================================")
+
+                    source_files_for_branches = set()
+                    for range_key in exact_function_ranges.keys():
+                        file_path = range_key.rsplit(':', 1)[0]
+                        source_files_for_branches.add(file_path)
+
+                    log(f"[BRANCH DEBUG] Prepared {len(source_files_for_branches)} source files for branch extraction:")
+                    for sf in source_files_for_branches:
+                        log(f"[BRANCH DEBUG]   - {sf}")
+
+                    # CRITICAL FIX: Delete all .gcda files before static branch extraction
+                    log(f"[BRANCH DEBUG] Deleting .gcda files to ensure pure static branch analysis...")
+                    gcda_files_deleted = 0
+                    for gcda_file in Path(build_dir).rglob("*.gcda"):
+                        try:
+                            gcda_file.unlink()
+                            gcda_files_deleted += 1
+                        except Exception as e:
+                            log(f"[BRANCH DEBUG]   WARNING: Could not delete {gcda_file}: {e}")
+                    log(f"[BRANCH DEBUG] Deleted {gcda_files_deleted} .gcda files")
+
+                    log(f"[BRANCH DEBUG] Calling extract_static_branch_counts...")
+                    static_branch_counts = extract_static_branch_counts(
+                        build_dir,
+                        source_files_for_branches,
+                        exact_function_ranges,
+                        filter_system_branches=True
+                    )
+
+                    log(f"[BRANCH DEBUG] Returned from extract_static_branch_counts")
+                    log(f"[BRANCH DEBUG] Got static branch counts for {len(static_branch_counts)} functions")
+
+                    if static_branch_counts:
+                        old_total = result["summary"]["branches_total"]
+                        result["summary"]["branches_total"] = 0
+
+                        for range_key, static_count in static_branch_counts.items():
+                            result["summary"]["branches_total"] += static_count
+                            log(f"[BRANCH DEBUG]   {range_key}: {static_count} branches (static)")
+
+                        log(f"[BRANCH DEBUG] Updated branches_total: {old_total} (fastcov) -> {result['summary']['branches_total']} (static)")
+                        log(f"[BRANCH DEBUG] Branches taken (unchanged): {result['summary']['branches_taken']}")
+                else:
+                    log(f"[BRANCH DEBUG] Skipping static branch extraction (no exact_function_ranges)")
+
             log(f"[GCOV DEBUG] Total functions found: {total_funcs_found}")
             log(f"[GCOV DEBUG] Found {len(all_funcs)} functions with >0 execution count")
             log(f"[GCOV DEBUG] Function-level coverage (only lines within changed functions):")
@@ -1187,517 +1416,7 @@ def worker_process(
     })
 
 
-# =============================================================================
-# TWO-PHASE REPLAY: Generate tests first, then execute in parallel
-# =============================================================================
-
-def generation_worker(
-    worker_id: int,
-    task_queue: multiprocessing.Queue,
-    output_queue: multiprocessing.Queue,
-    progress_queue: multiprocessing.Queue,
-    output_dir: str
-):
-    """
-    Phase 1 worker: Generate test files from seed groups.
-    Uses chain prefix caching to avoid redundant chain regeneration.
-    """
-    tests_generated = 0
-    tests_failed = 0
-    
-    # Cache for chain prefix content: (seed_path, rng_seed, chain_prefix) -> content
-    chain_cache: Dict[Tuple[str, int, Tuple[int, ...]], str] = {}
-    
-    progress_queue.put(('gen_worker_start', worker_id, os.getpid()))
-    
-    while True:
-        try:
-            task = task_queue.get(timeout=1)
-        except queue.Empty:
-            continue
-        
-        if task is None:
-            break
-        
-        seed_path, rng_seed, chain, group_recipes = task
-        seed_name = Path(seed_path).name
-        chain_str = f" chain={list(chain)}" if chain else ""
-        
-        progress_queue.put(('gen_start', worker_id, seed_name, len(group_recipes)))
-        
-        if not os.path.exists(seed_path):
-            progress_queue.put(('gen_skip', worker_id, seed_name, 'seed not found'))
-            tests_failed += len(group_recipes)
-            continue
-        
-        if chain:
-            start_content = regenerate_chain_content(seed_path, rng_seed, chain, worker_id, chain_cache)
-            if start_content is None:
-                progress_queue.put(('gen_skip', worker_id, seed_name, f'chain regeneration failed{chain_str}'))
-                tests_failed += len(group_recipes)
-                continue
-        else:
-            try:
-                with open(seed_path, 'r') as f:
-                    start_content = f.read()
-            except Exception as e:
-                progress_queue.put(('gen_skip', worker_id, seed_name, f'read failed: {e}'))
-                tests_failed += len(group_recipes)
-                continue
-        
-        random.seed(rng_seed)
-        
-        try:
-            fuzzer = InlineTypeFuzz.from_string(start_content) if hasattr(InlineTypeFuzz, 'from_string') else None
-            if fuzzer is None:
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.smt2', delete=False) as f:
-                    f.write(start_content)
-                    temp_path = f.name
-                try:
-                    fuzzer = InlineTypeFuzz(Path(temp_path))
-                    with mutation_timeout(PARSE_TIMEOUT):
-                        if not fuzzer.parse():
-                            progress_queue.put(('gen_skip', worker_id, seed_name, 'parse failed'))
-                            tests_failed += len(group_recipes)
-                            continue
-                except MutationTimeout:
-                    progress_queue.put(('gen_skip', worker_id, seed_name, f'parse timeout ({PARSE_TIMEOUT}s)'))
-                    tests_failed += len(group_recipes)
-                    continue
-                finally:
-                    try:
-                        os.unlink(temp_path)
-                    except:
-                        pass
-        except Exception as e:
-            progress_queue.put(('gen_skip', worker_id, seed_name, f'fuzzer init failed: {e}'))
-            tests_failed += len(group_recipes)
-            continue
-        
-        current_iteration = 0
-        mutation_timeout_hit = False
-        
-        for recipe in sorted(group_recipes, key=lambda r: r.get('iteration', 0)):
-            if mutation_timeout_hit:
-                tests_failed += 1
-                continue
-            
-            target_iteration = recipe.get('iteration', 0)
-            
-            try:
-                with mutation_timeout(MUTATION_TIMEOUT):
-                    while current_iteration < target_iteration:
-                        current_iteration += 1
-                        mutant, success = fuzzer.mutate()
-            except MutationTimeout:
-                progress_queue.put(('gen_mutation_timeout', worker_id, seed_name, current_iteration))
-                mutation_timeout_hit = True
-                tests_failed += 1
-                continue
-            
-            if current_iteration == target_iteration and success and mutant:
-                # Validate content hash if available (determinism check)
-                expected_hash = recipe.get('hash')
-                if expected_hash:
-                    actual_hash = compute_content_hash(mutant)
-                    if actual_hash != expected_hash:
-                        progress_queue.put(('hash_mismatch', worker_id, seed_name, 
-                                          current_iteration, expected_hash, actual_hash))
-                        # Continue anyway but log the mismatch
-                
-                test_id = f"{worker_id}_{tests_generated}"
-                test_path = os.path.join(output_dir, f"test_{test_id}.smt2")
-                try:
-                    with open(test_path, 'w') as f:
-                        f.write(mutant)
-                    
-                    output_queue.put({
-                        'test_path': test_path,
-                        'seed_path': seed_path,
-                        'recipe': recipe
-                    })
-                    tests_generated += 1
-                except Exception as e:
-                    progress_queue.put(('gen_write_error', worker_id, seed_name, str(e)))
-                    tests_failed += 1
-            else:
-                tests_failed += 1
-        
-        progress_queue.put(('gen_done', worker_id, seed_name, len(group_recipes)))
-    
-    progress_queue.put(('gen_worker_done', worker_id, tests_generated, tests_failed))
-
-
-def execution_worker(
-    worker_id: int,
-    test_queue: multiprocessing.Queue,
-    result_queue: multiprocessing.Queue,
-    progress_queue: multiprocessing.Queue,
-    solver_path: str,
-    timeout: int,
-    z3_memory_mb: int
-):
-    """
-    Phase 2 worker: Execute solver on generated test files.
-    """
-    tests_run = 0
-    tests_success = 0
-    tests_failed = 0
-    
-    progress_queue.put(('exec_worker_start', worker_id, os.getpid()))
-    
-    while True:
-        try:
-            test = test_queue.get(timeout=1)
-        except queue.Empty:
-            continue
-        
-        if test is None:
-            break
-        
-        test_path = test['test_path']
-        
-        # Z3 command with memory limit
-        cmd = [solver_path, f"-memory:{z3_memory_mb}", test_path]
-        test_name = os.path.basename(test_path)
-        
-        start_time = time.time()
-        try:
-            result = subprocess.run(
-                cmd,
-                timeout=timeout,
-                capture_output=True,
-                text=True
-            )
-            tests_success += 1
-            elapsed = time.time() - start_time
-            progress_queue.put(('exec_test', worker_id, test_name, elapsed, 'ok'))
-        except subprocess.TimeoutExpired:
-            tests_failed += 1
-            progress_queue.put(('exec_test', worker_id, test_name, timeout, 'TIMEOUT'))
-        except Exception as e:
-            tests_failed += 1
-            progress_queue.put(('exec_test', worker_id, test_name, 0, f'ERROR: {e}'))
-        
-        tests_run += 1
-        
-        try:
-            os.unlink(test_path)
-        except:
-            pass
-    
-    result_queue.put({
-        'worker_id': worker_id,
-        'tests_run': tests_run,
-        'tests_success': tests_success,
-        'tests_failed': tests_failed
-    })
-    progress_queue.put(('exec_worker_done', worker_id, tests_run, tests_success, tests_failed))
-
-
-def replay_recipes_two_phase(
-    recipe_file: str,
-    solver_path: str,
-    build_dir: str,
-    changed_functions_file: str,
-    output_file: str,
-    gcov_cmd: str = "gcov",
-    timeout: int = 60,
-    num_workers: int = 4,
-    seeds_file: Optional[str] = None,
-    z3_memory_mb: int = 4096
-) -> dict:
-    """
-    Two-phase recipe replay for Z3.
-    """
-    log("=" * 60)
-    log(f"RECIPE REPLAY (TWO-PHASE)")
-    log("=" * 60)
-    
-    solver_path = os.path.abspath(solver_path)
-    build_dir = os.path.abspath(build_dir)
-    log(f"Solver: {solver_path}")
-    log(f"Build dir: {build_dir}")
-    
-    if not YINYANG_AVAILABLE:
-        log("ERROR: yinyang not available for mutation regeneration")
-        return {"error": "yinyang not available"}
-    
-    allowed_seed_keys: Optional[Set[Tuple[str, int, Tuple[int, ...]]]] = None
-    if seeds_file:
-        log(f"Loading seed filter from: {seeds_file}")
-        with open(seeds_file, 'r') as f:
-            seeds_data = json.load(f)
-        
-        if isinstance(seeds_data, dict) and 'seed_keys' in seeds_data:
-            allowed_seed_keys = set()
-            for sk in seeds_data['seed_keys']:
-                chain = tuple(sk.get('chain', []))
-                allowed_seed_keys.add((sk['seed_path'], sk['rng_seed'], chain))
-            log(f"Filtering to {len(allowed_seed_keys)} seed groups")
-    
-    log(f"Loading recipes from: {recipe_file}")
-    reader = RecipeReader(recipe_file)
-    all_recipes = reader.recipes
-    log(f"Total recipes in file: {len(all_recipes)}")
-    
-    if allowed_seed_keys is not None:
-        def recipe_to_key(r):
-            return (r.get('seed_path'), r.get('rng_seed', 42), tuple(r.get('chain', [])))
-        recipes = [r for r in all_recipes if recipe_to_key(r) in allowed_seed_keys]
-        log(f"After seed filter: {len(recipes)} recipes")
-    else:
-        recipes = all_recipes
-    
-    if len(recipes) == 0:
-        log("WARNING: No recipes to process!")
-        results = {
-            "recipe_file": recipe_file,
-            "recipes_processed": 0,
-            "successful_runs": 0,
-            "failed_runs": 0,
-            "function_counts": {},
-            "total_function_calls": 0,
-        }
-        with open(output_file, 'w') as f:
-            json.dump(results, f, indent=2)
-        return results
-    
-    log(f"Loading changed functions from: {changed_functions_file}")
-    changed_functions, exact_function_ranges = load_changed_functions(changed_functions_file)
-    log(f"Tracking {len(changed_functions)} changed functions")
-    if exact_function_ranges:
-        log(f"Using {len(exact_function_ranges)} exact function line ranges from function_info_map")
-    
-    log("Grouping recipes by seed...")
-    seed_groups = group_recipes_by_seed(recipes)
-    seed_groups_list = list(seed_groups.items())
-    total_seeds = len(seed_groups_list)
-    total_recipes = sum(len(g) for _, g in seed_groups_list)
-    log(f"Found {total_seeds} unique seed groups, {total_recipes} total recipes")
-    
-    test_output_dir = tempfile.mkdtemp(prefix='replay_tests_')
-    log(f"Test output directory: {test_output_dir}")
-    
-    log("Resetting gcda files...")
-    reset_gcda_files(build_dir)
-    
-    start_time = time.time()
-    
-    # Phase 1: Generate
-    log("")
-    log("=" * 60)
-    log("PHASE 1: Generating test files")
-    log("=" * 60)
-    
-    task_queue = multiprocessing.Queue()
-    test_queue = multiprocessing.Queue()
-    progress_queue = multiprocessing.Queue()
-    
-    # Sort tasks by (seed_path, rng_seed, chain_length) so shorter chains are processed first
-    # This maximizes cache hits for chain prefixes
-    sorted_tasks = sorted(seed_groups_list, key=lambda x: (x[0][0], x[0][1], len(x[0][2])))
-    log(f"Sorted {len(sorted_tasks)} tasks by chain length for optimal caching")
-    
-    for (seed_path, rng_seed, chain), group_recipes in sorted_tasks:
-        task_queue.put((seed_path, rng_seed, chain, group_recipes))
-    
-    for _ in range(num_workers):
-        task_queue.put(None)
-    
-    gen_processes = []
-    for i in range(num_workers):
-        p = multiprocessing.Process(
-            target=generation_worker,
-            args=(i, task_queue, test_queue, progress_queue, test_output_dir)
-        )
-        p.start()
-        gen_processes.append(p)
-    
-    log(f"Started {num_workers} generation workers")
-    
-    # Monitor generation progress - track completion by messages, not just process state
-    gen_done = 0
-    workers_done = set()
-    
-    # Keep processing until all workers have reported done
-    while len(workers_done) < num_workers:
-        try:
-            # Use timeout to avoid blocking forever
-            msg = progress_queue.get(timeout=1.0)
-            if msg[0] == 'gen_worker_start':
-                _, wid, pid = msg
-                log(f"[G{wid}] Worker started (pid={pid})")
-            elif msg[0] == 'gen_start':
-                _, wid, seed_name, num_recipes = msg
-                log(f"[G{wid}] Generating: {seed_name} ({num_recipes} recipes)")
-            elif msg[0] == 'gen_done':
-                _, wid, seed_name, num_recipes = msg
-                gen_done += 1
-                log(f"[G{wid}] Done: {seed_name} [{gen_done}/{total_seeds}]")
-            elif msg[0] == 'gen_skip':
-                _, wid, seed_name, reason = msg
-                gen_done += 1
-                log(f"[G{wid}] Skip: {seed_name} - {reason} [{gen_done}/{total_seeds}]")
-            elif msg[0] == 'gen_mutation_timeout':
-                _, wid, seed_name, iteration = msg
-                log(f"[G{wid}] Mutation timeout: {seed_name} at iter {iteration}")
-            elif msg[0] == 'hash_mismatch':
-                _, wid, seed_name, iteration, expected, actual = msg
-                log(f"[G{wid}] ⚠️ HASH MISMATCH {seed_name} iter {iteration}: expected={expected} actual={actual}")
-            elif msg[0] == 'gen_worker_done':
-                _, wid, generated, failed = msg
-                workers_done.add(wid)
-                log(f"[G{wid}] Worker done: {generated} generated, {failed} failed ({len(workers_done)}/{num_workers} workers complete)")
-            elif msg[0].startswith('gen_'):
-                log(f"[GEN] {msg}")
-        except queue.Empty:
-            # Log status periodically when waiting
-            alive_workers = [i for i, p in enumerate(gen_processes) if p.is_alive()]
-            if alive_workers:
-                log(f"[STATUS] Waiting for workers {alive_workers}, {len(workers_done)}/{num_workers} reported done")
-    
-    log(f"All {num_workers} workers reported done, cleaning up...")
-    
-    # Wait for processes to actually exit (with timeout)
-    for i, p in enumerate(gen_processes):
-        p.join(timeout=5.0)
-        if p.is_alive():
-            log(f"[WARNING] Worker {i} still alive after join, terminating")
-            p.terminate()
-            p.join(timeout=2.0)
-    
-    tests_generated = test_queue.qsize()
-    phase1_time = time.time() - start_time
-    log(f"\nPhase 1 complete: {tests_generated} tests generated in {phase1_time:.1f}s")
-    
-    if tests_generated == 0:
-        log("WARNING: No tests generated!")
-        try:
-            import shutil
-            shutil.rmtree(test_output_dir)
-        except:
-            pass
-        
-        results = {
-            "recipe_file": recipe_file,
-            "recipes_processed": 0,
-            "successful_runs": 0,
-            "failed_runs": total_recipes,
-            "function_counts": {},
-            "total_function_calls": 0,
-        }
-        with open(output_file, 'w') as f:
-            json.dump(results, f, indent=2)
-        return results
-    
-    # Phase 2: Execute
-    log("")
-    log("=" * 60)
-    log("PHASE 2: Executing solver on test files")
-    log("=" * 60)
-    
-    for _ in range(num_workers):
-        test_queue.put(None)
-    
-    result_queue = multiprocessing.Queue()
-    
-    exec_processes = []
-    for i in range(num_workers):
-        p = multiprocessing.Process(
-            target=execution_worker,
-            args=(i, test_queue, result_queue, progress_queue, solver_path, timeout, z3_memory_mb)
-        )
-        p.start()
-        exec_processes.append(p)
-    
-    log(f"Started {num_workers} execution workers")
-    
-    while any(p.is_alive() for p in exec_processes):
-        try:
-            while True:
-                msg = progress_queue.get_nowait()
-                if msg[0] == 'exec_worker_start':
-                    _, wid, pid = msg
-                    log(f"[E{wid}] Worker started (pid={pid})")
-                elif msg[0] == 'exec_test':
-                    _, wid, test_name, elapsed, status = msg
-                    log(f"[E{wid}] {test_name}: {status} ({elapsed:.1f}s)")
-                elif msg[0] == 'exec_worker_done':
-                    _, wid, tests_run, tests_success, tests_failed = msg
-                    log(f"[E{wid}] Worker done: {tests_run} run, {tests_success} ok, {tests_failed} failed")
-        except queue.Empty:
-            pass
-        time.sleep(0.1)
-    
-    for p in exec_processes:
-        p.join()
-    
-    total_run = 0
-    total_success = 0
-    total_failed = 0
-    
-    try:
-        while True:
-            result = result_queue.get_nowait()
-            total_run += result['tests_run']
-            total_success += result['tests_success']
-            total_failed += result['tests_failed']
-    except queue.Empty:
-        pass
-    
-    phase2_time = time.time() - start_time - phase1_time
-    log(f"\nPhase 2 complete: {total_run} tests executed in {phase2_time:.1f}s")
-    
-    # Extract coverage
-    log("")
-    log("=" * 60)
-    log("Extracting coverage data")
-    log("=" * 60)
-    
-    coverage_data = extract_coverage_fastcov(build_dir, gcov_cmd, changed_functions, exact_function_ranges)
-    function_counts = coverage_data.get("function_counts", {})
-    total_function_calls = sum(function_counts.values())
-    
-    log(f"Extracted counts for {len(function_counts)} functions")
-    log(f"Total function calls: {total_function_calls}")
-    
-    try:
-        import shutil
-        shutil.rmtree(test_output_dir)
-        log(f"Cleaned up test directory: {test_output_dir}")
-    except Exception as e:
-        log(f"WARNING: Failed to clean up test directory: {e}")
-    
-    total_time = time.time() - start_time
-    
-    results = {
-        "recipe_file": recipe_file,
-        "recipes_processed": total_recipes,
-        "tests_generated": tests_generated,
-        "successful_runs": total_success,
-        "failed_runs": total_failed,
-        "function_counts": function_counts,
-        "total_function_calls": total_function_calls,
-        "phase1_time": phase1_time,
-        "phase2_time": phase2_time,
-        "total_time": total_time
-    }
-    
-    with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    log(f"\nResults written to: {output_file}")
-    log(f"Total time: {total_time:.1f}s")
-    
-    return results
-
-
-# =============================================================================
-# Legacy single-phase replay (kept for compatibility)
-# =============================================================================
-
-def replay_recipes_optimized(
+def replay_recipes_parallel(
     recipe_file: str,
     solver_path: str,
     build_dir: str,
@@ -1813,37 +1532,64 @@ def replay_recipes_optimized(
     seed_groups = group_recipes_by_seed(recipes)
     seed_groups_list = list(seed_groups.items())
     log(f"Found {len(seed_groups_list)} unique seed groups")
-    
+
     # Show sample of groups
     for (seed_path, rng_seed, chain), group_recipes in seed_groups_list[:3]:
         seed_name = Path(seed_path).name
         iterations = [r.get('iteration', 0) for r in group_recipes]
         log(f"  - {seed_name}: {len(group_recipes)} recipes, iterations {min(iterations)}-{max(iterations)}")
-    
-    # Adjust workers if fewer seed groups
+
+    # Split large seed groups for better load balancing across workers.
+    # Without splitting, a seed with 300K recipes goes to one worker while others
+    # get 10 recipes each and sit idle. Sub-groups starting at iteration > 0 will
+    # do dry-run mutations to advance RNG state before processing, which is cheap
+    # (~0.01s per mutation, no subprocess calls).
+    total_recipes = sum(len(g) for _, g in seed_groups_list)
+    target_chunk_size = max(total_recipes // num_workers, 1)
+    original_count = len(seed_groups_list)
+
+    split_groups = []
+    for key, recipes_group in seed_groups_list:
+        if len(recipes_group) <= target_chunk_size:
+            split_groups.append((key, recipes_group))
+        else:
+            for i in range(0, len(recipes_group), target_chunk_size):
+                chunk = recipes_group[i:i + target_chunk_size]
+                split_groups.append((key, chunk))
+
+    seed_groups_list = split_groups
+    if len(seed_groups_list) != original_count:
+        log(f"Split large seed groups: {original_count} -> {len(seed_groups_list)} tasks (target chunk size: {target_chunk_size})")
+
+    # Adjust workers if fewer tasks
     actual_workers = min(num_workers, len(seed_groups_list))
-    log(f"\nUsing {actual_workers} workers for {len(seed_groups_list)} seed groups")
-    
+    log(f"\nUsing {actual_workers} workers for {len(seed_groups_list)} tasks")
+
     start_time = time.time()
-    
+
     # Reset gcda files
     log("Resetting gcda files...")
     reset_gcda_files(build_dir)
-    
+
+    # Compute static coverage totals from .gcno files (before any .gcda exists)
+    log("Computing static coverage totals from .gcno files...")
+    static_totals = extract_static_totals(build_dir, changed_functions, gcov_cmd)
+    log(f"Static totals: {static_totals['lines_total']} lines, {static_totals['branches_total']} branches")
+
     log("")
     log("Starting parallel replay...")
     log("-" * 60)
-    
+
     # Create task queue and add all seed groups
     task_queue = multiprocessing.Queue()
     for seed_group in seed_groups_list:
         task_queue.put(seed_group)
-    
+
     # Add poison pills for workers
     for _ in range(actual_workers):
         task_queue.put(None)
-    
-    log(f"  {len(seed_groups_list)} seed groups queued for {actual_workers} workers")
+
+    log(f"  {len(seed_groups_list)} tasks queued for {actual_workers} workers")
     
     # Create queues and start workers
     progress_queue = multiprocessing.Queue()
@@ -2040,7 +1786,7 @@ def replay_recipes_optimized(
     # Extract coverage once at the end
     log("")
     log("All workers finished. Extracting coverage (functions, lines, branches)...")
-    coverage_data = extract_coverage_fastcov(build_dir, gcov_cmd, changed_functions, exact_function_ranges)
+    coverage_data = extract_coverage_fastcov(build_dir, gcov_cmd, changed_functions, exact_function_ranges, static_totals=static_totals)
     
     # Initialize function counts with zeros for all tracked functions
     function_counts: Dict[str, int] = {fn: 0 for fn in changed_functions}
@@ -2137,39 +1883,24 @@ def main():
     parser.add_argument("--end-idx", type=int, help="End index for recipe slice (legacy)")
     parser.add_argument("--seeds-file", help="JSON file with list of seed paths to process (recommended)")
     parser.add_argument("--z3-memory-mb", type=int, default=4096, help="Z3 memory limit in MB")
-    parser.add_argument("--legacy", action="store_true", help="Use legacy single-phase replay")
-    
+
     args = parser.parse_args()
-    
-    if args.legacy:
-        replay_recipes_optimized(
-            recipe_file=args.recipe_file,
-            solver_path=args.solver,
-            build_dir=args.build_dir,
-            changed_functions_file=args.changed_functions,
-            output_file=args.output,
-            gcov_cmd=args.gcov,
-            timeout=args.timeout,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            start_idx=args.start_idx,
-            end_idx=args.end_idx,
-            seeds_file=args.seeds_file,
-            z3_memory_mb=args.z3_memory_mb
-        )
-    else:
-        replay_recipes_two_phase(
-            recipe_file=args.recipe_file,
-            solver_path=args.solver,
-            build_dir=args.build_dir,
-            changed_functions_file=args.changed_functions,
-            output_file=args.output,
-            gcov_cmd=args.gcov,
-            timeout=args.timeout,
-            num_workers=args.num_workers,
-            seeds_file=args.seeds_file,
-            z3_memory_mb=args.z3_memory_mb
-        )
+
+    replay_recipes_parallel(
+        recipe_file=args.recipe_file,
+        solver_path=args.solver,
+        build_dir=args.build_dir,
+        changed_functions_file=args.changed_functions,
+        output_file=args.output,
+        gcov_cmd=args.gcov,
+        timeout=args.timeout,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        start_idx=args.start_idx,
+        end_idx=args.end_idx,
+        seeds_file=args.seeds_file,
+        z3_memory_mb=args.z3_memory_mb
+    )
 
 
 if __name__ == "__main__":
