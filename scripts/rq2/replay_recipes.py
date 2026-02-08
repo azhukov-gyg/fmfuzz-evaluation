@@ -1620,6 +1620,24 @@ def replay_recipes_parallel(
             return (r.get('seed_path'), r.get('rng_seed', 42), tuple(r.get('chain', [])))
         recipes = [r for r in all_recipes if recipe_to_key(r) in allowed_seed_keys]
         log(f"After seed filter: {len(recipes)} recipes")
+        if len(recipes) == 0 and len(all_recipes) > 0:
+            # Debug: show what keys we're looking for vs what's in the recipes
+            log(f"[SEED FILTER DEBUG] 0 recipes matched! Diagnosing mismatch...")
+            log(f"[SEED FILTER DEBUG] Allowed seed keys ({len(allowed_seed_keys)}):")
+            for sk in list(allowed_seed_keys)[:5]:
+                log(f"[SEED FILTER DEBUG]   {sk}")
+            sample_keys = set()
+            for r in all_recipes[:100]:
+                sample_keys.add(recipe_to_key(r))
+            log(f"[SEED FILTER DEBUG] Sample recipe keys (first 100 recipes, {len(sample_keys)} unique):")
+            for rk in list(sample_keys)[:5]:
+                log(f"[SEED FILTER DEBUG]   {rk}")
+            # Check field-by-field
+            sample_recipe = all_recipes[0]
+            log(f"[SEED FILTER DEBUG] First recipe fields: {list(sample_recipe.keys())}")
+            log(f"[SEED FILTER DEBUG] First recipe seed_path: {sample_recipe.get('seed_path')!r}")
+            log(f"[SEED FILTER DEBUG] First recipe rng_seed: {sample_recipe.get('rng_seed')!r}")
+            log(f"[SEED FILTER DEBUG] First recipe chain: {sample_recipe.get('chain')!r}")
     elif allowed_seed_paths is not None:
         # Legacy: filter by seed_path only
         recipes = [r for r in all_recipes if r.get('seed_path') in allowed_seed_paths]

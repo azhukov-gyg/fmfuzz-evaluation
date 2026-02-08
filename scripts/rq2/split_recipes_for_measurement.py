@@ -74,9 +74,15 @@ def split_recipes(recipe_file: str, num_jobs: int = 4, output_file: str = "measu
                 continue
             try:
                 recipe = json.loads(stripped)
+
+                # Skip metadata markers (seed_start, seed_end) — they are not recipes
+                # RecipeReader in replay_recipes.py also filters these out
+                if recipe.get('type') in ('seed_start', 'seed_end'):
+                    continue
+
                 recipe_idx = len(recipes)
                 recipes.append(recipe)
-                
+
                 # Group by (seed_path, rng_seed, chain)
                 # NOTE: Default rng_seed must match replay_recipes.py (42)
                 # Chain is a list of iterations that led to the parent seed
