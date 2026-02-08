@@ -36,33 +36,27 @@ jobs:
         env:
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
         run: |
-          mkdir -p measurements/baseline measurements/variant1 measurements/variant2
-          
+          mkdir -p measurements/baseline measurements/variant1
+
           # Download baseline measurements
           echo "=== Downloading baseline measurements ==="
           aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/z3/measurement-results/baseline/ measurements/baseline/
           BASELINE_COUNT=$(ls measurements/baseline/*.json.gz 2>/dev/null | wc -l || echo 0)
           echo "Downloaded $BASELINE_COUNT baseline measurement files"
-          
+
           # Download variant1 measurements
           echo "=== Downloading variant1 measurements ==="
           aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/z3/measurement-results/variant1/ measurements/variant1/
           VARIANT1_COUNT=$(ls measurements/variant1/*.json.gz 2>/dev/null | wc -l || echo 0)
           echo "Downloaded $VARIANT1_COUNT variant1 measurement files"
-          
-          # Download variant2 measurements
-          echo "=== Downloading variant2 measurements ==="
-          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/z3/measurement-results/variant2/ measurements/variant2/
-          VARIANT2_COUNT=$(ls measurements/variant2/*.json.gz 2>/dev/null | wc -l || echo 0)
-          echo "Downloaded $VARIANT2_COUNT variant2 measurement files"
-          
+
           # Decompress all
           gunzip measurements/*/*.json.gz 2>/dev/null || true
-          
+
           # Show downloaded measurement files content for debugging
           echo ""
           echo "=== Downloaded Measurement Files Content ==="
-          for variant in baseline variant1 variant2; do
+          for variant in baseline variant1; do
             for f in measurements/$variant/*.json; do
               if [ -f "$f" ]; then
                 echo ""
