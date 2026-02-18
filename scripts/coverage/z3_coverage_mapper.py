@@ -16,6 +16,18 @@ import psutil
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Import z3test utilities for test validation
+z3test_scripts = Path(__file__).parent.parent.parent / "z3test" / "scripts"
+if z3test_scripts.exists():
+    sys.path.insert(0, str(z3test_scripts))
+    try:
+        import util as z3test_util
+        HAS_Z3TEST_UTIL = True
+    except ImportError:
+        HAS_Z3TEST_UTIL = False
+else:
+    HAS_Z3TEST_UTIL = False
+
 class CoverageMapper:
     def __init__(self, build_dir: str = "build", z3test_dir: str = "z3test"):
         self.build_dir = Path(build_dir)
@@ -141,23 +153,47 @@ class CoverageMapper:
             sys.stdout.flush()
             return None
 
+        # Check if expected output file exists (required for validation)
+        base_path = str(smt_file).rsplit('.', 1)[0]  # Remove extension
+        expected_file = f"{base_path}.expected.out"
+        if not os.path.exists(expected_file):
+            print(f"⏭️ {test_name} - no expected output file, skipping")
+            sys.stdout.flush()
+            return None
+
         # Measure test execution time
         start_time = time.time()
 
-        # Run Z3 on the SMT file with a 120 second timeout
-        result = subprocess.run(
-            [str(self.z3_binary), str(smt_file)],
-            cwd=self.build_dir,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=120
-        )
+        # Use z3test's validation if available (like cvc5 uses ctest)
+        test_passed = False
+        if HAS_Z3TEST_UTIL:
+            try:
+                # test_benchmark returns True on success, raises exception on failure
+                z3test_util.test_benchmark(
+                    str(self.z3_binary),
+                    str(smt_file),
+                    timeout=120,
+                    expected=expected_file
+                )
+                test_passed = True
+            except Exception as e:
+                test_passed = False
+        else:
+            # Fallback: just run Z3 and check exit code (not ideal)
+            result = subprocess.run(
+                [str(self.z3_binary), str(smt_file)],
+                cwd=self.build_dir,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120
+            )
+            test_passed = (result.returncode == 0)
 
         end_time = time.time()
         execution_time = round(end_time - start_time, 2)
 
-        if result.returncode != 0:
+        if not test_passed:
             print(f"❌ {test_name} - {execution_time}s")
             sys.stdout.flush()
             return None
