@@ -111,12 +111,12 @@ def main():
         # Clone z3test if needed
         if not os.path.exists('z3test'):
             subprocess.run(['git', 'clone', 'https://github.com/z3prover/z3test.git', 'z3test'], check=True)
-        
-        # Generate matrix using fmfuzz-dev script
-        generate_matrix_script = fmfuzz_scripts / "z3" / "coverage" / "generate_matrix.py"
+
+        # Generate matrix using local script
+        generate_matrix_script = repo_root / "scripts" / "coverage" / "z3_generate_matrix.py"
         if not generate_matrix_script.exists():
             raise RuntimeError(f"Generate matrix script not found: {generate_matrix_script}")
-        
+
         result = subprocess.run(
             ['python3', str(generate_matrix_script),
              '--z3test-dir', 'z3test',
