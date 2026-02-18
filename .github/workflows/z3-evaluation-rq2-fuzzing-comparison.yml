@@ -39,13 +39,13 @@ jobs:
           AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
           # List commits that have both baseline and variant1 statistics
-          prefix="evaluation/rq2/z3/fuzzing-statistics/variant1/"
+          prefix="evaluation/rq2/v2/z3/fuzzing-statistics/variant1/"
           variant1_commits=$(aws s3 ls s3://${{ secrets.AWS_S3_BUCKET }}/$prefix --recursive | \
             grep "fuzzing_statistics-" | \
             sed 's/.*fuzzing_statistics-\(.*\)\.json\.gz/\1/' | \
             sort -u)
           
-          prefix="evaluation/rq2/z3/fuzzing-statistics/baseline/"
+          prefix="evaluation/rq2/v2/z3/fuzzing-statistics/baseline/"
           baseline_commits=$(aws s3 ls s3://${{ secrets.AWS_S3_BUCKET }}/$prefix --recursive | \
             grep "fuzzing_statistics-" | \
             sed 's/.*fuzzing_statistics-\(.*\)\.json\.gz/\1/' | \
@@ -152,7 +152,7 @@ jobs:
           
           aws s3api put-object \
             --bucket ${{ secrets.AWS_S3_BUCKET }} \
-            --key "evaluation/rq2/z3/fuzzing-comparison/aggregated_comparison.json.gz" \
+            --key "evaluation/rq2/v2/z3/fuzzing-comparison/aggregated_comparison.json.gz" \
             --body aggregated_comparison.json.gz
           
           echo "✅ Uploaded aggregated comparison to S3"

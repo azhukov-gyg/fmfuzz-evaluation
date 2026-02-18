@@ -154,15 +154,6 @@ jobs:
             git clone https://github.com/z3prover/z3test.git z3test
           fi
       
-      - name: Install CVC5 oracle
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          pip install requests
-          python3 fmfuzz-dev/scripts/download_cvc5.py $HOME/.local/bin
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-          cvc5 --version
-      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -315,7 +306,7 @@ jobs:
         env:
           TEST_TIMEOUT: 120
         run: |
-          python3 ../../fmfuzz-dev/scripts/z3/coverage/coverage_mapper.py \
+          python3 ../../scripts/coverage/z3_coverage_mapper.py \
             --build-dir $(pwd) \
             --z3test-dir ../../z3test \
             --start-index ${{ matrix.chunk.start_index }} \
@@ -360,7 +351,7 @@ jobs:
       
       - name: Join coverage mappings
         run: |
-          python3 fmfuzz-dev/scripts/z3/coverage/join_coverage_mappings.py
+          python3 scripts/coverage/z3_join_coverage_mappings.py
       
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5.1.0
@@ -388,7 +379,7 @@ jobs:
       - name: Upload coverage mapping to S3
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/z3/coverage-mappings/variant1/coverage_mapping-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/v2/z3/coverage-mappings/variant1/coverage_mapping-${COMMIT_HASH}.json.gz"
           
           if [ ! -f "coverage_mapping.json.gz" ]; then
             echo "❌ Error: coverage_mapping.json.gz not found"

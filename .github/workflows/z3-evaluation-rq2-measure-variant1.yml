@@ -65,7 +65,7 @@ jobs:
             TOTAL_COMMITS=1
           else
             # List commits that have variant1 recipes (coverage map tests, production binary)
-            prefix="evaluation/rq2/z3/fuzzing-recipes/variant1/"
+            prefix="evaluation/rq2/v2/z3/fuzzing-recipes/variant1/"
             commits=$(aws s3 ls s3://${{ secrets.AWS_S3_BUCKET }}/$prefix --recursive | \
               grep "recipes-" | \
               sed 's/.*recipes-\(.*\)\.jsonl\.gz/\1/' | \
@@ -118,7 +118,7 @@ jobs:
       - name: Download recipes from S3
         run: |
           COMMIT_HASH="${{ matrix.commit }}"
-          S3_KEY="evaluation/rq2/z3/fuzzing-recipes/variant1/recipes-${COMMIT_HASH}.jsonl.gz"
+          S3_KEY="evaluation/rq2/v2/z3/fuzzing-recipes/variant1/recipes-${COMMIT_HASH}.jsonl.gz"
           
           aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY recipes.jsonl.gz
           gunzip recipes.jsonl.gz
@@ -320,7 +320,7 @@ jobs:
       - name: Download changed functions from S3
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/z3/changed-functions/changed_functions-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/v2/z3/changed-functions/changed_functions-${COMMIT_HASH}.json.gz"
           
           aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY changed_functions.json.gz
           gunzip changed_functions.json.gz
@@ -477,7 +477,7 @@ jobs:
         if: always() && !inputs.dry_run
         run: |
           COMMIT_HASH="${{ matrix.commit }}"
-          S3_KEY="evaluation/rq2/z3/measurement-results/variant1/measurement-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/v2/z3/measurement-results/variant1/measurement-${COMMIT_HASH}.json.gz"
           
           if [ ! -f "merged_measurement_${{ matrix.commit }}.json" ]; then
             echo "⚠️ Merged measurement results file not found"
@@ -497,7 +497,7 @@ jobs:
         if: always() && !inputs.dry_run && inputs.timeline_mode
         run: |
           COMMIT_HASH="${{ matrix.commit }}"
-          S3_KEY="evaluation/rq2/z3/measurement-results/variant1/timeline-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/v2/z3/measurement-results/variant1/timeline-${COMMIT_HASH}.json.gz"
           
           if [ ! -f "cumulative_timeline_${{ matrix.commit }}.json" ]; then
             echo "⚠️ Timeline file not found, skipping upload"

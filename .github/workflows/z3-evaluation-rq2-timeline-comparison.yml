@@ -45,19 +45,19 @@ jobs:
 
           # Download baseline timelines
           echo "=== Downloading baseline timelines ==="
-          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/z3/measurement-results/baseline/ timelines/baseline/ --exclude "*" --include "timeline-*.json.gz"
+          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/v2/z3/measurement-results/baseline/ timelines/baseline/ --exclude "*" --include "timeline-*.json.gz"
           BASELINE_COUNT=$(ls timelines/baseline/timeline-*.json.gz 2>/dev/null | wc -l || echo 0)
           echo "Downloaded $BASELINE_COUNT baseline timeline files"
 
           # Download variant1 timelines
           echo "=== Downloading variant1 timelines ==="
-          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/z3/measurement-results/variant1/ timelines/variant1/ --exclude "*" --include "timeline-*.json.gz"
+          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/v2/z3/measurement-results/variant1/ timelines/variant1/ --exclude "*" --include "timeline-*.json.gz"
           VARIANT1_COUNT=$(ls timelines/variant1/timeline-*.json.gz 2>/dev/null | wc -l || echo 0)
           echo "Downloaded $VARIANT1_COUNT variant1 timeline files"
 
           # Download variant2 timelines
           echo "=== Downloading variant2 timelines ==="
-          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/z3/measurement-results/variant2/ timelines/variant2/ --exclude "*" --include "timeline-*.json.gz"
+          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/v2/z3/measurement-results/variant2/ timelines/variant2/ --exclude "*" --include "timeline-*.json.gz"
           VARIANT2_COUNT=$(ls timelines/variant2/timeline-*.json.gz 2>/dev/null | wc -l || echo 0)
           echo "Downloaded $VARIANT2_COUNT variant2 timeline files"
 
@@ -89,7 +89,7 @@ jobs:
       - name: Upload comparison to S3
         if: ${{ !inputs.dry_run }}
         run: |
-          S3_KEY="evaluation/rq2/z3/timeline-comparison/comparison_${{ inputs.time_axis }}.json.gz"
+          S3_KEY="evaluation/rq2/v2/z3/timeline-comparison/comparison_${{ inputs.time_axis }}.json.gz"
 
           if [ ! -f "timeline_comparison.json" ]; then
             echo "⚠️ Timeline comparison file not found"

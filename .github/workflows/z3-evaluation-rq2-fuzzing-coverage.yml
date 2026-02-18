@@ -575,7 +575,7 @@ jobs:
         if: always()
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/z3/fuzzing-statistics/variant1/fuzzing_statistics-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/v2/z3/fuzzing-statistics/variant1/fuzzing_statistics-${COMMIT_HASH}.json.gz"
           
           if [ ! -f "merged_statistics_${{ matrix.commit }}.json" ]; then
             echo "⚠️ Merged statistics file not found"

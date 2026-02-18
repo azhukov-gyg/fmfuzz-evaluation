@@ -20,7 +20,9 @@ from typing import Dict, List, Optional
 
 def download_statistics(s3_client, bucket: str, solver: str, commit_hash: str, variant: str) -> Optional[Dict]:
     """Download statistics from S3"""
-    s3_key = f"evaluation/rq2/{solver}/fuzzing-statistics/{variant}/fuzzing_statistics-{commit_hash}.json.gz"
+    # Use v2 path for z3, old path for other solvers
+    version = "v2/" if solver == "z3" else ""
+    s3_key = f"evaluation/rq2/{version}{solver}/fuzzing-statistics/{variant}/fuzzing_statistics-{commit_hash}.json.gz"
     
     try:
         import tempfile
@@ -164,7 +166,9 @@ def main():
         print(f"🔍 Comparing all commits (baseline vs {variant_name})...", file=sys.stderr)
         
         # List all commits with variant statistics
-        prefix = f"evaluation/rq2/{args.solver}/fuzzing-statistics/{variant_name}/"
+        # Use v2 path for z3, old path for other solvers
+        version = "v2/" if args.solver == "z3" else ""
+        prefix = f"evaluation/rq2/{version}{args.solver}/fuzzing-statistics/{variant_name}/"
         commits = []
         
         try:
