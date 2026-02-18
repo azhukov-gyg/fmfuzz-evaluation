@@ -45,7 +45,8 @@ jobs:
             sed 's/.*fuzzing_statistics-\(.*\)\.json\.gz/\1/' | \
             sort -u)
           
-          prefix="evaluation/rq2/v2/z3/fuzzing-statistics/baseline/"
+          # Use old path for baseline (not v2)
+          prefix="evaluation/rq2/z3/fuzzing-statistics/baseline/"
           baseline_commits=$(aws s3 ls s3://${{ secrets.AWS_S3_BUCKET }}/$prefix --recursive | \
             grep "fuzzing_statistics-" | \
             sed 's/.*fuzzing_statistics-\(.*\)\.json\.gz/\1/' | \

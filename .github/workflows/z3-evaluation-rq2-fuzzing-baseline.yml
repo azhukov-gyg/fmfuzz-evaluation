@@ -62,7 +62,7 @@ jobs:
             echo "total_commits=$TOTAL_COMMITS" >> $GITHUB_OUTPUT
           else
             # List commits that have variant1 statistics
-            prefix="evaluation/rq2/v2/z3/fuzzing-statistics/variant1/"
+            prefix="evaluation/rq2/z3/fuzzing-statistics/variant1/"
             commits=$(aws s3 ls s3://${{ secrets.AWS_S3_BUCKET }}/$prefix --recursive | \
               grep "fuzzing_statistics-" | \
               sed 's/.*fuzzing_statistics-\(.*\)\.json\.gz/\1/' | \
@@ -149,7 +149,7 @@ jobs:
       - name: Download coverage mapping from S3
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/v2/z3/coverage-mappings/variant1/coverage_mapping-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/z3/coverage-mappings/variant1/coverage_mapping-${COMMIT_HASH}.json.gz"
           
           aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY coverage_mapping.json.gz || {
             echo "⚠️ Coverage mapping not found, falling back to discovering all tests"
@@ -538,7 +538,7 @@ jobs:
         if: always() && !inputs.dry_run
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/v2/z3/fuzzing-recipes/baseline/recipes-${COMMIT_HASH}.jsonl.gz"
+          S3_KEY="evaluation/rq2/z3/fuzzing-recipes/baseline/recipes-${COMMIT_HASH}.jsonl.gz"
           
           if [ ! -f "merged_recipes_${{ matrix.commit }}.jsonl" ]; then
             echo "⚠️ Merged recipes file not found"
@@ -558,7 +558,7 @@ jobs:
         if: always() && !inputs.dry_run
         run: |
           COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/v2/z3/changed-functions/changed_functions-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/z3/changed-functions/changed_functions-${COMMIT_HASH}.json.gz"
           
           if [ ! -f "changed_functions.json" ]; then
             echo "⚠️ changed_functions.json not found"
