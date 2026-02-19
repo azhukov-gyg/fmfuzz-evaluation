@@ -187,25 +187,7 @@ jobs:
           else
             git clone https://github.com/z3prover/z3test.git z3test
           fi
-      
-      - name: Read changed functions from variant1 statistics
-        id: read-functions
-        env:
-          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-        run: |
-          COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          python3 scripts/rq2/read_changed_functions_from_statistics.py z3 "$COMMIT_HASH" > changed_functions_data.json
-          
-          # Extract function IDs and create proper JSON format (same as prepare_commit_fuzzer)
-          jq '{
-            "commit_hash": .commit_hash,
-            "changed_functions": .changed_functions
-          }' changed_functions_data.json > changed_functions.json
-          
-          FUNCTION_COUNT=$(jq -r '.total_functions' changed_functions_data.json)
-          echo "✅ Read $FUNCTION_COUNT changed functions from variant1 statistics"
-      
+
       - name: Extract tests from coverage mapping
         id: pick-tests
         if: env.use_coverage_mapping == 'true'
@@ -249,13 +231,11 @@ jobs:
             }))
           }' fuzzer_matrix.json > combined_matrix.json
       
-      - name: Upload changed functions and matrix
+      - name: Upload fuzzer matrix
         uses: actions/upload-artifact@v4
         with:
-          name: baseline-changed-functions-${{ matrix.commit }}
-          path: |
-            changed_functions.json
-            fuzzer_matrix.json
+          name: baseline-fuzzer-matrix-${{ matrix.commit }}
+          path: fuzzer_matrix.json
           if-no-files-found: ignore
       
       - name: Upload combined matrix
@@ -434,10 +414,10 @@ jobs:
         run: |
           ./scripts/z3/extract_build_artifacts.sh artifacts/artifacts.tar.gz z3/build true
       
-      - name: Download changed functions and matrix
+      - name: Download fuzzer matrix
         uses: actions/download-artifact@v4
         with:
-          name: baseline-changed-functions-${{ matrix.commit }}
+          name: baseline-fuzzer-matrix-${{ matrix.commit }}
           path: .
       
       - name: Verify solver binaries
@@ -486,13 +466,7 @@ jobs:
           path: recipes-artifacts
           pattern: baseline-recipes-commit-${{ matrix.commit }}-job-*
           merge-multiple: false
-      
-      - name: Download changed functions
-        uses: actions/download-artifact@v4
-        with:
-          name: baseline-changed-functions-${{ matrix.commit }}
-          path: .
-      
+
       - name: Merge recipes from all jobs
         run: |
           RECIPE_FILES=$(find recipes-artifacts -name "recipes_${{ matrix.commit }}_job_*.jsonl" -type f | sort)
@@ -553,31 +527,7 @@ jobs:
             --body recipes_${COMMIT_HASH}.jsonl.gz
           
           echo "✅ Uploaded baseline recipes to S3: $S3_KEY"
-      
-      - name: Upload changed functions to S3
-        if: always() && !inputs.dry_run
-        run: |
-          COMMIT_HASH="${{ steps.get-commit-merge.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/z3/changed-functions/changed_functions-${COMMIT_HASH}.json.gz"
-          
-          if [ ! -f "changed_functions.json" ]; then
-            echo "⚠️ changed_functions.json not found"
-            exit 0
-          fi
-          
-          # Show changed functions content for debugging
-          echo "=== Changed Functions Content ==="
-          cat changed_functions.json | python3 -m json.tool
-          
-          gzip -c "changed_functions.json" > changed_functions_${COMMIT_HASH}.json.gz
-          
-          aws s3api put-object \
-            --bucket ${{ secrets.AWS_S3_BUCKET }} \
-            --key "$S3_KEY" \
-            --body changed_functions_${COMMIT_HASH}.json.gz
-          
-          echo "✅ Uploaded changed functions to S3: $S3_KEY"
-      
+
       - name: Dry run - Skip S3 upload
         if: always() && inputs.dry_run
         run: |

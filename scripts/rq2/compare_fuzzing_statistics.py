@@ -20,8 +20,8 @@ from typing import Dict, List, Optional
 
 def download_statistics(s3_client, bucket: str, solver: str, commit_hash: str, variant: str) -> Optional[Dict]:
     """Download statistics from S3"""
-    # Use v2 path only for z3 variant1/variant2/coverage-guided, old path for baseline and other solvers
-    version = "v2/" if solver == "z3" and variant != "baseline" else ""
+    # Use v2 path for all z3 variants (baseline, variant1, variant2), old path for other solvers
+    version = "v2/" if solver == "z3" else ""
     s3_key = f"evaluation/rq2/{version}{solver}/fuzzing-statistics/{variant}/fuzzing_statistics-{commit_hash}.json.gz"
     
     try:

@@ -43,9 +43,9 @@ jobs:
         run: |
           mkdir -p timelines/baseline timelines/variant1 timelines/variant2
 
-          # Download baseline timelines (from old path, not v2)
+          # Download baseline timelines (from v2 path)
           echo "=== Downloading baseline timelines ==="
-          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/z3/measurement-results/baseline/ timelines/baseline/ --exclude "*" --include "timeline-*.json.gz"
+          aws s3 sync s3://$AWS_S3_BUCKET/evaluation/rq2/v2/z3/measurement-results/baseline/ timelines/baseline/ --exclude "*" --include "timeline-*.json.gz"
           BASELINE_COUNT=$(ls timelines/baseline/timeline-*.json.gz 2>/dev/null | wc -l || echo 0)
           echo "Downloaded $BASELINE_COUNT baseline timeline files"
 

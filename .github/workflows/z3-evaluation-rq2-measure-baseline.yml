@@ -325,11 +325,11 @@ jobs:
       - name: Download changed functions from S3
         run: |
           COMMIT_HASH="${{ steps.get-commit.outputs.commit_hash }}"
-          S3_KEY="evaluation/rq2/z3/changed-functions/changed_functions-${COMMIT_HASH}.json.gz"
-          
+          S3_KEY="evaluation/rq2/v2/z3/changed-functions/changed_functions-${COMMIT_HASH}.json.gz"
+
           aws s3 cp s3://${{ secrets.AWS_S3_BUCKET }}/$S3_KEY changed_functions.json.gz
           gunzip changed_functions.json.gz
-          
+
           FUNC_COUNT=$(jq '.changed_functions | length' changed_functions.json 2>/dev/null || echo "unknown")
           echo "✅ Downloaded changed functions: $FUNC_COUNT functions"
       
@@ -483,7 +483,7 @@ jobs:
         if: always() && !inputs.dry_run
         run: |
           COMMIT_HASH="${{ matrix.commit }}"
-          S3_KEY="evaluation/rq2/z3/measurement-results/baseline/measurement-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/v2/z3/measurement-results/baseline/measurement-${COMMIT_HASH}.json.gz"
           
           if [ ! -f "merged_measurement_${{ matrix.commit }}.json" ]; then
             echo "⚠️ Merged measurement results file not found"
@@ -503,7 +503,7 @@ jobs:
         if: always() && !inputs.dry_run && inputs.timeline_mode
         run: |
           COMMIT_HASH="${{ matrix.commit }}"
-          S3_KEY="evaluation/rq2/z3/measurement-results/baseline/timeline-${COMMIT_HASH}.json.gz"
+          S3_KEY="evaluation/rq2/v2/z3/measurement-results/baseline/timeline-${COMMIT_HASH}.json.gz"
           
           if [ ! -f "cumulative_timeline_${{ matrix.commit }}.json" ]; then
             echo "⚠️ Timeline file not found, skipping upload"
